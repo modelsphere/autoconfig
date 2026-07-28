@@ -53,9 +53,15 @@ sinks:                        # target ↔ 消费方显式绑定
 ```
 
 - **cart sink**:把 base config.yaml + 发现的 workers 渲染成完整 `config.yaml`(一个 key)。
-- **openresty sink**:读 baseConfigDir 里每个 conf,对 `routeByTarget` 指定的 conf **brace 定位并重写
+- **openresty sink**:读 baseConfigDir 里每个 `.conf`,对 `routeByTarget` 指定的 conf **brace 定位并重写
   `peers = {` / `_G.PEERS = {` 块**(位置形式 `{ip, port, name[, priority[, maxConcurrency]]}`),
-  其余文件原样透传,整批写进 openresty 的 conf.d ConfigMap。
+  其余原样透传,写进输出 ConfigMap(**只含 `.conf`,不含 lua**)。
+
+### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动
+ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把 **session_route*.conf 移到
+子目录 `conf.d/routes/`**,ConfigMap 挂到那里;`lua/` + `router_locations.inc` + `nginx.conf` 仍烤镜像。
+openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/routes/*.conf;`(lua_package_path 不变)。
+—— autoconfig **代码零改**:baseConfigDir 只放 `.conf`、消费方把输出 ConfigMap 挂到 `conf.d/routes/` 即可。
 
 ## 构建
 

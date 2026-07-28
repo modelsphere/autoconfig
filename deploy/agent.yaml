@@ -88,15 +88,16 @@ spec:
 #     volumes:
 #     - { name: cfg, configMap: { name: cart-config } }   # ← agent 创建/更新(整卷挂!非 subPath)
 #
-# openresty pod:
+# openresty pod(只把 .conf 放 ConfigMap → 挂到 conf.d/routes/;lua/nginx.conf 烤镜像。
+#   需 nginx.conf: include conf.d/routes/*.conf; 且 session_route*.conf 移到 routes/):
 #     shareProcessNamespace: true
 #     containers:
 #     - name: openresty
 #       volumeMounts:
-#       - { name: confd, mountPath: /usr/local/openresty/nginx/conf/conf.d }   # 整卷挂 agent 的输出
+#       - { name: routes, mountPath: /usr/local/openresty/nginx/conf/conf.d/routes }   # 整卷挂 agent 输出的 .conf
 #     - name: reload
 #       image: harbor.4pd.io/hardcore-tech/autoconfig:0.1.0
 #       args: ["--reload-mode","--watch","/watch","--process","nginx: master"]
-#       volumeMounts: [{ name: confd, mountPath: /watch }]
+#       volumeMounts: [{ name: routes, mountPath: /watch }]
 #     volumes:
-#     - { name: confd, configMap: { name: openresty-conf } }   # ← agent 创建/更新
+#     - { name: routes, configMap: { name: openresty-conf } }   # ← agent 创建/更新(只含 session_route*.conf)
