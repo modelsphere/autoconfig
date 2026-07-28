@@ -1,0 +1,3 @@
+# 交叉编译产物(本机 build,不入库)
+/autoconfig
+autoconfig.exe
