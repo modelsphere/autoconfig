@@ -74,7 +74,7 @@ sinks:                        # target ↔ 消费方显式绑定
       outputConfigMap: openresty/openresty-conf
   ```
   模板见 `deploy/openresty-route.tmpl`(骨架对齐真实 per-model conf:6 个 `*_<route>` dict + server + `register_route` + `peers` + `include conf.d/router_locations.inc`)。已实测:模板生成的 conf 用真 lua 正常加载;**动态加一条路由 → reload 后新端口 + 新 dict 上线**。
-  ⚠️ 改 agent 配置(加/删 route/target)当前需**重启 agent**(config 启动时读一次);加模型不频繁,可接受。
+  ✅ 改 agent 配置(加/删 route/target)**免重启**:agent 每周期重读 config,变了就重建 sinks(读失败保留上次好配置)。config 也走 ConfigMap 挂载,改 ConfigMap 即热更。
 
 ### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动
 ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把 **session_route*.conf 移到
@@ -84,13 +84,17 @@ openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/route
 
 ## 构建
 
-二进制在本机交叉编译成静态 linux/amd64(内网无 golang 基础镜像,这样最省事),镜像只打包:
+**多阶段 build,依赖已 vendor(`vendor/` 入库),全程离线**——不联网、不预置二进制:
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o autoconfig ./cmd/autoconfig
-docker build -t harbor.4pd.io/hardcore-tech/autoconfig:<tag> .
+docker build -t harbor.4pd.io/hardcore-tech/autoconfig:<tag> .   # builder=harbor golang:1.23.3-alpine,-mod=vendor 编译 → 打进 python:3.12-alpine
 docker push harbor.4pd.io/hardcore-tech/autoconfig:<tag>
 ```
+
+**CI(`.gitlab-ci.yml`):打 git tag 自动 build+push** `:<tag>`+`:latest`(`public-buildx` runner,docker 已 login harbor)。
+该 runner 只 go1.17.6 且够不到外网,故用 vendor 离线 + golang builder 从 harbor 拉。改依赖后 `go mod vendor` 重新入库。
+
+改 Go 代码本地快速验证:`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor ./cmd/autoconfig`。
 
 ## 部署
 
