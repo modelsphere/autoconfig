@@ -76,7 +76,7 @@ Manager(leader 选举)
         3) write ConfigMap —— 带 ownerReference(级联 GC)+ diff/fail-safe(照旧)
         4) update status   —— backends/cartPeers/conditions/lastReloadTime(新增)
 ```
-**reload 仍是 sidecar**(同一二进制 `--reload-mode`,inotify→SIGHUP)——**完全不变**。也可选让 controller 经 pods/exec 触发,但 sidecar 更解耦,建议保留。
+**reload 仍是 sidecar**(独立的 reload 小程序/镜像(cmd/reload),inotify→SIGHUP)——**完全不变**。也可选让 controller 经 pods/exec 触发,但 sidecar 更解耦,建议保留。
 
 **关键**:`internal/discovery` 和 `internal/sink` 两个包**原样复用**,只是调用方从「轮询 agent」换成「reconcile 循环」。新增的只有:CRD 类型、reconciler 壳、status 回写。
 
@@ -104,7 +104,7 @@ Manager(leader 选举)
 
 1. **CART 发现归 autoconfig**(不改 CART):autoconfig 外部发现后端 → 写 CART 的 `config.yaml`(workers)+ SIGHUP。因此 `ModelRoute` 有完整的 `cart` 段。
 2. **单个 CR**(`ModelRoute`,一个模型一个),`cart` 段**可选**——省略 = openresty 直连后端。理由:CART 归 autoconfig 后,「模型 X 的后端桶」这**一个 `discovery` 同时喂 CART 的 workers 和 openresty 的兜底 source**,单 CR = 单一真相;现状 1 模型=1 CART=1 route。将来若出现「一个 CART 被多条路由共享 / 一条路由 fan 多个 CART / 团队分权」再拆(加法式:`sources` 支持 `cartRef` 引用独立 CartBinding)。
-3. **reload 仍走 sidecar**(同一二进制 `--reload-mode`),controller 不碰 reload。
+3. **reload 仍走 sidecar**(独立的 reload 小程序/镜像(cmd/reload)),controller 不碰 reload。
 
 ## 8. 输出 ConfigMap 的归属与清理
 

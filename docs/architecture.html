@@ -140,8 +140,8 @@
     <!-- autoconfig agent -->
     <div class="box agent">
       <span class="kind">deployment</span>
-      <div class="nm">autoconfig agent</div>
-      <div class="desc">watch 后端 pods ＋ CART pods（EndpointSlice／label）→ 写各消费方的 config</div>
+      <div class="nm">autoconfig controller</div>
+      <div class="desc">watch ModelRoute ＋ 发现后端／CART pods（EndpointSlice／label）→ 写各消费方的 config</div>
     </div>
 
     <!-- discovery annotation: autoconfig 也发现 CART -->
@@ -204,5 +204,5 @@
 
   </div>
 
-  <footer><span class="mono">autoconfig</span> ＝ 中心 agent（发现＋写配置）＋ 各 pod 的 reload sidecar（openresty／CART 收 SIGHUP；monitor 靠自身 60s 热加载）· 三者零改</footer>
+  <footer><span class="mono">autoconfig</span> ＝ 中心 controller（发现＋写配置）＋ 各 pod 的 reload sidecar（openresty／CART 收 SIGHUP；monitor 靠自身 60s 热加载）· 三者零改</footer>
 </div>

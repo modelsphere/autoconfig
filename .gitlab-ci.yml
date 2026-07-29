@@ -12,7 +12,8 @@
 stages: [build]
 
 variables:
-  IMAGE: harbor.4pd.io/hardcore-tech/autoconfig
+  IMAGE: harbor.4pd.io/hardcore-tech/autoconfig                 # controller
+  RELOAD_IMAGE: harbor.4pd.io/hardcore-tech/autoconfig-reload   # reload sidecar(独立小镜像)
 
 build:image:
   stage: build
@@ -23,3 +24,13 @@ build:image:
     - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
     - docker push "$IMAGE:$CI_COMMIT_TAG"
     - docker push "$IMAGE:latest"
+
+build:reload:
+  stage: build
+  tags: [public-buildx]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - docker build -f Dockerfile.reload -t "$RELOAD_IMAGE:$CI_COMMIT_TAG" -t "$RELOAD_IMAGE:latest" .
+    - docker push "$RELOAD_IMAGE:$CI_COMMIT_TAG"
+    - docker push "$RELOAD_IMAGE:latest"

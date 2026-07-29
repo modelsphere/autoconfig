@@ -1,0 +1,12 @@
+# autoconfig-reload 镜像 —— reload sidecar 独立小程序(cmd/reload)。
+# 与 controller 分离:openresty / CART pod 里挂它当 sidecar,watch ConfigMap 文件变 → SIGHUP 主进程。
+# 多阶段 + vendor 离线编译,同 Dockerfile。
+#   docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-reload:<tag> .
+FROM harbor.4pd.io/library/golang:1.23.3-alpine3.20 AS build
+WORKDIR /src
+COPY . .
+RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o /out/reload ./cmd/reload
+
+FROM harbor.4pd.io/hardcore-tech/python:3.12-alpine
+COPY --from=build /out/reload /usr/local/bin/reload
+ENTRYPOINT ["/usr/local/bin/reload"]

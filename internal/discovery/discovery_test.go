@@ -34,7 +34,7 @@ func TestDiscoverEndpointSlices(t *testing.T) {
 			discoveryv1.Endpoint{Addresses: []string{"10.1.0.5"}, Conditions: discoveryv1.EndpointConditions{Ready: boolp(true)}},
 		),
 	)
-	tgt := config.Target{Name: "glm", Namespace: "glm", Service: "glm-leader", Port: 8050}
+	tgt := config.Target{Namespace: "glm", Service: "glm-leader", Port: 8050}
 
 	peers, err := Discover(context.Background(), cs, tgt)
 	if err != nil {
