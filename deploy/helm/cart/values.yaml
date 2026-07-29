@@ -1,0 +1,32 @@
+image:
+  repository: harbor.4pd.io/hardcore-tech/cache_aware_router
+  tag: ""              # 缺省用 Chart.appVersion(v0.6.0)
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+# autoconfig 从 ModelRoute 写的 CART 配置(config.yaml,含 workers)。本 chart 不创建(autoconfig 管)。
+configConfigMap: cart-config
+
+# launch_service 要求 ulimit -n ≥ 65535
+ulimitNofile: 65535
+
+reload:
+  enabled: true
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.2
+  process: "cache-aware-router"
+
+service:
+  type: ClusterIP
+  port: 8071           # 需与 ModelRoute.cart.port 一致(openresty 按此路由到 CART)
+
+resources:
+  requests: { cpu: 200m, memory: 256Mi }
+  limits: { cpu: "4", memory: 4Gi }
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+nameOverride: ""
+fullnameOverride: ""

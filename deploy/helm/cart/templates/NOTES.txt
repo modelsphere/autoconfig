@@ -1,0 +1,12 @@
+CART(cache-aware-router)已部署({{ include "cart.fullname" . }})。
+
+镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+配置: ConfigMap「{{ .Values.configConfigMap }}」(autoconfig 从 ModelRoute 写 config.yaml + workers)
+{{- if .Values.reload.enabled }}
+reload: sidecar autoconfig-reload watch → SIGHUP cache-aware-router
+{{- end }}
+Service: {{ include "cart.fullname" . }}:{{ .Values.service.port }}(openresty 的 cart source 指向它)
+
+⚠️ CART 需 config.yaml 才能起;请先让 autoconfig 有对应 ModelRoute(cart.outputConfigMap 指向本 ConfigMap)
+   写出 cart-config,再装/等本 chart(否则 CART 会 crashloop 直到 config 出现并传播)。
+验证: kubectl exec deploy/{{ include "cart.fullname" . }} -c cart -- cat /workspace/configs/config.yaml

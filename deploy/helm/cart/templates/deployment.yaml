@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cart.fullname" . }}
+  labels: {{- include "cart.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: {{- include "cart.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "cart.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- if .Values.reload.enabled }}
+      shareProcessNamespace: true
+      {{- end }}
+      containers:
+        - name: cart
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "ulimit -n {{ .Values.ulimitNofile }}; exec ./launch_service"]
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          volumeMounts:
+            - name: cfg                 # autoconfig 写的 config.yaml(整卷挂到 /workspace/configs)
+              mountPath: /workspace/configs
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.reload.enabled }}
+        - name: reload
+          image: {{ .Values.reload.image }}
+          args: ["--watch", "/workspace/configs", "--process", {{ .Values.reload.process | quote }}]
+          volumeMounts:
+            - name: cfg
+              mountPath: /workspace/configs
+        {{- end }}
+      volumes:
+        - name: cfg
+          configMap:
+            name: {{ .Values.configConfigMap }}
+            optional: true      # autoconfig 创建;⚠️ CART 需 config.yaml 才起,建议先 apply ModelRoute 再装本 chart
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
