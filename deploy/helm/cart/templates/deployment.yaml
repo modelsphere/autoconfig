@@ -39,8 +39,7 @@ spec:
       volumes:
         - name: cfg
           configMap:
-            name: {{ .Values.configConfigMap }}
-            optional: true      # autoconfig 创建;⚠️ CART 需 config.yaml 才起,建议先 apply ModelRoute 再装本 chart
+            name: {{ .Values.configMapName }}   # chart 建初值,autoconfig 更新
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

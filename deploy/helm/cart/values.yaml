@@ -5,8 +5,17 @@ image:
 
 replicas: 1
 
-# autoconfig 从 ModelRoute 写的 CART 配置(config.yaml,含 workers)。本 chart 不创建(autoconfig 管)。
-configConfigMap: cart-config
+# CART 配置 ConfigMap(config.yaml):**chart 建初值**(server 块 + 初始 workers),autoconfig 更新
+# (等价手动改 CM;Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 写的 config.yaml)。没 autoconfig 时手动编辑。
+configMapName: cart-config
+
+# 初始 config.yaml(server 块 + workers)。standalone(无 autoconfig)时在此写死 workers;
+# 有 autoconfig 时它会用 ModelRoute.cart.baseConfigRef 重写整个 config.yaml。
+baseConfig: |
+  server:
+    host: "0.0.0.0"
+    port: 8071
+  workers: []
 
 # launch_service 要求 ulimit -n ≥ 65535
 ulimitNofile: 65535

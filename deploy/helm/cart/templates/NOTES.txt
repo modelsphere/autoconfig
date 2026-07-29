@@ -1,12 +1,13 @@
-CART(cache-aware-router)已部署({{ include "cart.fullname" . }})。
+cache-aware-router 已部署({{ include "cart.fullname" . }})。
 
 镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
-配置: ConfigMap「{{ .Values.configConfigMap }}」(autoconfig 从 ModelRoute 写 config.yaml + workers)
+配置 ConfigMap:{{ .Values.configMapName }}(本 chart 建 config.yaml 初值,挂到 /workspace/configs)
 {{- if .Values.reload.enabled }}
-reload: sidecar autoconfig-reload watch → SIGHUP cache-aware-router
+reload: sidecar autoconfig-reload watch → SIGHUP cache-aware-router(热更 workers)
 {{- end }}
-Service: {{ include "cart.fullname" . }}:{{ .Values.service.port }}(openresty 的 cart source 指向它)
+Service :{{ .Values.service.port }}(需与 ModelRoute.cart.port 一致)
 
-⚠️ CART 需 config.yaml 才能起;请先让 autoconfig 有对应 ModelRoute(cart.outputConfigMap 指向本 ConfigMap)
-   写出 cart-config,再装/等本 chart(否则 CART 会 crashloop 直到 config 出现并传播)。
-验证: kubectl exec deploy/{{ include "cart.fullname" . }} -c cart -- cat /workspace/configs/config.yaml
+配置更新两种方式(不冲突):
+  - autoconfig(可选):有 ModelRoute(cart.outputConfigMap={{ .Values.configMapName }})时自动写/更新 workers;
+  - 手动:kubectl edit cm {{ .Values.configMapName }} 改 workers(standalone 模式在 values.baseConfig 写死)。
+  Helm upgrade 三方合并不会覆盖 autoconfig/手动写的 config.yaml。
