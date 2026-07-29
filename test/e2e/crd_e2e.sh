@@ -4,12 +4,12 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.0 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.1 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.0}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.1}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -74,7 +74,7 @@ kind: ConfigMap
 metadata: { name: base-cart }
 data: { config.base.yaml: "server: { host: \"0.0.0.0\", port: 6700 }" }
 ---
-apiVersion: routing.4pd.io/v1alpha1
+apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata: { name: glm }
 spec:

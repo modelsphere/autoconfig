@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	finalizer = "routing.4pd.io/cleanup"
+	finalizer = "routing.gpucluster.io/cleanup"
 	// 重新发现的轮询周期(informer 事件之外的兜底 resync)。
 	resyncEvery = 10 * time.Second
 )
@@ -40,9 +40,9 @@ type ModelRouteReconciler struct {
 	Scheme    *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=routing.4pd.io,resources=modelroutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=routing.4pd.io,resources=modelroutes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=routing.4pd.io,resources=modelroutes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
@@ -58,7 +58,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 删除:跑 finalizer 清理(只摘掉共享 openresty ConfigMap 里自己那个 key)
 	if !rb.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&rb, finalizer) {
-			if err := r.cleanupOpenrestyKey(ctx, &rb); err != nil {
+			if err := r.cleanupSharedKeys(ctx, &rb); err != nil {
 				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(&rb, finalizer)
@@ -139,13 +139,25 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("write openresty configmap: %w", err)
 	}
 
-	// 4) 回写 status
+	// 4) monitor(可选):把发现的后端渲染成 monitor.conf 的 service 行(共享 ConfigMap,每模型一个 key)
+	if m := rb.Spec.Monitor; m != nil {
+		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, backends)
+		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
+			map[string]string{monitorKey(rb.Name): monConf}, false); err != nil {
+			return ctrl.Result{}, fmt.Errorf("write monitor configmap: %w", err)
+		}
+	}
+
+	// 5) 回写 status
 	r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), true, "Synced", "synced")
 	return ctrl.Result{RequeueAfter: resyncEvery}, nil
 }
 
 // openrestyKey 是这条路由在 openresty ConfigMap 里的 key(= 文件名)。
 func openrestyKey(route string) string { return "session_route_" + route + ".conf" }
+
+// monitorKey 是这个模型在共享 monitor ConfigMap 里的 key。
+func monitorKey(name string) string { return name + ".monitor.conf" }
 
 // writeConfigMap 把 data 的 key merge 进目标 ConfigMap(其余 key 保留),不存在则建。
 // exclusive=true(cart 专属)时设 controllerReference → 删 RB 级联 GC;共享的 openresty 不设(靠 finalizer 摘 key)。
@@ -191,10 +203,23 @@ func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1
 	})
 }
 
-// cleanupOpenrestyKey 删 RB 时,从共享 openresty ConfigMap 里摘掉自己那个 key。
-func (r *ModelRouteReconciler) cleanupOpenrestyKey(ctx context.Context, rb *routingv1.ModelRoute) error {
-	ns, name := splitNSName(rb.Spec.Openresty.OutputConfigMap, rb.Namespace)
-	key := openrestyKey(rb.Spec.Openresty.Route)
+// cleanupSharedKeys 删 RB 时,从共享 ConfigMap(openresty + 可选 monitor)里摘掉自己那个 key。
+// cart 的 ConfigMap 是专属 + ownerRef,k8s 自动级联 GC,无需在此处理。
+func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routingv1.ModelRoute) error {
+	if err := r.removeConfigMapKey(ctx, rb.Spec.Openresty.OutputConfigMap, openrestyKey(rb.Spec.Openresty.Route), rb.Namespace); err != nil {
+		return err
+	}
+	if m := rb.Spec.Monitor; m != nil {
+		if err := r.removeConfigMapKey(ctx, m.OutputConfigMap, monitorKey(rb.Name), rb.Namespace); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeConfigMapKey 从共享 ConfigMap 里删掉一个 key(不存在则跳过)。
+func (r *ModelRouteReconciler) removeConfigMapKey(ctx context.Context, ref, key, defaultNS string) error {
+	ns, name := splitNSName(ref, defaultNS)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cm corev1.ConfigMap
 		err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm)

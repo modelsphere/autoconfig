@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.4
-  name: modelroutes.routing.4pd.io
+  name: modelroutes.routing.gpucluster.io
 spec:
-  group: routing.4pd.io
+  group: routing.gpucluster.io
   names:
     kind: ModelRoute
     listKind: ModelRouteList
@@ -90,8 +90,8 @@ spec:
                 - message: 'cart: service 和 selector 必须恰好给一个'
                   rule: has(self.service) != has(self.selector)
               discovery:
-                description: Discovery:本模型的后端桶(喂 CART 的 workers 和 openresty 的 backend
-                  来源)。
+                description: Discovery:本模型的后端桶(喂 CART 的 workers、openresty 的 backend
+                  来源、monitor 的 services)。
                 properties:
                   includeNotReady:
                     description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
@@ -112,6 +112,25 @@ spec:
                 x-kubernetes-validations:
                 - message: 'discovery: service 和 selector 必须恰好给一个'
                   rule: has(self.service) != has(self.selector)
+              monitor:
+                description: Monitor:可选;有 = 把发现的后端也写进 monitor 的 services(monitor 60s
+                  自热加载,无 sidecar)。
+                properties:
+                  gpuType:
+                    description: GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300
+                      / H200)。
+                    type: string
+                  model:
+                    description: Model:monitor service 行的 model 字段(served-model-name);省略用
+                      metadata.name。
+                    type: string
+                  outputConfigMap:
+                    description: OutputConfigMap:autoconfig 写 monitor 配置的 ConfigMap("ns/name",多模型共享,每模型一个
+                      key)。
+                    type: string
+                required:
+                - outputConfigMap
+                type: object
               openresty:
                 description: Openresty:openresty 路由。
                 properties:

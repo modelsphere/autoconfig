@@ -1,4 +1,4 @@
-// autoconfig controller: watch ModelRoute (routing.4pd.io/v1alpha1) → 发现后端 →
+// autoconfig controller: watch ModelRoute (routing.gpucluster.io/v1alpha1) → 发现后端 →
 // 写 openresty peers / CART workers / monitor config。
 // (reload sidecar 是独立程序,见 cmd/reload。)
 package main
@@ -47,7 +47,7 @@ func runController(leaderElect bool) error {
 		Scheme:                  scheme,
 		Metrics:                 metricsserver.Options{BindAddress: "0"}, // 关 metrics server,避免端口占用
 		LeaderElection:          leaderElect,
-		LeaderElectionID:        "autoconfig-controller.routing.4pd.io",
+		LeaderElectionID:        "autoconfig-controller.routing.gpucluster.io",
 		LeaderElectionNamespace: envOr("PS_NAMESPACE", ""), // 空 = in-cluster 自动推断
 	})
 	if err != nil {
@@ -64,7 +64,7 @@ func runController(leaderElect bool) error {
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}
-	log.Print("controller start: ModelRoute (routing.4pd.io/v1alpha1)")
+	log.Print("controller start: ModelRoute (routing.gpucluster.io/v1alpha1)")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 

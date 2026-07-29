@@ -14,9 +14,9 @@ metadata:
   name: {{ include "autoconfig.clusterRoleName" . }}
   labels: {{- include "autoconfig.labels" . | nindent 4 }}
 rules:
-- { apiGroups: ["routing.4pd.io"], resources: ["modelroutes"], verbs: ["get","list","watch","update","patch"] }
-- { apiGroups: ["routing.4pd.io"], resources: ["modelroutes/status"], verbs: ["get","update","patch"] }
-- { apiGroups: ["routing.4pd.io"], resources: ["modelroutes/finalizers"], verbs: ["update"] }
+- { apiGroups: ["routing.gpucluster.io"], resources: ["modelroutes"], verbs: ["get","list","watch","update","patch"] }
+- { apiGroups: ["routing.gpucluster.io"], resources: ["modelroutes/status"], verbs: ["get","update","patch"] }
+- { apiGroups: ["routing.gpucluster.io"], resources: ["modelroutes/finalizers"], verbs: ["update"] }
 - { apiGroups: [""], resources: ["configmaps"], verbs: ["get","list","watch","create","update","patch","delete"] }
 - { apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"] }
 - { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["get","list","watch"] }

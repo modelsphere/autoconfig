@@ -17,10 +17,10 @@
 
 ## 2. CRD 设计
 
-`routing.4pd.io/v1alpha1` · `ModelRoute`(namespaced,一个模型/一条路由一个)。
+`routing.gpucluster.io/v1alpha1` · `ModelRoute`(namespaced,一个模型/一条路由一个)。
 
 ```yaml
-apiVersion: routing.4pd.io/v1alpha1
+apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata: { name: glm-5.1-fp8, namespace: glm }
 spec:

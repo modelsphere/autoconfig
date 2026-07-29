@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CHART=${CHART:-$HERE/autoconfig}
 NS=${NS:-autoconfig}
 TNS=${TNS:-ac-helm-e2e}
-IMG_TAG=${IMG_TAG:-0.3.0}
+IMG_TAG=${IMG_TAG:-0.3.1}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -21,7 +21,7 @@ cleanup(){ [ "$KEEP" = 1 ] && { echo "(--keep)"; return; }
   kubectl delete ns "$TNS" --wait=false 2>/dev/null
   helm uninstall autoconfig -n "$NS" 2>/dev/null
   kubectl delete ns "$NS" --wait=false 2>/dev/null
-  kubectl delete crd modelroutes.routing.4pd.io --wait=false 2>/dev/null
+  kubectl delete crd modelroutes.routing.gpucluster.io --wait=false 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -33,7 +33,7 @@ say "helm install(image.tag=$IMG_TAG)"
 helm upgrade --install autoconfig "$CHART" -n "$NS" --create-namespace \
   --set image.tag="$IMG_TAG" --wait --timeout 200s && ok "helm install" || { bad "helm install"; kubectl -n "$NS" get pods; }
 kubectl -n "$NS" rollout status deploy -l app.kubernetes.io/instance=autoconfig --timeout=60s && ok "controller 就绪" || bad "controller 未就绪"
-kubectl get crd modelroutes.routing.4pd.io >/dev/null 2>&1 && ok "CRD 已安装" || bad "CRD 未安装"
+kubectl get crd modelroutes.routing.gpucluster.io >/dev/null 2>&1 && ok "CRD 已安装" || bad "CRD 未安装"
 
 say "mock 后端 + CART + ModelRoute(helm 装的 controller 调谐)"
 kubectl create ns "$TNS" --dry-run=client -o yaml | kubectl apply -f -
@@ -48,7 +48,7 @@ kind: Service
 metadata: { name: be-svc }
 spec: { selector: { app: be }, ports: [{ port: 8050 }] }
 ---
-apiVersion: routing.4pd.io/v1alpha1
+apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata: { name: demo }
 spec:
@@ -68,7 +68,7 @@ echo "$OR" | grep -q 'listen 18099' && ok "listen 18099" || bad "无 listen 1809
 
 say "helm uninstall(验证 CRD 因 resource-policy:keep 保留)"
 helm uninstall autoconfig -n "$NS" && ok "uninstall" || bad "uninstall"
-kubectl get crd modelroutes.routing.4pd.io >/dev/null 2>&1 && ok "CRD 卸载后仍保留(keep)" || bad "CRD 被误删"
+kubectl get crd modelroutes.routing.gpucluster.io >/dev/null 2>&1 && ok "CRD 卸载后仍保留(keep)" || bad "CRD 被误删"
 
 say "结果"
 [ "$FAIL" = 0 ] && echo "ALL PASS ✅" || echo "SOME FAILED ❌"

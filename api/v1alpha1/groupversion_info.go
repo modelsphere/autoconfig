@@ -1,6 +1,6 @@
-// Package v1alpha1 定义 routing.4pd.io/v1alpha1 的 ModelRoute CRD。
+// Package v1alpha1 定义 routing.gpucluster.io/v1alpha1 的 ModelRoute CRD。
 // +kubebuilder:object:generate=true
-// +groupName=routing.4pd.io
+// +groupName=routing.gpucluster.io
 package v1alpha1
 
 import (
@@ -10,7 +10,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "routing.4pd.io", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "routing.gpucluster.io", Version: "v1alpha1"}
 	// SchemeBuilder registers the types into a runtime scheme.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
 	// AddToScheme adds the types to a scheme.

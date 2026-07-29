@@ -9,7 +9,7 @@ autoconfig 让路由器配置跟着实时收敛。
 ```
 ┌──── autoconfig controller(Deployment,watch ModelRoute + 发现后端,RBAC 一处,leader 选举 HA)────┐
 │ 每个 ModelRoute(一个模型一条):按 discovery 发现后端(EndpointSlice/label,只取 Ready)          │
-│ 渲染:cart → config.yaml 的 workers;openresty → peers(CART 优先 + 后端兜底)                     │
+│ 渲染:cart → config.yaml 的 workers;openresty → peers(CART 优先+后端兜底);monitor → services(可选)│
 │ diff(变了才写)+ fail-safe(发现为空→保留上次)→ 写进各输出 ConfigMap + 回写 status              │
 └──────────────────┬───────────────────────────────────┬────────────────────────────────────────┘
           ConfigMap│(整卷挂,kubelet ~1min)      ConfigMap│
@@ -30,8 +30,9 @@ autoconfig 让路由器配置跟着实时收敛。
 
 > 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「用法」+ [`docs/crd-design.md`](docs/crd-design.md)。
 > (早期的 ConfigMap 驱动「agent 模式」已移除。)
-> **monitor** 也纳入 autoconfig 配置(monitor.conf 的 services;monitor 自身 60s 热加载、无需 sidecar)是**规划方向**
-> (见架构图 [`docs/architecture.html`](docs/architecture.html));当前 ModelRoute 只驱动 openresty + CART。
+> **monitor** 也可由 autoconfig 配置(`spec.monitor`,可选):把发现的后端写进 monitor.conf 的 `service:` 行(每后端一行,
+> 格式 `service: <name> | <url> | <model> | <gpu_type>`),写进共享 monitor ConfigMap(每模型一个 key)。
+> **monitor 自身每 60s 热加载 monitor.conf、无需 reload sidecar**(区别于 openresty/CART);消费方把该 ConfigMap 挂进 monitor pod 即可。
 
 ### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动
 ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把 **session_route*.conf 移到
@@ -41,7 +42,7 @@ openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/route
 
 ## 用法:一个模型一个 ModelRoute
 
-autoconfig controller 的输入是 **`ModelRoute`(routing.4pd.io/v1alpha1)**,一个模型一个对象;`kubectl apply` 当场校验、
+autoconfig controller 的输入是 **`ModelRoute`(routing.gpucluster.io/v1alpha1)**,一个模型一个对象;`kubectl apply` 当场校验、
 `kubectl get modelroute` 直接看发现了几个后端/CART/ready。**发现(`internal/discovery`)、渲染(`internal/sink`)、
 reload sidecar 全部复用**,只是「输入」变 CR、多回写 `status`。设计见 [`docs/crd-design.md`](docs/crd-design.md)。
 
@@ -56,7 +57,7 @@ CRD 放在 chart 的 `crds/`(Helm install-once、`helm uninstall` **不删**,保
 `make install` 或 `kubectl apply -f config/crd/bases/...`)。
 
 **⚠️ 卸载顺序:先删 ModelRoute,再 `helm uninstall`。** ModelRoute 带 finalizer
-(`routing.4pd.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)再删 ModelRoute /
+(`routing.gpucluster.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)再删 ModelRoute /
 namespace,ModelRoute 会卡住、拖住 namespace/CRD 删除。正确:`kubectl delete mr --all -A` → `helm uninstall`。
 (chart 里用 `modelRoutes` 声明的 ModelRoute 由 helm 托管,`helm uninstall` 前会随 release 删除,controller
 还在 → 自动摘 finalizer,无此问题。)已卡住的补救:
@@ -64,7 +65,7 @@ namespace,ModelRoute 会卡住、拖住 namespace/CRD 删除。正确:`kubectl d
 
 裸 manifest(不想用 helm 时):
 ```bash
-kubectl apply -f config/crd/bases/routing.4pd.io_modelroutes.yaml     # 装 CRD
+kubectl apply -f config/crd/bases/routing.gpucluster.io_modelroutes.yaml     # 装 CRD
 kubectl apply -f deploy/controller.yaml             # 起 controller
 ```
 一个 `ModelRoute` 同时驱动 **CART 的 workers**(cart-config,专属 → ownerRef 级联 GC)和 **openresty 的 peers**
@@ -99,7 +100,7 @@ docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-relo
 
 ## 部署
 
-- **controller**:`deploy/helm/autoconfig`(推荐)或 `deploy/controller.yaml` + `config/crd/bases/routing.4pd.io_modelroutes.yaml`。
+- **controller**:`deploy/helm/autoconfig`(推荐)或 `deploy/controller.yaml` + `config/crd/bases/routing.gpucluster.io_modelroutes.yaml`。
 - **reload sidecar**:消费方 pod(openresty / CART)里加一个容器,镜像 `autoconfig-reload`,
   `args: ["--watch","/watch","--process","nginx: master"]`(或 `cache-aware-router`)+ `shareProcessNamespace: true`
   + 把对应输出 ConfigMap **整卷挂**(非 subPath——subPath 不随 ConfigMap 更新)。

@@ -9,7 +9,7 @@ KUSTOMIZE_VERSION      ?= v5.4.3
 CONTROLLER_GEN = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
 KUSTOMIZE      = go run sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
 
-HELM_CRD = deploy/helm/autoconfig/crds/routing.4pd.io_modelroutes.yaml
+HELM_CRD = deploy/helm/autoconfig/crds/routing.gpucluster.io_modelroutes.yaml
 
 .PHONY: all
 all: build
@@ -20,7 +20,7 @@ all: build
 manifests: ## 生成 CRD + RBAC(从 marker),并同步 CRD 到 Helm chart。
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=manager-role paths=./... output:rbac:artifacts:config=config/rbac
-	cp config/crd/bases/routing.4pd.io_modelroutes.yaml $(HELM_CRD)
+	cp config/crd/bases/routing.gpucluster.io_modelroutes.yaml $(HELM_CRD)
 
 .PHONY: generate
 generate: ## 生成 deepcopy(zz_generated.deepcopy.go)。

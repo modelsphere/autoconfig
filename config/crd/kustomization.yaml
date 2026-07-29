@@ -1,2 +1,2 @@
 resources:
-- bases/routing.4pd.io_modelroutes.yaml
+- bases/routing.gpucluster.io_modelroutes.yaml

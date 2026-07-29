@@ -65,15 +65,28 @@ type OpenrestySpec struct {
 	Values map[string]string `json:"values,omitempty"`
 }
 
+// MonitorSpec:可选;有 = autoconfig 把发现的后端写进 monitor 的 services 列表。
+// monitor 自身每 60s 热加载 monitor.conf,无需 reload sidecar(不同于 openresty/CART)。
+type MonitorSpec struct {
+	// OutputConfigMap:autoconfig 写 monitor 配置的 ConfigMap("ns/name",多模型共享,每模型一个 key)。
+	OutputConfigMap string `json:"outputConfigMap"`
+	// Model:monitor service 行的 model 字段(served-model-name);省略用 metadata.name。
+	Model string `json:"model,omitempty"`
+	// GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300 / H200)。
+	GPUType string `json:"gpuType,omitempty"`
+}
+
 // ModelRouteSpec 是一个模型的完整路由绑定。
 // +kubebuilder:validation:XValidation:rule="!self.openresty.sources.exists(s, s.use == 'cart') || has(self.cart)",message="openresty.sources 用了 cart,但没配 spec.cart"
 type ModelRouteSpec struct {
-	// Discovery:本模型的后端桶(喂 CART 的 workers 和 openresty 的 backend 来源)。
+	// Discovery:本模型的后端桶(喂 CART 的 workers、openresty 的 backend 来源、monitor 的 services)。
 	Discovery Discovery `json:"discovery"`
 	// Cart:可选;有 = autoconfig 管这个 CART,无 = openresty 直连后端。
 	Cart *CartSpec `json:"cart,omitempty"`
 	// Openresty:openresty 路由。
 	Openresty OpenrestySpec `json:"openresty"`
+	// Monitor:可选;有 = 把发现的后端也写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)。
+	Monitor *MonitorSpec `json:"monitor,omitempty"`
 }
 
 // ModelRouteStatus 是 controller 回写的观测状态。

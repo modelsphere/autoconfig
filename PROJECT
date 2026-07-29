@@ -1,5 +1,5 @@
 # kubebuilder / operator-sdk 项目元数据。
-domain: 4pd.io
+domain: gpucluster.io
 layout:
 - go.kubebuilder.io/v4
 projectName: autoconfig

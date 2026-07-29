@@ -1,5 +1,5 @@
 # 示例:glm-5.1-fp8 —— EndpointSlice 发现后端 + CART 优先 + 后端兜底。
-apiVersion: routing.4pd.io/v1alpha1
+apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
   name: glm-5.1-fp8
@@ -22,9 +22,13 @@ spec:
     sources:                         # 有序:CART 优先 + 后端兜底
       - { use: cart,    priority: 1, maxConcurrency: 180 }
       - { use: backend, priority: 0 }
+  monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
+    outputConfigMap: monitor/monitor-conf
+    model: glm-5.1-fp8
+    gpuType: H100
 ---
 # 无 CART 的例子:openresty 直连后端(省略 cart 段,sources 只有 backend)
-apiVersion: routing.4pd.io/v1alpha1
+apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
   name: kimi-k2.6

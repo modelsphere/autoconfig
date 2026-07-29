@@ -54,6 +54,9 @@ func TestReconcileGLM(t *testing.T) {
 					{Use: "backend", Priority: 0},
 				},
 			},
+			Monitor: &routingv1.MonitorSpec{
+				OutputConfigMap: "monitor/monitor-conf", Model: "glm-5.1-fp8", GPUType: "H100",
+			},
 		},
 	}
 	base := &corev1.ConfigMap{
@@ -112,6 +115,21 @@ func TestReconcileGLM(t *testing.T) {
 	}
 	if strings.Index(conf, wantCart) > strings.Index(conf, wantBe) {
 		t.Errorf("CART peer 应在后端 peer 之前\n%s", conf)
+	}
+
+	// monitor:共享 ConfigMap 里本模型一个 key,每后端一行 service
+	var monCM corev1.ConfigMap
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "monitor", Name: "monitor-conf"}, &monCM); err != nil {
+		t.Fatalf("get monitor-conf: %v", err)
+	}
+	mon := monCM.Data["glm-5.1-fp8.monitor.conf"]
+	for _, w := range []string{
+		"service: glm-5.1-fp8-0 | http://10.1.0.1:8050 | glm-5.1-fp8 | H100",
+		"service: glm-5.1-fp8-1 | http://10.1.0.2:8050 | glm-5.1-fp8 | H100",
+	} {
+		if !strings.Contains(mon, w) {
+			t.Errorf("monitor conf missing %q\n%s", w, mon)
+		}
 	}
 
 	// status 回写

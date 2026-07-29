@@ -2,7 +2,7 @@
        Helm 安装顺序按 kind 排序:CustomResourceDefinition 先于自定义资源,故 CRD 先建、RB 后建。 */ -}}
 {{- range .Values.modelRoutes }}
 ---
-apiVersion: routing.4pd.io/v1alpha1
+apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
   name: {{ .name }}
