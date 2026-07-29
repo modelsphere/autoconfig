@@ -25,8 +25,9 @@ autoconfig 让路由器配置跟着实时收敛。
   变化就 `kill -HUP` 主进程(靠 `shareProcessNamespace`)。CART / openresty 收 SIGHUP 优雅重载。
   **controller 与 reload 是两个独立二进制/镜像**,不再是同一二进制的模式。
 
-已在真集群 + 真 `cache_aware_router` + mock 后端端到端验证:多模型分桶、scale 精准跟随、
-不变不 reload、空→保留上次(fail-safe)、删除清理(finalizer/ownerRef);`make install` / `make deploy` 亦已实测。
+**验证状态**(别混淆两层):
+- **CRD controller**(现版):k8s-cpu-20 + **mock 后端**已验——发现分桶、**写出的 cart-config/openresty-conf/monitor-conf ConfigMap 内容正确**、status、scale 跟随、fail-safe、删除清理(finalizer/ownerRef)、`make install`/`make deploy`。即验到「autoconfig 写对 ConfigMap」为止。
+- **真 openresty(0.1.0-routes)+ 真 CART(v0.6.0)+ 真 monitor 端到端接入**(真 reload/serve):见 `test/e2e/real_e2e.sh`。
 
 > 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「用法」+ [`docs/crd-design.md`](docs/crd-design.md)。
 > (早期的 ConfigMap 驱动「agent 模式」已移除。)
