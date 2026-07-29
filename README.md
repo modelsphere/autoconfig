@@ -9,27 +9,29 @@ autoconfig 让路由器配置跟着实时收敛。
 ```
 ┌──── autoconfig controller(Deployment,watch ModelRoute + 发现后端,RBAC 一处,leader 选举 HA)────┐
 │ 每个 ModelRoute(一个模型一条):按 discovery 发现后端(EndpointSlice/label,只取 Ready)          │
-│ 渲染:cart → config.yaml 的 workers;openresty → peers(CART 优先+后端兜底);monitor → services  │
+│ 渲染:cart → config.yaml 的 workers;openresty → peers(CART 优先 + 后端兜底)                     │
 │ diff(变了才写)+ fail-safe(发现为空→保留上次)→ 写进各输出 ConfigMap + 回写 status              │
-└──────────┬──────────────────────────┬──────────────────────────┬──────────────────────────────────┘
-   ConfigMap│(整卷挂,kubelet ~1min)ConfigMap│                ConfigMap│
-   ┌────────▼──── CART pod ────┐ ┌──────▼── openresty pod ──┐ ┌────▼── monitor pod ──┐
-   │ [cart] 读 config.yaml     │ │ [openresty] conf.d/routes │ │ [monitor] 60s 自动    │
-   │ [reload sidecar] SIGHUP   │ │ [reload sidecar] SIGHUP    │ │   热加载,无需 sidecar  │
-   │   shareProcessNamespace   │ │   shareProcessNamespace    │ │                        │
-   └───────────────────────────┘ └────────────────────────────┘ └────────────────────────┘
+└──────────────────┬───────────────────────────────────┬────────────────────────────────────────┘
+          ConfigMap│(整卷挂,kubelet ~1min)      ConfigMap│
+          ┌────────▼──────── CART pod ────────┐ ┌───────▼──── openresty pod ──────┐
+          │ [cart] 读 config.yaml             │ │ [openresty] include conf.d/routes│
+          │ [autoconfig-reload] → SIGHUP      │ │ [autoconfig-reload] → SIGHUP     │
+          │   shareProcessNamespace           │ │   shareProcessNamespace          │
+          └───────────────────────────────────┘ └──────────────────────────────────┘
 ```
 
-- **controller**(`autoconfig`,镜像 `autoconfig`):唯一发现逻辑 + RBAC 一处;watch ModelRoute → 发现 → 渲染 → 写 ConfigMap + status。
-- **reload sidecar**(**独立小程序** `cmd/reload`,镜像 `autoconfig-reload`):watch 挂载的 ConfigMap 文件,
-  变化就 `kill -HUP` 主进程(靠 `shareProcessNamespace`)。CART/openresty 收 SIGHUP 优雅重载;monitor 不需要
-  (自身 60s 热加载)。**controller 与 reload 是两个独立二进制/镜像**,不再是同一二进制的模式。
+- **controller**(`autoconfig` 镜像,`cmd/`):唯一发现逻辑 + RBAC 一处;watch ModelRoute → 发现 → 渲染 → 写 ConfigMap + status。
+- **reload sidecar**(**独立小程序** `cmd/reload`,`autoconfig-reload` 镜像):watch 挂载的 ConfigMap 文件,
+  变化就 `kill -HUP` 主进程(靠 `shareProcessNamespace`)。CART / openresty 收 SIGHUP 优雅重载。
+  **controller 与 reload 是两个独立二进制/镜像**,不再是同一二进制的模式。
 
 已在真集群 + 真 `cache_aware_router` + mock 后端端到端验证:多模型分桶、scale 精准跟随、
-不变不 reload、空→保留上次(fail-safe)、删除清理(finalizer/ownerRef)。
+不变不 reload、空→保留上次(fail-safe)、删除清理(finalizer/ownerRef);`make install` / `make deploy` 亦已实测。
 
-> 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「CRD 模式」+ [`docs/crd-design.md`](docs/crd-design.md)。
+> 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「用法」+ [`docs/crd-design.md`](docs/crd-design.md)。
 > (早期的 ConfigMap 驱动「agent 模式」已移除。)
+> **monitor** 也纳入 autoconfig 配置(monitor.conf 的 services;monitor 自身 60s 热加载、无需 sidecar)是**规划方向**
+> (见架构图 [`docs/architecture.html`](docs/architecture.html));当前 ModelRoute 只驱动 openresty + CART。
 
 ### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动
 ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把 **session_route*.conf 移到
@@ -73,7 +75,7 @@ kubectl apply -f deploy/controller.yaml             # 起 controller
 **多阶段 build,依赖已 vendor(`vendor/` 入库),全程离线**——不联网、不预置二进制:
 
 ```bash
-docker build -t harbor.4pd.io/hardcore-tech/autoconfig:<tag> .                       # controller(cmd/autoconfig)
+docker build -t harbor.4pd.io/hardcore-tech/autoconfig:<tag> .                       # controller(cmd/)
 docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-reload:<tag> .  # reload sidecar(cmd/reload,独立小镜像)
 ```
 
@@ -100,7 +102,7 @@ docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-relo
 - **controller**:`deploy/helm/autoconfig`(推荐)或 `deploy/controller.yaml` + `config/crd/bases/routing.4pd.io_modelroutes.yaml`。
 - **reload sidecar**:消费方 pod(openresty / CART)里加一个容器,镜像 `autoconfig-reload`,
   `args: ["--watch","/watch","--process","nginx: master"]`(或 `cache-aware-router`)+ `shareProcessNamespace: true`
-  + 把对应输出 ConfigMap **整卷挂**(非 subPath——subPath 不随 ConfigMap 更新)。monitor 不需要 sidecar。
+  + 把对应输出 ConfigMap **整卷挂**(非 subPath——subPath 不随 ConfigMap 更新)。
 
 ## 注意(踩坑)
 
