@@ -5,13 +5,17 @@ image:
 
 replicas: 1
 
-# autoconfig 从 ModelRoute 写的 services ConfigMap(每模型一个 <model>.monitor.conf key)。
-servicesConfigMap: monitor-conf
+# monitor conf.d ConfigMap:**chart 建初值**(base 阈值 + 可选初始 services),autoconfig 更新
+# (每模型一个 <model>.monitor.conf key;Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 加的 key)。
+# 没 autoconfig 时手动编辑此 CM 加 service 行即可。
+configMapName: monitor-conf
 
-# 本 chart 提供的 base 阈值(00-base.conf);与 autoconfig 的 services 经 projected volume 合并到 conf.d 目录。
+# 本 chart 提供的 base 阈值(存为 00-base.conf key)。
 baseConfig: |
   alert_ttft: 80
   gpu_temp_warn: 75
+
+initialServices: {}    # 可选初始 service 文件(文件名: 内容);默认空,由 autoconfig 填
 
 service:
   type: ClusterIP

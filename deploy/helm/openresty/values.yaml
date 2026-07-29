@@ -5,9 +5,10 @@ image:
 
 replicas: 1
 
-# autoconfig 从 ModelRoute 写的路由 ConfigMap(每路由一个 session_route_<route>.conf key),挂到 conf.d/routes/。
-# 本 chart 不创建它(autoconfig 管);optional 挂载 → 即使还没建 pod 也能起(框架已 baked)。
-routesConfigMap: openresty-conf
+# 路由 ConfigMap(挂到 conf.d/routes/):**chart 创建初值**,autoconfig 更新(等价手动改 CM;
+# Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 加的 key)。没 autoconfig 时手动编辑此 CM 即可。
+configMapName: openresty-conf
+initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容);默认空(仅框架起,路由由 autoconfig 填)
 
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:

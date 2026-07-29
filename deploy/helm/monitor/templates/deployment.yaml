@@ -24,18 +24,13 @@ spec:
           env: {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            - name: mconf                 # base + autoconfig services 合并;monitor 60s 自热加载(无 sidecar)
+            - name: mconf                 # base + autoconfig services 同一 ConfigMap;monitor 60s 自热加载(无 sidecar)
               mountPath: /etc/monitor/conf.d
           resources: {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: mconf
-          projected:                      # 合并两个 ConfigMap 到一个目录(monitor 读 *.conf)
-            sources:
-              - configMap:
-                  name: {{ include "monitor.fullname" . }}-base    # chart 的 base 阈值
-              - configMap:
-                  name: {{ .Values.servicesConfigMap }}            # autoconfig 的 services
-                  optional: true
+          configMap:
+            name: {{ .Values.configMapName }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

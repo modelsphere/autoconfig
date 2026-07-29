@@ -1,10 +1,10 @@
-monitor 已部署({{ include "monitor.fullname" . }})。dashboard: :{{ .Values.service.port }}
+monitor 已部署({{ include "monitor.fullname" . }})。
 
-配置(projected 合并到 /etc/monitor/conf.d):
-  - base 阈值: 本 chart 的 ConfigMap「{{ include "monitor.fullname" . }}-base」(00-base.conf)
-  - services:  autoconfig 从 ModelRoute 写的「{{ .Values.servicesConfigMap }}」(每模型一个 *.monitor.conf)
-monitor 每 60s 自热加载 monitor.conf,无需 reload sidecar。
+镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+conf.d ConfigMap:{{ .Values.configMapName }}(本 chart 建 00-base.conf 阈值,挂到 /etc/monitor/conf.d)
+dashboard: Service :{{ .Values.service.port }}
 
-⚠️ monitor 首启需至少一条 service(否则 "no services configured" 拒启);请先让 autoconfig 有对应
-   ModelRoute(monitor.outputConfigMap 指向本 servicesConfigMap)写出 service,再装/等本 chart。
-验证: kubectl logs deploy/{{ include "monitor.fullname" . }} | grep '配置热更新: services'
+配置更新两种方式(不冲突;monitor 60s 自热加载,无需 sidecar):
+  - autoconfig(可选):有 ModelRoute(monitor.outputConfigMap={{ .Values.configMapName }})时自动写/更新 <model>.monitor.conf;
+  - 手动:kubectl edit cm {{ .Values.configMapName }} 增删 service 行。
+  Helm upgrade 三方合并不会覆盖 autoconfig/手动加的 service key。

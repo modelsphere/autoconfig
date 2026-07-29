@@ -1,0 +1,14 @@
+# monitor-conf:chart 建初值(base 阈值 00-base.conf + 可选初始 services),autoconfig 更新
+# (每模型一个 <model>.monitor.conf key;Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 加的 key)。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMapName }}
+  labels: {{- include "monitor.labels" . | nindent 4 }}
+data:
+  00-base.conf: |
+{{ .Values.baseConfig | indent 4 }}
+{{- range $f, $c := .Values.initialServices }}
+  {{ $f }}: |
+{{ $c | indent 4 }}
+{{- end }}

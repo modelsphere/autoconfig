@@ -1,9 +1,0 @@
-# base 阈值(00-base.conf);与 autoconfig 的 services(servicesConfigMap)经 projected volume 合并到 conf.d 目录。
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "monitor.fullname" . }}-base
-  labels: {{- include "monitor.labels" . | nindent 4 }}
-data:
-  00-base.conf: |
-{{ .Values.baseConfig | indent 4 }}

@@ -40,8 +40,7 @@ spec:
       volumes:
         - name: routes
           configMap:
-            name: {{ .Values.routesConfigMap }}
-            optional: true      # 由 autoconfig 创建;不存在也让 pod 起(框架 baked,routes 后填)
+            name: {{ .Values.configMapName }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
