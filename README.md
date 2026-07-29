@@ -124,11 +124,19 @@ openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/route
 `kubectl get routerbinding` 直接看发现了几个后端/CART/ready。**发现(`internal/discovery`)、渲染(`internal/sink`)、
 reload sidecar 全部复用**,只是「输入」变 CR、多回写 `status`。设计见 [`docs/crd-design.md`](docs/crd-design.md)。
 
+**Helm 部署(推荐)** —— chart 在 `deploy/helm/autoconfig/`(含 CRD + SA/RBAC + Deployment):
 ```bash
-kubectl apply -f config/crd/routerbindings.yaml     # 装 CRD
-kubectl apply -f deploy/controller.yaml             # 起 controller(SA/RBAC/Deployment,leader 选举 HA)
+helm upgrade --install autoconfig deploy/helm/autoconfig -n autoconfig --create-namespace
 kubectl apply -f config/samples/routerbinding-glm.yaml
 kubectl get rb -A                                   # NAME/BACKENDS/CART/READY/AGE
+```
+常用 values:`image.tag`、`replicas`(>1 leader 选举 HA)、`crd.install`(默认 true;CRD 带
+`helm.sh/resource-policy: keep`,卸载不删,保护已有 RouterBinding)、`leaderElection`。
+
+裸 manifest(不想用 helm 时):
+```bash
+kubectl apply -f config/crd/routerbindings.yaml     # 装 CRD
+kubectl apply -f deploy/controller.yaml             # 起 controller
 ```
 一个 `RouterBinding` 同时驱动 **CART 的 workers**(cart-config,专属 → ownerRef 级联 GC)和 **openresty 的 peers**
 (openresty-conf,多路由共享 → finalizer 摘 key);`cart` 段可选(省略 = openresty 直连后端)。消费方 pod +

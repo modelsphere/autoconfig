@@ -1,0 +1,29 @@
+autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
+
+镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+副本: {{ .Values.replicas }}{{ if .Values.leaderElection }}(leader 选举 HA){{ end }}
+
+查看 controller:
+  kubectl -n {{ .Release.Namespace }} get deploy,pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "autoconfig.fullname" . }} -f
+
+创建一个 RouterBinding(一个模型一条),controller 会自动:
+  发现后端 → 写 CART 的 workers(cart-config)+ openresty 的 peers(openresty-conf,CART 优先 + 后端兜底)。
+
+  kubectl apply -f - <<'EOF'
+  apiVersion: routing.4pd.io/v1alpha1
+  kind: RouterBinding
+  metadata: { name: glm-5.1-fp8, namespace: glm }
+  spec:
+    discovery: { service: glm-leader, port: 8050 }   # 或 selector
+    cart: { service: cart-glm, port: 8071, outputConfigMap: glm/cart-config,
+            baseConfigRef: { name: base-cart, key: config.base.yaml }, maxLoad: 20 }
+    openresty:
+      route: glm
+      listen: 18083
+      outputConfigMap: openresty/openresty-conf
+      sources: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
+  EOF
+
+查看状态(发现了几个后端 / CART / ready):
+  kubectl get routerbindings -A     # 或 kubectl get rb -A

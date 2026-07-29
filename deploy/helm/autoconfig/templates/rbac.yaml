@@ -1,0 +1,39 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "autoconfig.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "autoconfig.labels" . | nindent 4 }}
+{{- end }}
+{{- if .Values.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "autoconfig.clusterRoleName" . }}
+  labels: {{- include "autoconfig.labels" . | nindent 4 }}
+rules:
+- { apiGroups: ["routing.4pd.io"], resources: ["routerbindings"], verbs: ["get","list","watch","update","patch"] }
+- { apiGroups: ["routing.4pd.io"], resources: ["routerbindings/status"], verbs: ["get","update","patch"] }
+- { apiGroups: ["routing.4pd.io"], resources: ["routerbindings/finalizers"], verbs: ["update"] }
+- { apiGroups: [""], resources: ["configmaps"], verbs: ["get","list","watch","create","update","patch","delete"] }
+- { apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"] }
+- { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["get","list","watch"] }
+- { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get","list","watch","create","update","patch","delete"] }
+- { apiGroups: [""], resources: ["events"], verbs: ["create","patch"] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "autoconfig.clusterRoleName" . }}
+  labels: {{- include "autoconfig.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "autoconfig.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "autoconfig.clusterRoleName" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
