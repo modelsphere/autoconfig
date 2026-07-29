@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # autoconfig CRD controller 端到端(在能 kubectl 的机器上跑,如 k8s-cpu-20)。
-# 装 CRD + controller → mock 后端(Service→EndpointSlice)+ mock CART → RouterBinding
+# 装 CRD + controller → mock 后端(Service→EndpointSlice)+ mock CART → ModelRoute
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
-# 依赖同目录文件:routerbindings.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.2.0 bash crd_e2e.sh [--keep]
+# 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.0 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.2.0}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.0}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -28,15 +28,15 @@ trap cleanup EXIT
 
 # ---------- 1) CRD + controller ----------
 say "install CRD + controller ($IMG)"
-kubectl apply -f "$HERE/routerbindings.yaml"
+kubectl apply -f "$HERE/modelroutes.yaml"
 kubectl create ns "$CTRL_NS" --dry-run=client -o yaml | kubectl apply -f -
 # 用传入 IMG 覆盖 controller.yaml 里的 image
 sed "s#image: harbor.4pd.io/hardcore-tech/autoconfig:.*#image: $IMG#" "$HERE/controller.yaml" | kubectl apply -f -
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s || { bad "controller 未就绪"; kubectl -n "$CTRL_NS" get pods; exit 1; }
 ok "controller 就绪"
 
-# ---------- 2) mock 后端 + CART + RouterBinding ----------
-say "mock 后端(2) + CART(1) + RouterBinding"
+# ---------- 2) mock 后端 + CART + ModelRoute ----------
+say "mock 后端(2) + CART(1) + ModelRoute"
 kubectl create ns "$NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n "$NS" apply -f - <<YAML
 apiVersion: apps/v1
@@ -75,7 +75,7 @@ metadata: { name: base-cart }
 data: { config.base.yaml: "server: { host: \"0.0.0.0\", port: 6700 }" }
 ---
 apiVersion: routing.4pd.io/v1alpha1
-kind: RouterBinding
+kind: ModelRoute
 metadata: { name: glm }
 spec:
   discovery: { service: glm-leader, port: 8050 }
@@ -92,9 +92,9 @@ kubectl -n "$NS" rollout status deploy/cart-glm --timeout=120s
 
 # ---------- 3) 断言:status + cart workers + openresty peers ----------
 say "验证:status / cart-config / openresty-conf"
-rb_backends(){ kubectl -n "$NS" get rb glm -o jsonpath='{.status.backends}'; }
-rb_cart(){ kubectl -n "$NS" get rb glm -o jsonpath='{.status.cartPeers}'; }
-rb_ready(){ kubectl -n "$NS" get rb glm -o jsonpath='{.status.ready}'; }
+rb_backends(){ kubectl -n "$NS" get mr glm -o jsonpath='{.status.backends}'; }
+rb_cart(){ kubectl -n "$NS" get mr glm -o jsonpath='{.status.cartPeers}'; }
+rb_ready(){ kubectl -n "$NS" get mr glm -o jsonpath='{.status.ready}'; }
 waiteq 2 "status.backends" rb_backends
 waiteq 1 "status.cartPeers" rb_cart
 waiteq true "status.ready" rb_ready
@@ -122,8 +122,8 @@ for i in $(seq 1 20); do n=$(kubectl -n "$NS" get cm cart-config -o jsonpath='{.
 [ "$n" = 3 ] && ok "cart workers 跟随到 3" || bad "cart workers 未跟随($n)"
 
 # ---------- 5) 删除清理:finalizer 摘 openresty key + ownerRef GC cart-config ----------
-say "删除 RouterBinding,验证清理"
-kubectl -n "$NS" delete rb glm --timeout=60s
+say "删除 ModelRoute,验证清理"
+kubectl -n "$NS" delete mr glm --timeout=60s
 for i in $(seq 1 20); do kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_glm\.conf}' 2>/dev/null | grep -q . || break; sleep 3; done
 kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_glm\.conf}' 2>/dev/null | grep -q . && bad "openresty key 未被 finalizer 摘除" || ok "openresty key 已摘除(finalizer)"
 for i in $(seq 1 20); do kubectl -n "$NS" get cm cart-config >/dev/null 2>&1 || break; sleep 3; done

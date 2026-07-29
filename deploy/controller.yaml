@@ -1,5 +1,5 @@
-# autoconfig CRD controller 部署(RouterBinding 调谐器)。
-# 先装 CRD:kubectl apply -f config/crd/routerbindings.yaml
+# autoconfig CRD controller 部署(ModelRoute 调谐器)。
+# 先装 CRD:kubectl apply -f config/crd/modelroutes.yaml
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -9,9 +9,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata: { name: autoconfig-controller }
 rules:
-- { apiGroups: ["routing.4pd.io"], resources: ["routerbindings"], verbs: ["get","list","watch","update","patch"] }
-- { apiGroups: ["routing.4pd.io"], resources: ["routerbindings/status"], verbs: ["get","update","patch"] }
-- { apiGroups: ["routing.4pd.io"], resources: ["routerbindings/finalizers"], verbs: ["update"] }
+- { apiGroups: ["routing.4pd.io"], resources: ["modelroutes"], verbs: ["get","list","watch","update","patch"] }
+- { apiGroups: ["routing.4pd.io"], resources: ["modelroutes/status"], verbs: ["get","update","patch"] }
+- { apiGroups: ["routing.4pd.io"], resources: ["modelroutes/finalizers"], verbs: ["update"] }
 - { apiGroups: [""], resources: ["configmaps"], verbs: ["get","list","watch","create","update","patch","delete"] }
 - { apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"] }                          # selector 兜底发现
 - { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["get","list","watch"] } # service EndpointSlice 发现
@@ -37,7 +37,7 @@ spec:
       serviceAccountName: autoconfig-controller
       containers:
       - name: controller
-        image: harbor.4pd.io/hardcore-tech/autoconfig:0.2.0
+        image: harbor.4pd.io/hardcore-tech/autoconfig:0.3.0
         imagePullPolicy: Always          # tag 可能被重推(CI overwrite),强制重拉避免用到节点旧缓存
         args: ["--controller"]
         env:

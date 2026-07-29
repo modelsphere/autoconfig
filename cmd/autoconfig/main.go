@@ -1,7 +1,7 @@
 // autoconfig: k8s backend discovery -> openresty/CART config.
 //
 //	agent mode:      autoconfig --config /etc/autoconfig/config.yaml   (ConfigMap 驱动)
-//	controller mode: autoconfig --controller                          (CRD RouterBinding 驱动)
+//	controller mode: autoconfig --controller                          (CRD ModelRoute 驱动)
 //	reload mode:     autoconfig --reload-mode --watch /cfg --process cache-aware-router
 package main
 
@@ -33,7 +33,7 @@ func main() {
 	log.SetPrefix("[autoconfig] ")
 
 	reloadMode := flag.Bool("reload-mode", false, "run as reload sidecar (watch file -> SIGHUP)")
-	controllerMode := flag.Bool("controller", false, "run as CRD controller (RouterBinding)")
+	controllerMode := flag.Bool("controller", false, "run as CRD controller (ModelRoute)")
 	watch := flag.String("watch", envOr("PS_WATCH", ""), "reload mode: file/dir to watch")
 	proc := flag.String("process", envOr("PS_PROCESS", ""), "reload mode: process cmdline substring to SIGHUP")
 	cfgPath := flag.String("config", envOr("PS_CONFIG", "/etc/autoconfig/config.yaml"), "agent mode: config path")
@@ -70,7 +70,7 @@ func main() {
 	}
 }
 
-// runController 启动 controller-runtime manager,调谐 RouterBinding。
+// runController 启动 controller-runtime manager,调谐 ModelRoute。
 func runController(leaderElect bool) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
 
@@ -96,14 +96,14 @@ func runController(leaderElect bool) error {
 	if err != nil {
 		return err
 	}
-	if err := (&controller.RouterBindingReconciler{
+	if err := (&controller.ModelRouteReconciler{
 		Client:    mgr.GetClient(),
 		Clientset: cs,
 		Scheme:    mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}
-	log.Print("controller start: RouterBinding (routing.4pd.io/v1alpha1)")
+	log.Print("controller start: ModelRoute (routing.4pd.io/v1alpha1)")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 

@@ -74,7 +74,7 @@ func (in *OpenrestySpec) DeepCopy() *OpenrestySpec {
 	return out
 }
 
-func (in *RouterBindingSpec) DeepCopyInto(out *RouterBindingSpec) {
+func (in *ModelRouteSpec) DeepCopyInto(out *ModelRouteSpec) {
 	*out = *in
 	out.Discovery = in.Discovery
 	if in.Cart != nil {
@@ -83,16 +83,16 @@ func (in *RouterBindingSpec) DeepCopyInto(out *RouterBindingSpec) {
 	}
 	in.Openresty.DeepCopyInto(&out.Openresty)
 }
-func (in *RouterBindingSpec) DeepCopy() *RouterBindingSpec {
+func (in *ModelRouteSpec) DeepCopy() *ModelRouteSpec {
 	if in == nil {
 		return nil
 	}
-	out := new(RouterBindingSpec)
+	out := new(ModelRouteSpec)
 	in.DeepCopyInto(out)
 	return out
 }
 
-func (in *RouterBindingStatus) DeepCopyInto(out *RouterBindingStatus) {
+func (in *ModelRouteStatus) DeepCopyInto(out *ModelRouteStatus) {
 	*out = *in
 	if in.LastSyncTime != nil {
 		out.LastSyncTime = in.LastSyncTime.DeepCopy()
@@ -104,57 +104,57 @@ func (in *RouterBindingStatus) DeepCopyInto(out *RouterBindingStatus) {
 		}
 	}
 }
-func (in *RouterBindingStatus) DeepCopy() *RouterBindingStatus {
+func (in *ModelRouteStatus) DeepCopy() *ModelRouteStatus {
 	if in == nil {
 		return nil
 	}
-	out := new(RouterBindingStatus)
+	out := new(ModelRouteStatus)
 	in.DeepCopyInto(out)
 	return out
 }
 
-func (in *RouterBinding) DeepCopyInto(out *RouterBinding) {
+func (in *ModelRoute) DeepCopyInto(out *ModelRoute) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
 	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
 	in.Spec.DeepCopyInto(&out.Spec)
 	in.Status.DeepCopyInto(&out.Status)
 }
-func (in *RouterBinding) DeepCopy() *RouterBinding {
+func (in *ModelRoute) DeepCopy() *ModelRoute {
 	if in == nil {
 		return nil
 	}
-	out := new(RouterBinding)
+	out := new(ModelRoute)
 	in.DeepCopyInto(out)
 	return out
 }
-func (in *RouterBinding) DeepCopyObject() runtime.Object {
+func (in *ModelRoute) DeepCopyObject() runtime.Object {
 	if c := in.DeepCopy(); c != nil {
 		return c
 	}
 	return nil
 }
 
-func (in *RouterBindingList) DeepCopyInto(out *RouterBindingList) {
+func (in *ModelRouteList) DeepCopyInto(out *ModelRouteList) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
 	in.ListMeta.DeepCopyInto(&out.ListMeta)
 	if in.Items != nil {
-		out.Items = make([]RouterBinding, len(in.Items))
+		out.Items = make([]ModelRoute, len(in.Items))
 		for i := range in.Items {
 			in.Items[i].DeepCopyInto(&out.Items[i])
 		}
 	}
 }
-func (in *RouterBindingList) DeepCopy() *RouterBindingList {
+func (in *ModelRouteList) DeepCopy() *ModelRouteList {
 	if in == nil {
 		return nil
 	}
-	out := new(RouterBindingList)
+	out := new(ModelRouteList)
 	in.DeepCopyInto(out)
 	return out
 }
-func (in *RouterBindingList) DeepCopyObject() runtime.Object {
+func (in *ModelRouteList) DeepCopyObject() runtime.Object {
 	if c := in.DeepCopy(); c != nil {
 		return c
 	}

@@ -1,6 +1,6 @@
 # 示例:glm-5.1-fp8 —— EndpointSlice 发现后端 + CART 优先 + 后端兜底。
 apiVersion: routing.4pd.io/v1alpha1
-kind: RouterBinding
+kind: ModelRoute
 metadata:
   name: glm-5.1-fp8
   namespace: glm
@@ -25,7 +25,7 @@ spec:
 ---
 # 无 CART 的例子:openresty 直连后端(省略 cart 段,sources 只有 backend)
 apiVersion: routing.4pd.io/v1alpha1
-kind: RouterBinding
+kind: ModelRoute
 metadata:
   name: kimi-k2.6
   namespace: kimi

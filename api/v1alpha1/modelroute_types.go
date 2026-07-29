@@ -62,8 +62,8 @@ type OpenrestySpec struct {
 	Values map[string]string `json:"values,omitempty"`
 }
 
-// RouterBindingSpec 是一个模型的完整路由绑定。
-type RouterBindingSpec struct {
+// ModelRouteSpec 是一个模型的完整路由绑定。
+type ModelRouteSpec struct {
 	// Discovery:本模型的后端桶(喂 CART 的 workers 和 openresty 的 backend 来源)。
 	Discovery Discovery `json:"discovery"`
 	// Cart:可选;有 = autoconfig 管这个 CART,无 = openresty 直连后端。
@@ -72,8 +72,8 @@ type RouterBindingSpec struct {
 	Openresty OpenrestySpec `json:"openresty"`
 }
 
-// RouterBindingStatus 是 controller 回写的观测状态。
-type RouterBindingStatus struct {
+// ModelRouteStatus 是 controller 回写的观测状态。
+type ModelRouteStatus struct {
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
 	Backends           int                `json:"backends"`
 	CartPeers          int                `json:"cartPeers"`
@@ -89,20 +89,20 @@ type RouterBindingStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=boolean,JSONPath=`.status.ready`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// RouterBinding 把「一个模型的后端」自动同步到 openresty 的 peers 与 CART 的 workers。
-type RouterBinding struct {
+// ModelRoute 把「一个模型的后端」自动同步到 openresty 的 peers 与 CART 的 workers。
+type ModelRoute struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   RouterBindingSpec   `json:"spec,omitempty"`
-	Status RouterBindingStatus `json:"status,omitempty"`
+	Spec   ModelRouteSpec   `json:"spec,omitempty"`
+	Status ModelRouteStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// RouterBindingList is a list of RouterBinding.
-type RouterBindingList struct {
+// ModelRouteList is a list of ModelRoute.
+type ModelRouteList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []RouterBinding `json:"items"`
+	Items           []ModelRoute `json:"items"`
 }

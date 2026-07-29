@@ -38,9 +38,9 @@ func TestReconcileGLM(t *testing.T) {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = routingv1.AddToScheme(scheme)
 
-	rb := &routingv1.RouterBinding{
+	rb := &routingv1.ModelRoute{
 		ObjectMeta: metav1.ObjectMeta{Name: "glm-5.1-fp8", Namespace: "glm"},
-		Spec: routingv1.RouterBindingSpec{
+		Spec: routingv1.ModelRouteSpec{
 			Discovery: routingv1.Discovery{Service: "glm-leader", Port: 8050},
 			Cart: &routingv1.CartSpec{
 				Service: "cart-glm", Port: 8071, OutputConfigMap: "glm/cart-config",
@@ -61,12 +61,12 @@ func TestReconcileGLM(t *testing.T) {
 		Data:       map[string]string{"config.base.yaml": "server: { host: \"0.0.0.0\", port: 6700 }"},
 	}
 	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rb, base).WithStatusSubresource(&routingv1.RouterBinding{}).Build()
+		WithObjects(rb, base).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
 	cs := k8sfake.NewSimpleClientset(
 		epslice("glm-leader-1", "glm-leader", "glm", "10.1.0.1", "10.1.0.2"),
 		epslice("cart-glm-1", "cart-glm", "glm", "10.9.0.1"),
 	)
-	r := &RouterBindingReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
 	nn := types.NamespacedName{Namespace: "glm", Name: "glm-5.1-fp8"}
 
 	// 第一次:加 finalizer 并 requeue
@@ -115,9 +115,9 @@ func TestReconcileGLM(t *testing.T) {
 	}
 
 	// status 回写
-	var got routingv1.RouterBinding
+	var got routingv1.ModelRoute
 	if err := cl.Get(context.Background(), nn, &got); err != nil {
-		t.Fatalf("get rb: %v", err)
+		t.Fatalf("get mr: %v", err)
 	}
 	if got.Status.Backends != 2 || got.Status.CartPeers != 1 || !got.Status.Ready {
 		t.Errorf("status: backends=%d cartPeers=%d ready=%v (want 2/1/true)",

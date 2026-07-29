@@ -1,4 +1,4 @@
-// Package v1alpha1 定义 routing.4pd.io/v1alpha1 的 RouterBinding CRD。
+// Package v1alpha1 定义 routing.4pd.io/v1alpha1 的 ModelRoute CRD。
 package v1alpha1
 
 import (
@@ -16,5 +16,5 @@ var (
 )
 
 func init() {
-	SchemeBuilder.Register(&RouterBinding{}, &RouterBindingList{})
+	SchemeBuilder.Register(&ModelRoute{}, &ModelRouteList{})
 }

@@ -117,36 +117,36 @@ ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`
 openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/routes/*.conf;`(lua_package_path 不变)。
 —— autoconfig **代码零改**:baseConfigDir 只放 `.conf`、消费方把输出 ConfigMap 挂到 `conf.d/routes/` 即可。
 
-## CRD 模式(controller)—— 一个模型一个 RouterBinding
+## CRD 模式(controller)—— 一个模型一个 ModelRoute
 
 除了「一个大 ConfigMap + 轮询 agent」,autoconfig 还有 **CRD controller 模式**(`autoconfig --controller`):
-输入从 ConfigMap 换成 **`RouterBinding`(routing.4pd.io/v1alpha1)**,一个模型一个对象;`kubectl apply` 当场校验、
-`kubectl get routerbinding` 直接看发现了几个后端/CART/ready。**发现(`internal/discovery`)、渲染(`internal/sink`)、
+输入从 ConfigMap 换成 **`ModelRoute`(routing.4pd.io/v1alpha1)**,一个模型一个对象;`kubectl apply` 当场校验、
+`kubectl get modelroute` 直接看发现了几个后端/CART/ready。**发现(`internal/discovery`)、渲染(`internal/sink`)、
 reload sidecar 全部复用**,只是「输入」变 CR、多回写 `status`。设计见 [`docs/crd-design.md`](docs/crd-design.md)。
 
 **Helm 部署(推荐)** —— chart 在 `deploy/helm/autoconfig/`(含 CRD + SA/RBAC + Deployment):
 ```bash
 helm upgrade --install autoconfig deploy/helm/autoconfig -n autoconfig --create-namespace
-kubectl apply -f config/samples/routerbinding-glm.yaml
-kubectl get rb -A                                   # NAME/BACKENDS/CART/READY/AGE
+kubectl apply -f config/samples/modelroute-glm.yaml
+kubectl get mr -A                                   # NAME/BACKENDS/CART/READY/AGE
 ```
 常用 values:`image.tag`、`replicas`(>1 leader 选举 HA)、`crd.install`(默认 true;CRD 带
-`helm.sh/resource-policy: keep`,卸载不删,保护已有 RouterBinding)、`leaderElection`、
-`routerBindings`(见下,直接在 chart 里声明路由)。
+`helm.sh/resource-policy: keep`,卸载不删,保护已有 ModelRoute)、`leaderElection`、
+`modelRoutes`(见下,直接在 chart 里声明路由)。
 
-**⚠️ 卸载顺序:先删 RouterBinding,再 `helm uninstall`。** RouterBinding 带 finalizer
-(`routing.4pd.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)再删 RB /
-namespace,RB 会卡住、拖住 namespace/CRD 删除。正确:`kubectl delete rb --all -A` → `helm uninstall`。
-(chart 里用 `routerBindings` 声明的 RB 由 helm 托管,`helm uninstall` 前会随 release 删除,controller
+**⚠️ 卸载顺序:先删 ModelRoute,再 `helm uninstall`。** ModelRoute 带 finalizer
+(`routing.4pd.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)再删 ModelRoute /
+namespace,ModelRoute 会卡住、拖住 namespace/CRD 删除。正确:`kubectl delete mr --all -A` → `helm uninstall`。
+(chart 里用 `modelRoutes` 声明的 ModelRoute 由 helm 托管,`helm uninstall` 前会随 release 删除,controller
 还在 → 自动摘 finalizer,无此问题。)已卡住的补救:
-`kubectl patch rb <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'`。
+`kubectl patch mr <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'`。
 
 裸 manifest(不想用 helm 时):
 ```bash
-kubectl apply -f config/crd/routerbindings.yaml     # 装 CRD
+kubectl apply -f config/crd/modelroutes.yaml     # 装 CRD
 kubectl apply -f deploy/controller.yaml             # 起 controller
 ```
-一个 `RouterBinding` 同时驱动 **CART 的 workers**(cart-config,专属 → ownerRef 级联 GC)和 **openresty 的 peers**
+一个 `ModelRoute` 同时驱动 **CART 的 workers**(cart-config,专属 → ownerRef 级联 GC)和 **openresty 的 peers**
 (openresty-conf,多路由共享 → finalizer 摘 key);`cart` 段可选(省略 = openresty 直连后端)。消费方 pod +
 reload sidecar 与 agent 模式**完全一样**。两模式共用一个镜像/二进制,`--controller` 开关切换。
 

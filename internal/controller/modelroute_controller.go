@@ -1,4 +1,4 @@
-// Package controller 是 RouterBinding 的 controller-runtime 调谐器。
+// Package controller 是 ModelRoute 的 controller-runtime 调谐器。
 // 复用 internal/discovery 与 internal/sink;只把「输入」从 ConfigMap 换成 CR,并回写 status。
 package controller
 
@@ -32,25 +32,25 @@ const (
 	resyncEvery = 10 * time.Second
 )
 
-// RouterBindingReconciler 调谐 RouterBinding。
+// ModelRouteReconciler 调谐 ModelRoute。
 // Client 管 CR + ConfigMap;Clientset 供 discovery(EndpointSlice/pod 发现)。
-type RouterBindingReconciler struct {
+type ModelRouteReconciler struct {
 	client.Client
 	Clientset kubernetes.Interface
 	Scheme    *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=routing.4pd.io,resources=routerbindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=routing.4pd.io,resources=routerbindings/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=routing.4pd.io,resources=routerbindings/finalizers,verbs=update
+// +kubebuilder:rbac:groups=routing.4pd.io,resources=modelroutes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=routing.4pd.io,resources=modelroutes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=routing.4pd.io,resources=modelroutes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 
-func (r *RouterBindingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	var rb routingv1.RouterBinding
+	var rb routingv1.ModelRoute
 	if err := r.Get(ctx, req.NamespacedName, &rb); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -149,7 +149,7 @@ func openrestyKey(route string) string { return "session_route_" + route + ".con
 
 // writeConfigMap 把 data 的 key merge 进目标 ConfigMap(其余 key 保留),不存在则建。
 // exclusive=true(cart 专属)时设 controllerReference → 删 RB 级联 GC;共享的 openresty 不设(靠 finalizer 摘 key)。
-func (r *RouterBindingReconciler) writeConfigMap(ctx context.Context, rb *routingv1.RouterBinding, ref string, data map[string]string, exclusive bool) error {
+func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1.ModelRoute, ref string, data map[string]string, exclusive bool) error {
 	ns, name := splitNSName(ref, rb.Namespace)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cm corev1.ConfigMap
@@ -192,7 +192,7 @@ func (r *RouterBindingReconciler) writeConfigMap(ctx context.Context, rb *routin
 }
 
 // cleanupOpenrestyKey 删 RB 时,从共享 openresty ConfigMap 里摘掉自己那个 key。
-func (r *RouterBindingReconciler) cleanupOpenrestyKey(ctx context.Context, rb *routingv1.RouterBinding) error {
+func (r *ModelRouteReconciler) cleanupOpenrestyKey(ctx context.Context, rb *routingv1.ModelRoute) error {
 	ns, name := splitNSName(rb.Spec.Openresty.OutputConfigMap, rb.Namespace)
 	key := openrestyKey(rb.Spec.Openresty.Route)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -212,10 +212,10 @@ func (r *RouterBindingReconciler) cleanupOpenrestyKey(ctx context.Context, rb *r
 	})
 }
 
-func (r *RouterBindingReconciler) setStatus(ctx context.Context, nn types.NamespacedName, backends, cartPeers int, ready bool, reason, msg string) {
+func (r *ModelRouteReconciler) setStatus(ctx context.Context, nn types.NamespacedName, backends, cartPeers int, ready bool, reason, msg string) {
 	log := logf.FromContext(ctx)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var rb routingv1.RouterBinding
+		var rb routingv1.ModelRoute
 		if err := r.Get(ctx, nn, &rb); err != nil {
 			return err
 		}
@@ -260,10 +260,10 @@ func splitNSName(ref, defaultNS string) (ns, name string) {
 	return defaultNS, ref
 }
 
-// SetupWithManager 注册:watch RouterBinding + 自己拥有的 ConfigMap(cart-config)。
-func (r *RouterBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
+// SetupWithManager 注册:watch ModelRoute + 自己拥有的 ConfigMap(cart-config)。
+func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&routingv1.RouterBinding{}).
+		For(&routingv1.ModelRoute{}).
 		Owns(&corev1.ConfigMap{}).
 		Complete(r)
 }

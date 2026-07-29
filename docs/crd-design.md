@@ -17,11 +17,11 @@
 
 ## 2. CRD 设计
 
-`routing.4pd.io/v1alpha1` · `RouterBinding`(namespaced,一个模型/一条路由一个)。
+`routing.4pd.io/v1alpha1` · `ModelRoute`(namespaced,一个模型/一条路由一个)。
 
 ```yaml
 apiVersion: routing.4pd.io/v1alpha1
-kind: RouterBinding
+kind: ModelRoute
 metadata: { name: glm-5.1-fp8, namespace: glm }
 spec:
   discovery:                       # service 与 selector 恰好其一
@@ -57,7 +57,7 @@ status:                            # controller 回写(只读)
 - rule: "self.openresty.sources.size() > 0"
   message: "openresty.sources 不能为空"
 ```
-**printer columns** → `kubectl get routebinding`:
+**printer columns** → `kubectl get modelroute`:
 ```
 NAME          TARGET       BACKENDS  CART  READY  LASTSYNC
 glm-5.1-fp8   glm-leader   6         1     True   12s
@@ -68,8 +68,8 @@ kimi-k2.6     (label)      4         0     True   12s
 
 ```
 Manager(leader 选举)
-└── RouterBinding Reconciler
-     Watches: RouterBinding(主)  +  Owns: 输出 ConfigMap  +  Watches: EndpointSlice/Pod →(映射回相关 RB 入队)
+└── ModelRoute Reconciler
+     Watches: ModelRoute(主)  +  Owns: 输出 ConfigMap  +  Watches: EndpointSlice/Pod →(映射回相关 ModelRoute 入队)
      Reconcile(rb):
         1) discover        —— 复用 internal/discovery(EndpointSlice / label)
         2) render          —— 复用 internal/sink(cart / openresty,多来源 priority)
@@ -83,7 +83,7 @@ Manager(leader 选举)
 ## 4. 迁移路径(加法、可灰度、可回退)
 
 1. **装 CRD + controller**,与现 agent **并存**(先不接管)。
-2. 现 ConfigMap 配置 → 每模型一个 `RouterBinding`(写个一次性转换脚本)。
+2. 现 ConfigMap 配置 → 每模型一个 `ModelRoute`(写个一次性转换脚本)。
 3. controller **先只读**:渲染出结果和现 agent 的输出**做 diff 比对**,确认一致。
 4. **切写**:controller 接管输出 ConfigMap 的写入;下线老 agent。
 5. **消费方零改**:输出 ConfigMap 格式不变 → openresty / CART pod + reload sidecar 一个字不用动。
@@ -102,11 +102,11 @@ Manager(leader 选举)
 
 ## 7. 已定的决策
 
-1. **CART 发现归 autoconfig**(不改 CART):autoconfig 外部发现后端 → 写 CART 的 `config.yaml`(workers)+ SIGHUP。因此 `RouterBinding` 有完整的 `cart` 段。
-2. **单个 CR**(`RouterBinding`,一个模型一个),`cart` 段**可选**——省略 = openresty 直连后端。理由:CART 归 autoconfig 后,「模型 X 的后端桶」这**一个 `discovery` 同时喂 CART 的 workers 和 openresty 的兜底 source**,单 CR = 单一真相;现状 1 模型=1 CART=1 route。将来若出现「一个 CART 被多条路由共享 / 一条路由 fan 多个 CART / 团队分权」再拆(加法式:`sources` 支持 `cartRef` 引用独立 CartBinding)。
+1. **CART 发现归 autoconfig**(不改 CART):autoconfig 外部发现后端 → 写 CART 的 `config.yaml`(workers)+ SIGHUP。因此 `ModelRoute` 有完整的 `cart` 段。
+2. **单个 CR**(`ModelRoute`,一个模型一个),`cart` 段**可选**——省略 = openresty 直连后端。理由:CART 归 autoconfig 后,「模型 X 的后端桶」这**一个 `discovery` 同时喂 CART 的 workers 和 openresty 的兜底 source**,单 CR = 单一真相;现状 1 模型=1 CART=1 route。将来若出现「一个 CART 被多条路由共享 / 一条路由 fan 多个 CART / 团队分权」再拆(加法式:`sources` 支持 `cartRef` 引用独立 CartBinding)。
 3. **reload 仍走 sidecar**(同一二进制 `--reload-mode`),controller 不碰 reload。
 
 ## 8. 输出 ConfigMap 的归属与清理
 
-- **cart 的 outputConfigMap**:每模型专属 → 设 **ownerReference**,删 `RouterBinding` 时 k8s 级联 GC。
-- **openresty 的 outputConfigMap**:**多条路由共享一个**(每路由一个 key)→ **不设 ownerRef**(否则删一条会连累整个)。改用 **finalizer**:删 `RouterBinding` 时只移除它那一个 key。
+- **cart 的 outputConfigMap**:每模型专属 → 设 **ownerReference**,删 `ModelRoute` 时 k8s 级联 GC。
+- **openresty 的 outputConfigMap**:**多条路由共享一个**(每路由一个 key)→ **不设 ownerRef**(否则删一条会连累整个)。改用 **finalizer**:删 `ModelRoute` 时只移除它那一个 key。

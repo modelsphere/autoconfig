@@ -1,9 +1,9 @@
-{{- /* 可选:values.routerBindings 里声明的 RouterBinding 由本 chart 一并创建。
+{{- /* 可选:values.modelRoutes 里声明的 ModelRoute 由本 chart 一并创建。
        Helm 安装顺序按 kind 排序:CustomResourceDefinition 先于自定义资源,故 CRD 先建、RB 后建。 */ -}}
-{{- range .Values.routerBindings }}
+{{- range .Values.modelRoutes }}
 ---
 apiVersion: routing.4pd.io/v1alpha1
-kind: RouterBinding
+kind: ModelRoute
 metadata:
   name: {{ .name }}
   namespace: {{ .namespace | default $.Release.Namespace }}
