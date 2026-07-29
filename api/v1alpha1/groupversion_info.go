@@ -1,4 +1,6 @@
 // Package v1alpha1 定义 routing.4pd.io/v1alpha1 的 ModelRoute CRD。
+// +kubebuilder:object:generate=true
+// +groupName=routing.4pd.io
 package v1alpha1
 
 import (

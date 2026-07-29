@@ -1,0 +1,249 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.4
+  name: modelroutes.routing.4pd.io
+spec:
+  group: routing.4pd.io
+  names:
+    kind: ModelRoute
+    listKind: ModelRouteList
+    plural: modelroutes
+    shortNames:
+    - mr
+    singular: modelroute
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.backends
+      name: Backends
+      type: integer
+    - jsonPath: .status.cartPeers
+      name: CART
+      type: integer
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ModelRoute 把「一个模型的后端」自动同步到 openresty 的 peers 与 CART 的 workers。
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ModelRouteSpec 是一个模型的完整路由绑定。
+            properties:
+              cart:
+                description: Cart:可选;有 = autoconfig 管这个 CART,无 = openresty 直连后端。
+                properties:
+                  baseConfigRef:
+                    description: BaseConfigRef:CART config.yaml 的静态底稿(不含 workers);省略用内置默认。
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  maxLoad:
+                    description: MaxLoad:每 worker 的 max_load,默认 20。
+                    type: integer
+                  outputConfigMap:
+                    description: OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
+                    type: string
+                  port:
+                    type: integer
+                  selector:
+                    type: string
+                  service:
+                    description: CART pod 的发现(供 openresty 的 cart source);service/selector
+                      二选一。
+                    type: string
+                required:
+                - outputConfigMap
+                - port
+                type: object
+                x-kubernetes-validations:
+                - message: 'cart: service 和 selector 必须恰好给一个'
+                  rule: has(self.service) != has(self.selector)
+              discovery:
+                description: Discovery:本模型的后端桶(喂 CART 的 workers 和 openresty 的 backend
+                  来源)。
+                properties:
+                  includeNotReady:
+                    description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
+                    type: boolean
+                  port:
+                    description: Port:服务端口(配 pod IP)。
+                    type: integer
+                  selector:
+                    description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
+                    type: string
+                  service:
+                    description: Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS
+                      Service 配成只选 leader)。
+                    type: string
+                required:
+                - port
+                type: object
+                x-kubernetes-validations:
+                - message: 'discovery: service 和 selector 必须恰好给一个'
+                  rule: has(self.service) != has(self.selector)
+              openresty:
+                description: Openresty:openresty 路由。
+                properties:
+                  listen:
+                    description: Listen:server 监听端口。
+                    type: integer
+                  outputConfigMap:
+                    description: OutputConfigMap:openresty 输出 ConfigMap("ns/name",多路由共享,每路由一个
+                      key)。
+                    type: string
+                  route:
+                    description: Route:路由短名(dict/register 用),如 "glm"。
+                    type: string
+                  sources:
+                    description: Sources:有序 peer 来源(如 cart 优先 + backend 兜底)。
+                    items:
+                      description: RouteSource:openresty 一条 route 的一个 peer 来源。
+                      properties:
+                        maxConcurrency:
+                          description: MaxConcurrency:该来源 peer 的并发上限覆盖。
+                          type: integer
+                        priority:
+                          description: Priority:openresty peer 优先级(CART 优先=1,后端兜底=0)。
+                          type: integer
+                        use:
+                          description: Use:"cart"(引用本模型的 CART pod)或 "backend"(引用 discovery
+                            的后端桶)。
+                          enum:
+                          - cart
+                          - backend
+                          type: string
+                      required:
+                      - use
+                      type: object
+                    minItems: 1
+                    type: array
+                  values:
+                    additionalProperties:
+                      type: string
+                    description: Values:传给模板的额外值(如 ttft_limit_ms、tps_limit_tps、default_max)。
+                    type: object
+                required:
+                - listen
+                - outputConfigMap
+                - route
+                - sources
+                type: object
+            required:
+            - discovery
+            - openresty
+            type: object
+            x-kubernetes-validations:
+            - message: openresty.sources 用了 cart,但没配 spec.cart
+              rule: '!self.openresty.sources.exists(s, s.use == ''cart'') || has(self.cart)'
+          status:
+            description: ModelRouteStatus 是 controller 回写的观测状态。
+            properties:
+              backends:
+                type: integer
+              cartPeers:
+                type: integer
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lastSyncTime:
+                format: date-time
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              ready:
+                type: boolean
+            required:
+            - backends
+            - cartPeers
+            - ready
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,7 @@
+# kustomize 部署口径:CRD + RBAC + controller,统一 namespace/前缀。生产推荐 Helm(deploy/helm)。
+namespace: autoconfig-system
+namePrefix: autoconfig-
+resources:
+- ../crd
+- ../rbac
+- ../manager

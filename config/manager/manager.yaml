@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    control-plane: controller-manager
+  name: system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+spec:
+  replicas: 1                       # >1 时 leader 选举保证只有一个在干活
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+    spec:
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: manager
+        image: harbor.4pd.io/hardcore-tech/autoconfig:latest
+        imagePullPolicy: Always
+        args: []                    # 默认开 leader 选举;--leader-elect=false 可关
+        env:
+        - name: PS_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          requests: { cpu: 50m, memory: 64Mi }
+          limits: { cpu: 500m, memory: 256Mi }

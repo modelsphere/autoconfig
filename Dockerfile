@@ -10,7 +10,7 @@
 FROM harbor.4pd.io/library/golang:1.23.3-alpine3.20 AS build
 WORKDIR /src
 COPY . .
-RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o /out/autoconfig ./cmd/autoconfig
+RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o /out/autoconfig ./cmd
 
 FROM harbor.4pd.io/hardcore-tech/python:3.12-alpine
 COPY --from=build /out/autoconfig /usr/local/bin/autoconfig

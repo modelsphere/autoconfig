@@ -49,9 +49,9 @@ helm upgrade --install autoconfig deploy/helm/autoconfig -n autoconfig --create-
 kubectl apply -f config/samples/modelroute-glm.yaml
 kubectl get mr -A                                   # NAME/BACKENDS/CART/READY/AGE
 ```
-常用 values:`image.tag`、`replicas`(>1 leader 选举 HA)、`crd.install`(默认 true;CRD 带
-`helm.sh/resource-policy: keep`,卸载不删,保护已有 ModelRoute)、`leaderElection`、
-`modelRoutes`(见下,直接在 chart 里声明路由)。
+常用 values:`image.tag`、`replicas`(>1 leader 选举 HA)、`leaderElection`、`modelRoutes`(直接在 chart 里声明路由)。
+CRD 放在 chart 的 `crds/`(Helm install-once、`helm uninstall` **不删**,保护已有 ModelRoute;升级 CRD schema 用
+`make install` 或 `kubectl apply -f config/crd/bases/...`)。
 
 **⚠️ 卸载顺序:先删 ModelRoute,再 `helm uninstall`。** ModelRoute 带 finalizer
 (`routing.4pd.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)再删 ModelRoute /
@@ -62,7 +62,7 @@ namespace,ModelRoute 会卡住、拖住 namespace/CRD 删除。正确:`kubectl d
 
 裸 manifest(不想用 helm 时):
 ```bash
-kubectl apply -f config/crd/modelroutes.yaml     # 装 CRD
+kubectl apply -f config/crd/bases/routing.4pd.io_modelroutes.yaml     # 装 CRD
 kubectl apply -f deploy/controller.yaml             # 起 controller
 ```
 一个 `ModelRoute` 同时驱动 **CART 的 workers**(cart-config,专属 → ownerRef 级联 GC)和 **openresty 的 peers**
@@ -81,9 +81,23 @@ docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-relo
 
 本地快速验证:`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor ./cmd/...`。
 
+## 开发布局(kubebuilder / operator-sdk v4)
+
+标准 operator 布局:`PROJECT`(项目元数据)+ `Makefile`(生成/构建/部署目标)+ `api/v1alpha1`(带 kubebuilder marker
+的类型)+ `internal/controller`(reconciler)+ `config/`(kustomize:crd/rbac/manager/default/samples)。
+
+- **改了 `api/` 类型或 `+kubebuilder:` marker 后**,跑生成、提交生成物(CI 不跑生成,只编译):
+  ```bash
+  make generate manifests    # controller-gen 生成 deepcopy + config/crd/bases + config/rbac/role.yaml,并同步 CRD 到 helm/crds
+  make test                  # 生成 + fmt + vet + go test
+  ```
+  工具用 `go run ...@version`(见 Makefile),不装二进制、不进 vendor/CI。
+- **部署两条路都可**:生产用 **Helm**(`deploy/helm/autoconfig`);kustomize 用 `make deploy`(`config/default`)。
+  两者的 CRD/RBAC 同源(都来自 `config/` 的生成物)。
+
 ## 部署
 
-- **controller**:`deploy/helm/autoconfig`(推荐)或 `deploy/controller.yaml` + `config/crd/modelroutes.yaml`。
+- **controller**:`deploy/helm/autoconfig`(推荐)或 `deploy/controller.yaml` + `config/crd/bases/routing.4pd.io_modelroutes.yaml`。
 - **reload sidecar**:消费方 pod(openresty / CART)里加一个容器,镜像 `autoconfig-reload`,
   `args: ["--watch","/watch","--process","nginx: master"]`(或 `cache-aware-router`)+ `shareProcessNamespace: true`
   + 把对应输出 ConfigMap **整卷挂**(非 subPath——subPath 不随 ConfigMap 更新)。monitor 不需要 sidecar。

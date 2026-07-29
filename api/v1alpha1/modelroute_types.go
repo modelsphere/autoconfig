@@ -5,6 +5,7 @@ import (
 )
 
 // Discovery 描述「一桶后端」怎么发现:service(EndpointSlice)与 selector(pod label)恰好其一。
+// +kubebuilder:validation:XValidation:rule="has(self.service) != has(self.selector)",message="discovery: service 和 selector 必须恰好给一个"
 type Discovery struct {
 	// Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS Service 配成只选 leader)。
 	Service string `json:"service,omitempty"`
@@ -24,6 +25,7 @@ type ConfigMapKeyRef struct {
 
 // CartSpec:本模型的 CART 实例。autoconfig 发现后端 → 写 CART 的 workers;并发现 CART pod 供 openresty 引用。
 // 省略整个 cart 段 = openresty 直连后端(无 CART)。
+// +kubebuilder:validation:XValidation:rule="has(self.service) != has(self.selector)",message="cart: service 和 selector 必须恰好给一个"
 type CartSpec struct {
 	// CART pod 的发现(供 openresty 的 cart source);service/selector 二选一。
 	Service  string `json:"service,omitempty"`
@@ -55,6 +57,7 @@ type OpenrestySpec struct {
 	// Listen:server 监听端口。
 	Listen int `json:"listen"`
 	// Sources:有序 peer 来源(如 cart 优先 + backend 兜底)。
+	// +kubebuilder:validation:MinItems=1
 	Sources []RouteSource `json:"sources"`
 	// OutputConfigMap:openresty 输出 ConfigMap("ns/name",多路由共享,每路由一个 key)。
 	OutputConfigMap string `json:"outputConfigMap"`
@@ -63,6 +66,7 @@ type OpenrestySpec struct {
 }
 
 // ModelRouteSpec 是一个模型的完整路由绑定。
+// +kubebuilder:validation:XValidation:rule="!self.openresty.sources.exists(s, s.use == 'cart') || has(self.cart)",message="openresty.sources 用了 cart,但没配 spec.cart"
 type ModelRouteSpec struct {
 	// Discovery:本模型的后端桶(喂 CART 的 workers 和 openresty 的 backend 来源)。
 	Discovery Discovery `json:"discovery"`
@@ -84,6 +88,7 @@ type ModelRouteStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=mr
 // +kubebuilder:printcolumn:name="Backends",type=integer,JSONPath=`.status.backends`
 // +kubebuilder:printcolumn:name="CART",type=integer,JSONPath=`.status.cartPeers`
 // +kubebuilder:printcolumn:name="Ready",type=boolean,JSONPath=`.status.ready`

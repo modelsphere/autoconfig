@@ -1,5 +1,5 @@
 # autoconfig CRD controller 部署(ModelRoute 调谐器)。
-# 先装 CRD:kubectl apply -f config/crd/modelroutes.yaml
+# 先装 CRD:kubectl apply -f config/crd/bases/routing.4pd.io_modelroutes.yaml
 ---
 apiVersion: v1
 kind: ServiceAccount

@@ -1,0 +1,17 @@
+# kubebuilder / operator-sdk 项目元数据。
+domain: 4pd.io
+layout:
+- go.kubebuilder.io/v4
+projectName: autoconfig
+repo: autoconfig
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: 4pd.io
+  group: routing
+  kind: ModelRoute
+  path: autoconfig/api/v1alpha1
+  version: v1alpha1
+version: "3"
