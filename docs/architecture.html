@@ -110,6 +110,10 @@
   .col .pod{width:100%;min-width:0;flex:none}
   .ctrs.one{grid-template-columns:1fr}
   .mnote{margin-top:10px;font-size:11px;color:var(--muted);text-align:center;line-height:1.4}
+  .discover{margin:12px auto 0;font:600 11.5px/1.5 ui-monospace,monospace;color:var(--data);text-align:center;
+    border:1px dashed color-mix(in srgb,var(--data) 42%,var(--line));border-radius:9px;padding:8px 16px;max-width:680px;background:var(--surface2)}
+  .discover b{color:var(--ink)}
+  .pod .mnote.peers{color:var(--accent);font-weight:700;margin-top:9px}
 
   footer{margin-top:22px;font-size:12px;color:var(--faint);text-align:center}
   footer .mono{color:var(--muted)}
@@ -123,12 +127,12 @@
 
 <div class="wrap">
   <p class="eyebrow">架构设计 · 讨论稿</p>
-  <h1>autoconfig 怎么和 openresty / CART / monitor 协作</h1>
-  <p class="lede">autoconfig 发现后端，自动给 <b>openresty、CART、monitor</b> 各写一份配置。openresty / CART 由 <b>reload sidecar</b> 收 SIGHUP 热重载；<b>monitor 每 60s 自动热加载 <span class="mono">monitor.conf</span>，无需 sidecar</b>。<b>实线 = 配置流，虚线 = 请求 / 健康流。</b></p>
+  <h1>autoconfig 怎么和 openresty ／ CART ／ monitor 协作</h1>
+  <p class="lede">autoconfig 自动发现 <b>后端 pods 与 CART pods</b>，给 <b>openresty、CART、monitor</b> 各写一份配置——发现到的 CART 会被<b>注册为 openresty 的优先 peer</b>（后端兜底）。openresty／CART 由 <b>reload sidecar</b> 收 SIGHUP 热重载；<b>monitor 每 60s 自动热加载 <span class="mono">monitor.conf</span>，无需 sidecar</b>。实线＝配置流，虚线＝请求／健康流。</p>
 
   <div class="legend">
     <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--accent)" stroke-width="2.4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--accent)"/></svg>配置流（autoconfig 写 config → 消费方重载）</span>
-    <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--data)" stroke-width="2.4" stroke-dasharray="6 4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--data)"/></svg>请求 / 健康流（数据平面）</span>
+    <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--data)" stroke-width="2.4" stroke-dasharray="6 4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--data)"/></svg>请求／健康流（数据平面）</span>
   </div>
 
   <div class="scene">
@@ -137,10 +141,13 @@
     <div class="box agent">
       <span class="kind">deployment</span>
       <div class="nm">autoconfig agent</div>
-      <div class="desc">watch 后端 pod（EndpointSlice / label）→ 渲染 → 写各消费方的 config</div>
+      <div class="desc">watch 后端 pods ＋ CART pods（EndpointSlice／label）→ 写各消费方的 config</div>
     </div>
 
-    <!-- three consumers: openresty / CART / monitor -->
+    <!-- discovery annotation: autoconfig 也发现 CART -->
+    <div class="discover">↑ 自动发现（watch）：<b>后端 pods</b> ＋ <b>CART pods</b>　——　发现到的 CART 写进 openresty 的 peers（优先）</div>
+
+    <!-- three consumers: openresty ／ CART ／ monitor -->
     <div class="cols3">
 
       <div class="col">
@@ -153,6 +160,7 @@
             <div class="hup"><span class="hl">SIGHUP</span><svg width="28" height="12" viewBox="0 0 28 12"><line x1="28" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
             <div class="ctr rl"><span class="clab">sidecar</span><div class="cnm">reload</div></div>
           </div>
+          <div class="mnote peers">peers＝CART（优先）＋后端（兜底）</div>
         </div>
       </div>
 
@@ -177,24 +185,24 @@
           <div class="ctrs one">
             <div class="ctr app"><span class="clab">container</span><div class="cnm">monitor</div></div>
           </div>
-          <div class="mnote">monitor.conf 每 60s 自动热加载，<br>无需 SIGHUP / sidecar</div>
+          <div class="mnote">monitor.conf 每 60s 自动热加载，<br>无需 SIGHUP／sidecar</div>
         </div>
       </div>
 
     </div>
 
     <!-- data / health arrow down to backends -->
-    <div class="down data"><span class="l">数据平面 openresty → CART → 后端 &nbsp;·&nbsp; monitor 采指标 &nbsp;·&nbsp; autoconfig watch 发现 ↑</span>
+    <div class="down data"><span class="l">数据平面：openresty → CART → 后端　·　monitor 采集后端指标</span>
       <svg width="12" height="34" viewBox="0 0 12 34"><line x1="6" y1="0" x2="6" y2="25" stroke="currentColor" stroke-width="2.4" stroke-dasharray="6 4"/><path d="M1,25 L6,33 L11,25 Z" fill="currentColor"/></svg></div>
 
     <!-- backends -->
     <div class="box be">
       <span class="kind">pod ×N</span>
-      <div class="nm">后端 pods（vllm / sglang）</div>
-      <div class="desc">按模型分桶 · LWS leader / 单机 / 单卡</div>
+      <div class="nm">后端 pods（vllm／sglang）</div>
+      <div class="desc">按模型分桶 · LWS leader／单机／单卡</div>
     </div>
 
   </div>
 
-  <footer><span class="mono">autoconfig</span> = 中心 agent（发现 + 写配置）+ 各 pod 的 reload sidecar（openresty / CART 收 SIGHUP；monitor 靠自身 60s 热加载）· 三者零改</footer>
+  <footer><span class="mono">autoconfig</span> ＝ 中心 agent（发现＋写配置）＋ 各 pod 的 reload sidecar（openresty／CART 收 SIGHUP；monitor 靠自身 60s 热加载）· 三者零改</footer>
 </div>
