@@ -33,12 +33,16 @@ autoconfig 让路由器配置跟着实时收敛。
 
 ```yaml
 intervalSeconds: 5
-targets:                      # 每个 = 一桶后端(通用 label,不限 LWS)
-  - name: kimi-k2.6
+targets:                      # 每个 = 一桶后端;发现方式二选一(service 或 selector)
+  - name: glm-5.1-fp8         # (推荐)service:走 EndpointSlice——拿 Service 背后端点,原生 Ready/Terminating 语义
+    namespace: glm
+    service: glm-leader        #   前提:该 Service 只选服务端点(LWS Service 配成只选 leader:selector 带 worker-index=0)
+    port: 8050
+  - name: kimi-k2.6           # (兜底)selector:pod label 发现——没建 Service 的单机/单卡
     namespace: kimi
     selector: "leaderworkerset.sigs.k8s.io/name=kimi-k26,leaderworkerset.sigs.k8s.io/worker-index=0"
     port: 8050
-    # includeNotReady: false  # 默认只取 Ready
+    # includeNotReady: false  # 默认只取 Ready(排空中端点 Ready=false 自动排除)
     # staticPeers: [{ip: 127.0.0.1, port: 8060, name: router, priority: 1, maxConcurrency: 180}]
 sinks:                        # target ↔ 消费方显式绑定
   - kind: cart                # 一个 CART 一个模型
@@ -52,6 +56,10 @@ sinks:                        # target ↔ 消费方显式绑定
     outputConfigMap: openresty/openresty-conf
 ```
 
+- **发现(每 target 二选一)**:`service` → **EndpointSlice**(`discovery.k8s.io/v1`,按 `kubernetes.io/service-name`
+  聚合全部分片),用 k8s 原生 `Ready/Serving/Terminating` 判就绪——排空中端点(`Ready=false`)默认自动排除,
+  天然支撑优雅下线;要求该 Service 只选服务端点(**LWS Service 配成只选 leader**)。`selector` → pod label 发现
+  (兜底:没建 Service 的单机/单卡)。两条路都只用 `t.Port` 配 pod IP。
 - **cart sink**:把 base config.yaml + 发现的 workers 渲染成完整 `config.yaml`(一个 key)。
 - **openresty sink**:读 baseConfigDir 里每个 `.conf`,对 `routeByTarget` 指定的 conf **brace 定位并重写
   `peers = {` / `_G.PEERS = {` 块**(位置形式 `{ip, port, name[, priority[, maxConcurrency]]}`),

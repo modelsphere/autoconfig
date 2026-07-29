@@ -9,7 +9,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole                       # 若 targets/输出跨多个 ns,用 ClusterRole 省事;单 ns 可换 Role
 metadata: { name: autoconfig }
 rules:
-- { apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"] }
+- { apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"] }                        # selector 兜底发现
+- { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["get","list","watch"] } # service EndpointSlice 发现
 - { apiGroups: [""], resources: ["configmaps"], verbs: ["get","list","create","update","patch"] }
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -25,8 +26,10 @@ data:
   config.yaml: |
     intervalSeconds: 5
     targets:
+      # service:走 EndpointSlice(推荐)——前提是该 Service 只选服务端点(LWS Service 配成只选 leader)
+      - { name: glm-5.1-fp8, namespace: glm, service: glm-leader, port: 8050 }
+      # selector:pod label 发现(兜底)——没建 Service 的单机/单卡
       - { name: kimi-k2.6, namespace: kimi, selector: "leaderworkerset.sigs.k8s.io/name=kimi-k26,leaderworkerset.sigs.k8s.io/worker-index=0", port: 8050 }
-      - { name: glm-5.1-fp8, namespace: glm, selector: "app=glm,role=leader", port: 8050 }
     sinks:
       - kind: cart
         target: glm-5.1-fp8

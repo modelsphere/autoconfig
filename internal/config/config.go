@@ -32,13 +32,16 @@ func (p Peer) LuaTuple() string {
 	return s
 }
 
-// Target = one bucket of backends discovered by a label selector. Not LWS-specific.
+// Target = one bucket of backends. Discovered via EITHER an EndpointSlice-backed Service (service)
+// OR a pod label selector (selector) — exactly one. Not LWS-specific.
 type Target struct {
-	Name        string `json:"name"`      // logical name; referenced by sinks
-	Namespace       string `json:"namespace"`
-	Selector        string `json:"selector"` // k8s label selector, e.g. "app=kimi,role=leader"
+	Name      string `json:"name"`      // logical name; referenced by sinks
+	Namespace string `json:"namespace"`
+	// 二选一(且必选其一):
+	Service  string `json:"service"`  // Service 名(在 Namespace 内)→ 走 EndpointSlice 发现(推荐;原生就绪/终止语义)
+	Selector string `json:"selector"` // pod label selector,如 "app=kimi,role=leader" → 走 pod 发现(兜底:没建 Service 的单机/单卡)
 	Port            int    `json:"port"`
-	IncludeNotReady bool   `json:"includeNotReady"` // default false = only Ready pods
+	IncludeNotReady bool   `json:"includeNotReady"` // default false = only Ready endpoints
 	StaticPeers     []Peer `json:"staticPeers"`
 }
 
@@ -100,10 +103,13 @@ func Load(path string) (*Config, error) {
 		c.IntervalSeconds = 5
 	}
 	for i := range c.Targets {
-		// default readyOnly=true unless explicitly set false — but zero-value bool can't distinguish.
-		// Convention: readyOnly defaults true; set explicitly false to include NotReady pods.
-		if c.Targets[i].Port == 0 {
-			return nil, fmt.Errorf("target %q: port required", c.Targets[i].Name)
+		t := &c.Targets[i]
+		if t.Port == 0 {
+			return nil, fmt.Errorf("target %q: port required", t.Name)
+		}
+		// service / selector 恰好其一
+		if (t.Service == "") == (t.Selector == "") {
+			return nil, fmt.Errorf("target %q: 需恰好指定 service 或 selector 其一", t.Name)
 		}
 	}
 	return &c, nil
