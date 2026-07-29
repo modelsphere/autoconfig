@@ -18,6 +18,20 @@ type Peer struct {
 	MaxLoad        int    `json:"maxLoad"`        // cart only; 0 = sink default
 }
 
+// LuaTuple renders the positional lua peer form: "ip", port, "name"[, priority[, maxConcurrency]].
+// priority/maxConcurrency 只在非零时才输出(与 openresty peers 的位置约定一致);
+// maxConcurrency 非零必须先补 priority 占位(第 4 位),否则位置错位。
+func (p Peer) LuaTuple() string {
+	s := fmt.Sprintf("%q, %d, %q", p.IP, p.Port, p.Name)
+	if p.Priority != 0 || p.MaxConcurrency != 0 {
+		s += fmt.Sprintf(", %d", p.Priority)
+		if p.MaxConcurrency != 0 {
+			s += fmt.Sprintf(", %d", p.MaxConcurrency)
+		}
+	}
+	return s
+}
+
 // Target = one bucket of backends discovered by a label selector. Not LWS-specific.
 type Target struct {
 	Name        string `json:"name"`      // logical name; referenced by sinks
@@ -48,11 +62,23 @@ type Sink struct {
 	Routes   []OpenrestyRoute  `json:"routes"`
 }
 
-// OpenrestyRoute = template 模式下一条路由:target(哪桶后端)+ 输出文件名 + 传给模板的 values。
+// OpenrestyRoute = template 模式下一条路由:输出文件名 + 传给模板的 values + peer 来源。
+// peer 来源二选一:
+//   - target:单桶后端(简写,向后兼容)。
+//   - sources:多来源(有序,带 priority)。典型 = CART 作 priority-1 优先 + 后端桶作 priority-0 兜底。
 type OpenrestyRoute struct {
-	Target string                 `json:"target"`
-	File   string                 `json:"file"`   // 输出 ConfigMap key,如 session_route_glm.conf
-	Values map[string]interface{} `json:"values"` // 模板里用 {{.Values.route}} / {{.Values.listen}} / 覆盖项
+	Target  string                 `json:"target"`  // 单 target 简写(sources 为空时用)
+	Sources []RouteSource          `json:"sources"` // 多来源(有序);非空时优先于 target
+	File    string                 `json:"file"`    // 输出 ConfigMap key,如 session_route_glm.conf
+	Values  map[string]interface{} `json:"values"`  // 模板里用 {{.Values.route}} / {{.Values.listen}} / 覆盖项
+}
+
+// RouteSource = 一条 route 的一个 peer 来源:某 target 的发现结果 + priority/maxConcurrency 覆盖。
+// 用于「CART 优先 + 后端兜底」:sources: [{target: cart-glm, priority: 1}, {target: glm-backends, priority: 0}]。
+type RouteSource struct {
+	Target         string `json:"target"`
+	Priority       int    `json:"priority"`       // 覆盖该来源所有 peer 的 priority(0 = 不覆盖/默认)
+	MaxConcurrency int    `json:"maxConcurrency"` // 覆盖该来源所有 peer 的 maxConcurrency(0 = 不覆盖)
 }
 
 type Config struct {

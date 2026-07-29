@@ -19,7 +19,7 @@ server {
             return {
                 peers = {
 {{- range .Peers}}
-                    {"{{.IP}}", {{.Port}}, "{{.Name}}"},
+                    { {{.LuaTuple}} },
 {{- end}}
                 },
 {{- if .Values.ttft_limit_ms}}

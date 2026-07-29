@@ -72,7 +72,7 @@ func (o *OpenrestySink) Render(peersByTarget map[string][]config.Peer) (Rendered
 			data := struct {
 				Values map[string]interface{}
 				Peers  []config.Peer
-			}{Values: r.Values, Peers: nameUnnamed(peersByTarget[r.Target], r.Target)}
+			}{Values: r.Values, Peers: resolveRoutePeers(peersByTarget, r.Sources, r.Target)}
 			if err := tmpl.Execute(&buf, data); err != nil {
 				return nil, fmt.Errorf("render route %s: %w", file, err)
 			}
@@ -80,6 +80,29 @@ func (o *OpenrestySink) Render(peersByTarget map[string][]config.Peer) (Rendered
 		}
 	}
 	return out, nil
+}
+
+// resolveRoutePeers builds a route's ordered peer list. If sources is set, it concatenates each
+// source's discovered peers (applying that source's priority/maxConcurrency override) in order —
+// e.g. CART(priority 1) then backends(priority 0). Otherwise it falls back to the single target.
+// Names are assigned per source ("<target>-N"), so peers stay uniquely named across sources.
+func resolveRoutePeers(peersByTarget map[string][]config.Peer, sources []config.RouteSource, singleTarget string) []config.Peer {
+	if len(sources) == 0 {
+		return nameUnnamed(peersByTarget[singleTarget], singleTarget)
+	}
+	var all []config.Peer
+	for _, src := range sources {
+		for _, p := range nameUnnamed(peersByTarget[src.Target], src.Target) {
+			if src.Priority != 0 {
+				p.Priority = src.Priority
+			}
+			if src.MaxConcurrency != 0 {
+				p.MaxConcurrency = src.MaxConcurrency
+			}
+			all = append(all, p)
+		}
+	}
+	return all
 }
 
 // rewritePeersBlock locates the first uncommented `peers = {` or `_G.PEERS = {` block and
@@ -120,14 +143,7 @@ func rewritePeersBlock(text string, peers []config.Peer) (string, error) {
 	var b strings.Builder
 	b.WriteString(prefix + "{\n")
 	for _, p := range peers {
-		fields := fmt.Sprintf("%q, %d, %q", p.IP, p.Port, p.Name)
-		if p.Priority != 0 || p.MaxConcurrency != 0 {
-			fields += fmt.Sprintf(", %d", p.Priority)
-			if p.MaxConcurrency != 0 {
-				fields += fmt.Sprintf(", %d", p.MaxConcurrency)
-			}
-		}
-		b.WriteString(indent + "    {" + fields + "},\n")
+		b.WriteString(indent + "    {" + p.LuaTuple() + "},\n")
 	}
 	b.WriteString(indent + "}")
 

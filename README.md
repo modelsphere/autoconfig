@@ -76,6 +76,33 @@ sinks:                        # target ↔ 消费方显式绑定
   模板见 `deploy/openresty-route.tmpl`(骨架对齐真实 per-model conf:6 个 `*_<route>` dict + server + `register_route` + `peers` + `include conf.d/router_locations.inc`)。已实测:模板生成的 conf 用真 lua 正常加载;**动态加一条路由 → reload 后新端口 + 新 dict 上线**。
   ✅ 改 agent 配置(加/删 route/target)**免重启**:agent 每周期重读 config,变了就重建 sinks(读失败保留上次好配置)。config 也走 ConfigMap 挂载,改 ConfigMap 即热更。
 
+### 自动发现 CART 配进 openresty:一条 route 多来源(CART 优先 + 后端兜底)
+CART 本身也是 k8s pod,发现用同一套 label target(指 CART pod,port 8071)。一条 route 的 peers 用
+`sources`(有序,带 priority)从**多个 target** 组合 —— 复刻生产 m-cpu-11 的 **CART 作 priority-1 优先 +
+后端桶作 priority-0 兜底**(CART 挂了 openresty 仍直连后端)。同一份 agent 配置同时驱动
+**CART 的 workers(cart sink)** 和 **openresty 的 peers(CART + 后端)**,闭环:
+```yaml
+targets:
+  - { name: glm-backends, namespace: glm, selector: "app=glm,role=leader", port: 8050 }
+  - { name: cart-glm,     namespace: routing, selector: "app=cart,model=glm-5.1-fp8", port: 8071 }
+sinks:
+  - kind: cart                     # CART 的 workers = 后端桶
+    target: glm-backends
+    baseConfig: /base/cart/config.base.yaml
+    outputConfigMap: routing/cart-glm-config
+  - kind: openresty
+    template: /tmpl/openresty-route.tmpl
+    routes:
+      - file: session_route_glm.conf
+        values: { route: glm, listen: 18083 }
+        sources:                   # 有序:CART 优先,后端兜底
+          - { target: cart-glm,     priority: 1, maxConcurrency: 180 }
+          - { target: glm-backends, priority: 0 }
+    outputConfigMap: openresty/openresty-conf
+```
+route 只给单一 `target`(不给 `sources`)仍是旧行为(直连后端,无 CART)。纯 openresty→CART→后端
+拓扑 = 只写一个 `sources: [{target: cart-glm}]`。渲染已单测(`internal/sink/openresty_test.go`)。
+
 ### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动
 ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把 **session_route*.conf 移到
 子目录 `conf.d/routes/`**,ConfigMap 挂到那里;`lua/` + `router_locations.inc` + `nginx.conf` 仍烤镜像。
