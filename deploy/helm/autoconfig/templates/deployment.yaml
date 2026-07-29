@@ -16,6 +16,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "autoconfig.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 15    # 配合 manager GracefulShutdownTimeout(10s),pod 及时终止
       containers:
         - name: controller
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

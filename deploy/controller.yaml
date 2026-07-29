@@ -35,9 +35,10 @@ spec:
     metadata: { labels: { app: autoconfig-controller } }
     spec:
       serviceAccountName: autoconfig-controller
+      terminationGracePeriodSeconds: 15    # 配合 manager GracefulShutdownTimeout(10s),pod 及时终止
       containers:
       - name: controller
-        image: harbor.4pd.io/hardcore-tech/autoconfig:0.3.1
+        image: harbor.4pd.io/hardcore-tech/autoconfig:0.3.2
         imagePullPolicy: Always          # tag 可能被重推(CI overwrite),强制重拉避免用到节点旧缓存
         env:
         - { name: PS_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }  # leader lease 落本 ns

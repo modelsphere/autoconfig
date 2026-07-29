@@ -4,12 +4,12 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.1 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.2 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.1}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.2}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0

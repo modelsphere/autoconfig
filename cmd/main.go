@@ -7,6 +7,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -43,12 +44,14 @@ func runController(leaderElect bool) error {
 	if err != nil {
 		return err
 	}
+	shutdownTimeout := 10 * time.Second
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsserver.Options{BindAddress: "0"}, // 关 metrics server,避免端口占用
 		LeaderElection:          leaderElect,
 		LeaderElectionID:        "autoconfig-controller.routing.gpucluster.io",
 		LeaderElectionNamespace: envOr("PS_NAMESPACE", ""), // 空 = in-cluster 自动推断
+		GracefulShutdownTimeout: &shutdownTimeout,          // SIGTERM 后最多等 10s 收 runnable → pod 及时终止
 	})
 	if err != nil {
 		return err
