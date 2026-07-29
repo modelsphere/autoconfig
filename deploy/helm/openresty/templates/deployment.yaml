@@ -38,6 +38,11 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
             failureThreshold: 3
+          readinessProbe:                   # 健康即 Ready(主备两副本都 Ready,Deployment 滚动正常);
+            exec:                            # 谁收流量由 ha-gate 的 active 标签 + Service selector 决定
+              command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.reload.enabled }}
@@ -49,16 +54,12 @@ spec:
               mountPath: /watch
         {{- end }}
         {{- if .Values.ha.enabled }}
-        - name: hagate                       # master-standby:只有 leader /healthz=200 → 只有它进 Service
+        - name: hagate                       # master-standby:只有 leader 给自己打 ha-active 标签 → 只有它进 Service
           image: {{ .Values.ha.image }}
-          args: ["--lease", "{{ include "openresty.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}]
+          args: ["--lease", "{{ include "openresty.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}, "--label-key", "{{ include "openresty.name" . }}-active"]
           env:
             - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
             - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
-          readinessProbe:                    # 门控 pod-readiness = 该 pod 是否 leader(且 app 端口可连)
-            httpGet: { path: /healthz, port: {{ .Values.ha.port }} }
-            periodSeconds: 5
-            failureThreshold: 2
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { cpu: 200m, memory: 64Mi }

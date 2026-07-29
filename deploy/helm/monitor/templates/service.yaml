@@ -5,7 +5,11 @@ metadata:
   labels: {{- include "monitor.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
-  selector: {{- include "monitor.selectorLabels" . | nindent 4 }}
+  selector:
+    {{- include "monitor.selectorLabels" . | nindent 4 }}
+    {{- if .Values.ha.enabled }}
+    {{ include "monitor.name" . }}-active: "true"
+    {{- end }}
   ports:
     - name: dashboard
       port: {{ .Values.service.port }}

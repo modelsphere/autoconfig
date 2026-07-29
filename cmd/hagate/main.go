@@ -20,7 +20,9 @@ func main() {
 
 	lease := flag.String("lease", envOr("HA_LEASE", ""), "Lease 名(一组主备共用一个)")
 	httpAddr := flag.String("http", envOr("HA_HTTP", ":8081"), "healthz 监听地址")
-	appTCP := flag.String("app-tcp", envOr("HA_APP_TCP", ""), "本地 app host:port(非空则 leader 还要求它可连)")
+	appTCP := flag.String("app-tcp", envOr("HA_APP_TCP", ""), "本地 app host:port(非空则 leader 还要求它可连才打标签)")
+	labelKey := flag.String("label-key", envOr("HA_LABEL_KEY", "ha-active"), "active 标签 key(Service selector 匹配它)")
+	labelVal := flag.String("label-val", envOr("HA_LABEL_VAL", "true"), "active 标签 value")
 	flag.Parse()
 
 	ns := envOr("POD_NAMESPACE", "")
@@ -28,7 +30,7 @@ func main() {
 	if *lease == "" || ns == "" || id == "" {
 		log.Fatalf("需要 --lease + POD_NAMESPACE + POD_NAME(downward API)")
 	}
-	if err := hagate.Run(*lease, ns, id, *httpAddr, *appTCP); err != nil {
+	if err := hagate.Run(*lease, ns, id, *httpAddr, *appTCP, *labelKey, *labelVal); err != nil {
 		log.Fatalf("%v", err)
 	}
 }

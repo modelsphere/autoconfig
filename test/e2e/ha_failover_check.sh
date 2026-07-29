@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# master-standby(ha-gate)验证:openresty/cart 各 2 副本但只 1 个进 Service;删 leader → standby ~接管。
+# 前提:real_kimi_e2e.sh --keep 已把栈跑起来(kimi ns)。用法:bash ha_failover_check.sh
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+NS=${NS:-kimi}
+CHARTS=${CHARTS:-$HERE/charts}
+OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
+CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
+ACR=${ACR:-harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.6}
+AUTH_KEY=${AUTH_KEY:-REDACTED-SEE-DEPLOY-DOCS}
+FAIL=0; say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
+
+# ready endpoint 数(Service 背后 Ready 端点)
+eps(){ kubectl -n "$NS" get endpointslice -l kubernetes.io/service-name="$1" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' 2>/dev/null | grep -c true; }
+leaderpod(){ kubectl -n "$NS" get lease "$1" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null; }
+
+say "helm upgrade openresty/cart → 0.3.6(HA:replicas2 + ha-gate)"
+helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" --set fullnameOverride=openresty \
+  --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" --set reload.image="$ACR" >/dev/null && ok "openresty upgraded" || bad "openresty upgrade 失败"
+helm -n "$NS" upgrade --install cart "$CHARTS/cart" --set fullnameOverride=cart \
+  --set image.repository="${CART_IMG%:*}" --set image.tag="${CART_IMG##*:}" --set reload.image="$ACR" >/dev/null && ok "cart upgraded" || bad "cart upgrade 失败"
+
+say "等 rollout(2 副本)"
+kubectl -n "$NS" rollout status deploy/openresty --timeout=180s || bad "openresty rollout"
+kubectl -n "$NS" rollout status deploy/cart --timeout=180s || bad "cart rollout"
+
+say "稳态:2 副本但 Service 只 1 个 Ready 端点(主备)"
+for svc in openresty cart; do
+  n=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=$svc --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  e=$(eps $svc)
+  echo "  $svc: pods=$n, ready-endpoints=$e, lease-holder=$(leaderpod ${svc}-ha)"
+  [ "$n" = 2 ] && ok "$svc 2 副本" || bad "$svc 副本数=$n"
+  [ "$e" = 1 ] && ok "$svc Service 只 1 个 Ready 端点(单 active)" || bad "$svc Ready 端点=$e(期望 1)"
+done
+
+say "推理正常(经 openresty 入口)"
+infer(){ kubectl -n "$NS" exec -i deploy/monitor -- python3 - "$AUTH_KEY" <<'PYEOF'
+import sys,urllib.request,json
+key=sys.argv[1]
+req={"model":"kimi-k2.6","messages":[{"role":"user","content":"1+1=?只答数字"}],"max_tokens":8,"temperature":0,"chat_template_kwargs":{"thinking":False}}
+r=urllib.request.Request("http://openresty:18080/v1/chat/completions",data=json.dumps(req).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer "+key})
+try: print(urllib.request.urlopen(r,timeout=60).read().decode())
+except Exception as e: print("ERR",e)
+PYEOF
+}
+infer | grep -q '"content"' && ok "failover 前推理 OK" || bad "failover 前推理失败"
+
+say "failover:删 openresty leader pod,验 standby 接管"
+LEADER=$(leaderpod openresty-ha)
+echo "  当前 leader pod=$LEADER"
+kubectl -n "$NS" delete pod "$LEADER" --wait=false 2>/dev/null
+# 等新 leader(holder 变化)+ Service 仍恰好 1 个 Ready 端点
+NEW=""
+for i in $(seq 1 30); do NEW=$(leaderpod openresty-ha); [ -n "$NEW" ] && [ "$NEW" != "$LEADER" ] && break; sleep 3; done
+[ -n "$NEW" ] && [ "$NEW" != "$LEADER" ] && ok "standby 接管 leader:$LEADER → $NEW" || bad "leader 未切换(仍 $NEW)"
+for i in $(seq 1 20); do [ "$(eps openresty)" = 1 ] && break; sleep 3; done
+[ "$(eps openresty)" = 1 ] && ok "切换后 Service 仍恰好 1 个 Ready 端点" || bad "切换后 Ready 端点=$(eps openresty)"
+
+say "failover 后推理仍正常"
+for i in $(seq 1 20); do infer | grep -q '"content"' && { ok "failover 后推理 OK"; break; }; sleep 3; [ "$i" = 20 ] && bad "failover 后推理失败"; done
+
+say "结果"; [ "$FAIL" = 0 ] && echo "ALL PASS ✅" || echo "SOME FAILED ❌"; exit $FAIL

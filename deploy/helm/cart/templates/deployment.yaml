@@ -36,6 +36,10 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 20
             failureThreshold: 3
+          readinessProbe:               # 健康即 Ready(主备两副本都 Ready);谁收流量由 ha-active 标签定
+            tcpSocket: { port: {{ .Values.service.port }} }
+            initialDelaySeconds: 10
+            periodSeconds: 10
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.reload.enabled }}
@@ -47,16 +51,12 @@ spec:
               mountPath: /workspace/configs
         {{- end }}
         {{- if .Values.ha.enabled }}
-        - name: hagate                  # master-standby:只有 leader 进 Service(单 active 保缓存 + 计数正确)
+        - name: hagate                  # master-standby:只有 leader 给自己打 cart-active 标签 → 只有它进 Service
           image: {{ .Values.ha.image }}
-          args: ["--lease", "{{ include "cart.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}]
+          args: ["--lease", "{{ include "cart.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}, "--label-key", "{{ include "cart.name" . }}-active"]
           env:
             - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
             - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
-          readinessProbe:
-            httpGet: { path: /healthz, port: {{ .Values.ha.port }} }
-            periodSeconds: 5
-            failureThreshold: 2
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { cpu: 200m, memory: 64Mi }

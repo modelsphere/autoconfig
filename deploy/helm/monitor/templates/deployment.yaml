@@ -38,16 +38,12 @@ spec:
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.ha.enabled }}
-        - name: hagate                    # master-standby:只有 leader 采集/告警(避免双 active 双告警)
-          image: {{ .Values.ha.image }}
-          args: ["--lease", "{{ include "monitor.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}]
+        - name: hagate                    # ⚠️ 默认关:标签门控只挡 dashboard 流量,挡不住 monitor 自主采集/告警循环
+          image: {{ .Values.ha.image }}   #    → 真 monitor 主备要按 leader 门控进程(monitor 侧改造),这里仅 dashboard 主备
+          args: ["--lease", "{{ include "monitor.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}, "--label-key", "{{ include "monitor.name" . }}-active"]
           env:
             - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
             - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
-          readinessProbe:
-            httpGet: { path: /healthz, port: {{ .Values.ha.port }} }
-            periodSeconds: 5
-            failureThreshold: 2
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { cpu: 200m, memory: 64Mi }
