@@ -1,17 +1,19 @@
 package sink
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"text/template"
 
 	"autoconfig/internal/config"
 )
 
-// OpenrestySink rewrites the peers block of each route's session_route_<model>.conf.
-// It emits every flat file in BaseConfigDir as a ConfigMap key (verbatim, except the rewritten confs).
-// (lua/ subdir stays baked in the image or delivered separately; not handled here.)
+// OpenrestySink 生成 openresty 各路由的 conf。两种模式(可并用):
+//   (A) rewrite:读 BaseConfigDir 的现成 conf,按 RouteByTarget 改写 peers 块(其余透传)。
+//   (B) template:用 Template 给每条 Routes 生成整个 conf(dicts+server+register_route+peers)。
 type OpenrestySink struct{ s config.Sink }
 
 func (o *OpenrestySink) Kind() string          { return "openresty" }
@@ -21,32 +23,61 @@ func (o *OpenrestySink) ConfigMapName() string { _, n := splitNSName(o.s.OutputC
 
 func (o *OpenrestySink) Render(peersByTarget map[string][]config.Peer) (Rendered, error) {
 	out := Rendered{}
-	entries, err := os.ReadDir(o.s.BaseConfigDir)
-	if err != nil {
-		return nil, fmt.Errorf("read baseConfigDir %s: %w", o.s.BaseConfigDir, err)
-	}
-	for _, e := range entries {
-		// 跳过 ConfigMap 挂载的内部条目(..data 符号链接、..2026_ 时间戳目录)和子目录
-		if strings.HasPrefix(e.Name(), ".") || e.IsDir() {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(o.s.BaseConfigDir, e.Name()))
+
+	// (A) rewrite 模式:透传 baseConfigDir + 改写指定 conf 的 peers 块
+	if o.s.BaseConfigDir != "" {
+		entries, err := os.ReadDir(o.s.BaseConfigDir)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read baseConfigDir %s: %w", o.s.BaseConfigDir, err)
 		}
-		out[e.Name()] = string(b)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".") || e.IsDir() { // 跳过 ConfigMap 内部条目 ..data/..时间戳
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(o.s.BaseConfigDir, e.Name()))
+			if err != nil {
+				return nil, err
+			}
+			out[e.Name()] = string(b)
+		}
+		for target, confFile := range o.s.RouteByTarget {
+			content, ok := out[confFile]
+			if !ok {
+				return nil, fmt.Errorf("routeByTarget: conf %q not in baseConfigDir", confFile)
+			}
+			newContent, err := rewritePeersBlock(content, nameUnnamed(peersByTarget[target], target))
+			if err != nil {
+				return nil, fmt.Errorf("rewrite peers in %s: %w", confFile, err)
+			}
+			out[confFile] = newContent
+		}
 	}
-	for target, confFile := range o.s.RouteByTarget {
-		content, ok := out[confFile]
-		if !ok {
-			return nil, fmt.Errorf("routeByTarget: conf %q not found in baseConfigDir", confFile)
-		}
-		peers := nameUnnamed(peersByTarget[target], target)
-		newContent, err := rewritePeersBlock(content, peers)
+
+	// (B) template 模式:每条 route 用模板生成整个 conf
+	if o.s.Template != "" {
+		tb, err := os.ReadFile(o.s.Template)
 		if err != nil {
-			return nil, fmt.Errorf("rewrite peers in %s: %w", confFile, err)
+			return nil, fmt.Errorf("read template %s: %w", o.s.Template, err)
 		}
-		out[confFile] = newContent
+		tmpl, err := template.New("route").Parse(string(tb))
+		if err != nil {
+			return nil, fmt.Errorf("parse template: %w", err)
+		}
+		for _, r := range o.s.Routes {
+			file := r.File
+			if file == "" {
+				return nil, fmt.Errorf("route (target %q): file required", r.Target)
+			}
+			var buf bytes.Buffer
+			data := struct {
+				Values map[string]interface{}
+				Peers  []config.Peer
+			}{Values: r.Values, Peers: nameUnnamed(peersByTarget[r.Target], r.Target)}
+			if err := tmpl.Execute(&buf, data); err != nil {
+				return nil, fmt.Errorf("render route %s: %w", file, err)
+			}
+			out[file] = buf.String()
+		}
 	}
 	return out, nil
 }

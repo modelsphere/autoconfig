@@ -57,6 +57,25 @@ sinks:                        # target ↔ 消费方显式绑定
   `peers = {` / `_G.PEERS = {` 块**(位置形式 `{ip, port, name[, priority[, maxConcurrency]]}`),
   其余原样透传,写进输出 ConfigMap(**只含 `.conf`,不含 lua**)。
 
+### openresty 两种模式:改写现成 conf / 模板生成整个 conf
+- **(A) rewrite**(`baseConfigDir` + `routeByTarget`):读现成 conf,只**改写 peers 块**,其余透传。
+  适合共享基座 `session_route.conf`(K2.5 + 共享 dicts/init)和手调过的 conf。
+- **(B) template**(`template` + `routes`):**agent 用 Go 模板给每条路由生成整个 conf**(dicts+server+register_route+peers)。
+  **加一条路由 = 配置里加一个 `routes` 条目 + 一个 target**,不用手写 conf:
+  ```yaml
+  sinks:
+    - kind: openresty
+      baseConfigDir: /base/openresty            # (A) 基座 session_route.conf 等
+      routeByTarget: { kimi-k2.6-router: session_route.conf }
+      template: /tmpl/openresty-route.tmpl       # (B) 每路由生成
+      routes:
+        - { target: glm-5.1-fp8, file: session_route_glm.conf, values: { route: glm, listen: 18083, ttft_limit_ms: 60000 } }
+        - { target: kimi-k2.6,   file: session_route_kimi-k2.6.conf, values: { route: k26, listen: 18082 } }
+      outputConfigMap: openresty/openresty-conf
+  ```
+  模板见 `deploy/openresty-route.tmpl`(骨架对齐真实 per-model conf:6 个 `*_<route>` dict + server + `register_route` + `peers` + `include conf.d/router_locations.inc`)。已实测:模板生成的 conf 用真 lua 正常加载;**动态加一条路由 → reload 后新端口 + 新 dict 上线**。
+  ⚠️ 改 agent 配置(加/删 route/target)当前需**重启 agent**(config 启动时读一次);加模型不频繁,可接受。
+
 ### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动
 ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把 **session_route*.conf 移到
 子目录 `conf.d/routes/`**,ConfigMap 挂到那里;`lua/` + `router_locations.inc` + `nginx.conf` 仍烤镜像。

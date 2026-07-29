@@ -38,9 +38,21 @@ type Sink struct {
 	BaseConfig string `json:"baseConfig"` // path to base config.yaml WITHOUT a workers: block
 	MaxLoad    int    `json:"maxLoad"`    // per-worker max_load (default 20)
 
-	// openresty:
-	BaseConfigDir string            `json:"baseConfigDir"` // dir of conf files (each becomes a ConfigMap key)
-	RouteByTarget map[string]string `json:"routeByTarget"` // target name -> conf filename whose peers block to rewrite
+	// openresty —— 两种模式(可并用):
+	// (A) rewrite:读 baseConfigDir 的现成 conf,按 routeByTarget 改写其 peers 块(其余原样透传)。
+	BaseConfigDir string            `json:"baseConfigDir"`
+	RouteByTarget map[string]string `json:"routeByTarget"`
+	// (B) template:agent 用 Go 模板给每条 route 生成【整个 conf】(dicts+server+register_route+peers)。
+	//     加路由 = 加一个 routes 条目 + 一个 target,不用手写 conf。
+	Template string            `json:"template"` // 模板文件路径(挂进 agent)
+	Routes   []OpenrestyRoute  `json:"routes"`
+}
+
+// OpenrestyRoute = template 模式下一条路由:target(哪桶后端)+ 输出文件名 + 传给模板的 values。
+type OpenrestyRoute struct {
+	Target string                 `json:"target"`
+	File   string                 `json:"file"`   // 输出 ConfigMap key,如 session_route_glm.conf
+	Values map[string]interface{} `json:"values"` // 模板里用 {{.Values.route}} / {{.Values.listen}} / 覆盖项
 }
 
 type Config struct {
