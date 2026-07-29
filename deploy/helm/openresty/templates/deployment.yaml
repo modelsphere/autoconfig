@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openresty.fullname" . }}
+  labels: {{- include "openresty.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: {{- include "openresty.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "openresty.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- if .Values.reload.enabled }}
+      shareProcessNamespace: true   # reload sidecar 靠此给 nginx master 发 SIGHUP
+      {{- end }}
+      containers:
+        - name: openresty
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            {{- range .Values.service.ports }}
+            - containerPort: {{ .port }}
+            {{- end }}
+          volumeMounts:
+            - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
+              mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.reload.enabled }}
+        - name: reload
+          image: {{ .Values.reload.image }}
+          args: ["--watch", "/watch", "--process", {{ .Values.reload.process | quote }}]
+          volumeMounts:
+            - name: routes
+              mountPath: /watch
+        {{- end }}
+      volumes:
+        - name: routes
+          configMap:
+            name: {{ .Values.routesConfigMap }}
+            optional: true      # 由 autoconfig 创建;不存在也让 pod 起(框架 baked,routes 后填)
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

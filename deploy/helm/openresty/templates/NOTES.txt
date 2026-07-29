@@ -1,0 +1,11 @@
+openresty 已部署({{ include "openresty.fullname" . }})。
+
+镜像: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}(框架基座 baked)
+路由来源: ConfigMap「{{ .Values.routesConfigMap }}」(由 autoconfig 从 ModelRoute 写入 conf.d/routes/)
+{{- if .Values.reload.enabled }}
+reload: sidecar autoconfig-reload watch → SIGHUP nginx master(热更)
+{{- end }}
+
+前置: 需 autoconfig controller 在跑 + 有 ModelRoute(openresty.outputConfigMap 指向本 ConfigMap),
+      否则路由为空(仅框架起,无 server 服务)。ConfigMap 挂载 kubelet 传播 ~1min。
+验证: kubectl exec deploy/{{ include "openresty.fullname" . }} -c openresty -- /usr/local/openresty/bin/openresty -t

@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "monitor.fullname" . }}
+  labels: {{- include "monitor.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: {{- include "monitor.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "monitor.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      containers:
+        - name: monitor
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          {{- with .Values.env }}
+          env: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: mconf                 # base + autoconfig services 合并;monitor 60s 自热加载(无 sidecar)
+              mountPath: /etc/monitor/conf.d
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: mconf
+          projected:                      # 合并两个 ConfigMap 到一个目录(monitor 读 *.conf)
+            sources:
+              - configMap:
+                  name: {{ include "monitor.fullname" . }}-base    # chart 的 base 阈值
+              - configMap:
+                  name: {{ .Values.servicesConfigMap }}            # autoconfig 的 services
+                  optional: true
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

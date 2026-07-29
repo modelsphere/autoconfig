@@ -1,0 +1,10 @@
+monitor 已部署({{ include "monitor.fullname" . }})。dashboard: :{{ .Values.service.port }}
+
+配置(projected 合并到 /etc/monitor/conf.d):
+  - base 阈值: 本 chart 的 ConfigMap「{{ include "monitor.fullname" . }}-base」(00-base.conf)
+  - services:  autoconfig 从 ModelRoute 写的「{{ .Values.servicesConfigMap }}」(每模型一个 *.monitor.conf)
+monitor 每 60s 自热加载 monitor.conf,无需 reload sidecar。
+
+⚠️ monitor 首启需至少一条 service(否则 "no services configured" 拒启);请先让 autoconfig 有对应
+   ModelRoute(monitor.outputConfigMap 指向本 servicesConfigMap)写出 service,再装/等本 chart。
+验证: kubectl logs deploy/{{ include "monitor.fullname" . }} | grep '配置热更新: services'

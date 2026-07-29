@@ -1,0 +1,33 @@
+image:
+  repository: harbor.4pd.io/hardcore-tech/llm-openresty
+  tag: ""              # 缺省用 Chart.appVersion(0.2.0-routes,基座 baked 版)
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+# autoconfig 从 ModelRoute 写的路由 ConfigMap(每路由一个 session_route_<route>.conf key),挂到 conf.d/routes/。
+# 本 chart 不创建它(autoconfig 管);optional 挂载 → 即使还没建 pod 也能起(框架已 baked)。
+routesConfigMap: openresty-conf
+
+# reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
+reload:
+  enabled: true
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.2
+  process: "nginx: master"
+
+service:
+  type: ClusterIP
+  ports:               # 与各 ModelRoute.openresty.listen 对应(按需增删)
+    - { name: glm, port: 18083 }
+    - { name: k25, port: 18080 }
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { cpu: "2", memory: 1Gi }
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+nameOverride: ""
+fullnameOverride: ""

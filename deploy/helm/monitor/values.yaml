@@ -1,0 +1,30 @@
+image:
+  repository: harbor.4pd.io/hardcore-tech/llm-monitor
+  tag: ""              # 缺省用 Chart.appVersion(0.1.0)
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+# autoconfig 从 ModelRoute 写的 services ConfigMap(每模型一个 <model>.monitor.conf key)。
+servicesConfigMap: monitor-conf
+
+# 本 chart 提供的 base 阈值(00-base.conf);与 autoconfig 的 services 经 projected volume 合并到 conf.d 目录。
+baseConfig: |
+  alert_ttft: 80
+  gpu_temp_warn: 75
+
+service:
+  type: ClusterIP
+  port: 8080           # dashboard
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { cpu: "1", memory: 512Mi }
+
+env: []                # 机器级凭证(WEB_TPM_AUTH 等)按需在此注入
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+nameOverride: ""
+fullnameOverride: ""
