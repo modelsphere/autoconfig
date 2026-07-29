@@ -10,7 +10,7 @@ CTRL_NS=${CTRL_NS:-autoconfig}
 TAG=${IMG_TAG:-0.3.1}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
-OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.1.0-routes}
+OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
 CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
 MON_IMG=${MON_IMG:-harbor.4pd.io/hardcore-tech/llm-monitor:0.1.0}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
@@ -69,9 +69,6 @@ data:
     gpu_temp_warn: 75
 YAML
 kubectl -n "$NS" rollout status deploy/be --timeout=120s
-# 预置 openresty 基座 session_route.conf(定义 upstream vllm_backends + init_by_lua + lua 框架);
-# autoconfig 再往同一 ConfigMap merge 每模型 session_route_glm.conf。
-kubectl -n "$NS" create cm openresty-conf --from-file=session_route.conf="$HERE/session_route.conf" --dry-run=client -o yaml | kubectl apply -f -
 
 # ---------- 3) ModelRoute:驱动 openresty + CART + monitor ----------
 say "ModelRoute(discovery + cart + openresty + monitor)"
