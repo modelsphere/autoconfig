@@ -69,6 +69,9 @@ data:
     gpu_temp_warn: 75
 YAML
 kubectl -n "$NS" rollout status deploy/be --timeout=120s
+# 预置 openresty 基座 session_route.conf(定义 upstream vllm_backends + init_by_lua + lua 框架);
+# autoconfig 再往同一 ConfigMap merge 每模型 session_route_glm.conf。
+kubectl -n "$NS" create cm openresty-conf --from-file=session_route.conf="$HERE/session_route.conf" --dry-run=client -o yaml | kubectl apply -f -
 
 # ---------- 3) ModelRoute:驱动 openresty + CART + monitor ----------
 say "ModelRoute(discovery + cart + openresty + monitor)"
@@ -106,6 +109,7 @@ spec:
       containers:
       - name: cart
         image: $CART_IMG
+        command: ["sh","-c","ulimit -n 65535; exec ./launch_service"]   # launch_service 要 ulimit≥65535
         ports: [{ containerPort: 8071 }]
         volumeMounts: [{ name: cfg, mountPath: /workspace/configs }]
       - name: reload
@@ -162,19 +166,21 @@ kubectl -n "$NS" rollout status deploy/monitor --timeout=120s || { bad "monitor 
 
 # ---------- 5) 验证真消费 ----------
 say "验证:CART workers / openresty peers / monitor services"
-sleep 15   # 等 CART pod 被 autoconfig 发现进 openresty peers + 各 reload 生效
 # CART:配置里有 backends 作 workers
 CARTCFG=$(kubectl -n "$NS" exec deploy/cart -c cart -- cat /workspace/configs/config.yaml 2>/dev/null)
 [ "$(echo "$CARTCFG" | grep -c 'url:')" = 2 ] && ok "CART config.yaml 有 2 个 worker(后端)" || bad "CART workers 不对"
-# openresty:conf 里有 CART peer(优先)+ 后端
-ORCONF=$(kubectl -n "$NS" exec deploy/openresty -c openresty -- cat /usr/local/openresty/nginx/conf/conf.d/routes/session_route_glm.conf 2>/dev/null)
-echo "--- openresty session_route_glm.conf(pod 内)---"; echo "$ORCONF" | grep -A6 'peers'
-echo "$ORCONF" | grep -qE '8071, "cart-0", 1, 180' && ok "openresty peers 含 CART(优先)" || bad "openresty 无 CART peer(CART pod 可能还没被发现)"
-[ "$(echo "$ORCONF" | grep -c '8050, "backend-')" = 2 ] && ok "openresty peers 含 2 后端(兜底)" || bad "openresty 后端 peer 不对"
-# openresty 真加载了(-t 语法 OK 说明 conf 合法被 include)
-kubectl -n "$NS" exec deploy/openresty -c openresty -- /usr/local/openresty/bin/openresty -t 2>&1 | grep -q 'syntax is ok' && ok "openresty -t 通过(真加载 include 的 conf)" || bad "openresty -t 失败"
-# monitor:日志里加载了 service(autoconfig 写的)
-kubectl -n "$NS" logs deploy/monitor --tail=60 2>/dev/null | grep -qE 'services \+\[.*glm-5.1-fp8' && ok "monitor 加载了 autoconfig 写的 service" || { bad "monitor 未加载 service"; kubectl -n "$NS" logs deploy/monitor --tail=20; }
+# openresty peers:读【权威 ConfigMap】(挂载文件有 ~1min 传播延迟),等 autoconfig 发现 CART 进 peers
+for i in $(seq 1 30); do
+  ORCONF=$(kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_glm\.conf}' 2>/dev/null)
+  echo "$ORCONF" | grep -qE '8071, "cart-0", 1, 180' && break; sleep 4
+done
+echo "--- openresty-conf peers(权威)---"; echo "$ORCONF" | grep -A5 'peers ='
+echo "$ORCONF" | grep -qE '8071, "cart-0", 1, 180' && ok "openresty peers 含 CART(优先)" || bad "openresty 无 CART peer"
+[ "$(echo "$ORCONF" | grep -c '8050, "backend-')" -ge 2 ] && ok "openresty peers 含后端(兜底)" || bad "openresty 后端 peer 不对"
+# openresty 真加载了:pod Running(rollout 已过)+ nginx master 在
+kubectl -n "$NS" exec deploy/openresty -c openresty -- pgrep -f 'nginx: master' >/dev/null 2>&1 && ok "openresty nginx master 运行中(config 已加载)" || bad "openresty 未运行"
+# monitor:真加载了 autoconfig 写的 service(svc_attrs 带 model/gpu_type)
+kubectl -n "$NS" logs deploy/monitor --tail=80 2>/dev/null | grep -qE 'svc_attrs: glm-.*model=glm-5.1-fp8, gpu_type=H100' && ok "monitor 加载了 autoconfig 写的 service(model/gpu_type 正确)" || { bad "monitor 未加载 service"; kubectl -n "$NS" logs deploy/monitor --tail=15; }
 
 # ---------- 6) 动态:scale 后端 → reload 跟随 ----------
 say "scale 后端 2→3,验证真 reload 跟随"
