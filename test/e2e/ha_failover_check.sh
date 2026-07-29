@@ -25,13 +25,19 @@ say "等 rollout(2 副本)"
 kubectl -n "$NS" rollout status deploy/openresty --timeout=180s || bad "openresty rollout"
 kubectl -n "$NS" rollout status deploy/cart --timeout=180s || bad "cart rollout"
 
-say "稳态:2 副本但 Service 只 1 个 Ready 端点(主备)"
+say "等收敛(ha-gate 打 active 标签需 app 端口可服务;openresty 要等路由 conf 传播 ~60s)"
+# 等每个 svc 恰好 1 个 active 端点(最多 ~150s)
 for svc in openresty cart; do
-  n=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=$svc --no-headers 2>/dev/null | wc -l | tr -d ' ')
-  e=$(eps $svc)
-  echo "  $svc: pods=$n, ready-endpoints=$e, lease-holder=$(leaderpod ${svc}-ha)"
-  [ "$n" = 2 ] && ok "$svc 2 副本" || bad "$svc 副本数=$n"
-  [ "$e" = 1 ] && ok "$svc Service 只 1 个 Ready 端点(单 active)" || bad "$svc Ready 端点=$e(期望 1)"
+  for i in $(seq 1 50); do [ "$(eps $svc)" = 1 ] && break; sleep 3; done
+done
+runpods(){ kubectl -n "$NS" get pods -l app.kubernetes.io/name=$1 --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' '; }
+
+say "稳态:2 副本(都 Ready/健康)但 Service 只 1 个 active 端点(主备)"
+for svc in openresty cart; do
+  n=$(runpods $svc); e=$(eps $svc)
+  echo "  $svc: running-pods=$n, service-endpoints=$e, lease-holder=$(leaderpod ${svc}-ha)"
+  [ "$n" = 2 ] && ok "$svc 2 副本 Running" || bad "$svc Running 副本=$n"
+  [ "$e" = 1 ] && ok "$svc Service 只 1 个 active 端点(单 active)" || bad "$svc active 端点=$e(期望 1)"
 done
 
 say "推理正常(经 openresty 入口)"
