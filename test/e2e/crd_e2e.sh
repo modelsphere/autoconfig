@@ -86,6 +86,7 @@ spec:
     outputConfigMap: $NS/openresty-conf
     values: { ttft_limit_ms: "60000" }
     sources: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
+  monitor: { outputConfigMap: $NS/monitor-conf, model: glm, gpuType: H100 }
 YAML
 kubectl -n "$NS" rollout status deploy/glm-backend --timeout=120s
 kubectl -n "$NS" rollout status deploy/cart-glm --timeout=120s
@@ -112,6 +113,11 @@ echo "$OR" | grep -q 'listen 18083' && ok "listen 18083" || bad "无 listen 1808
 # 顺序:CART 在后端之前
 cl=$(echo "$OR" | grep -n 'cart-0' | head -1 | cut -d: -f1); bl=$(echo "$OR" | grep -n 'backend-0' | head -1 | cut -d: -f1)
 [ -n "$cl" ] && [ -n "$bl" ] && [ "$cl" -lt "$bl" ] && ok "CART 排在后端之前" || bad "CART/后端顺序不对"
+
+MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm\.monitor\.conf}' 2>/dev/null)
+echo "--- monitor glm.monitor.conf ---"; echo "$MON"
+[ "$(echo "$MON" | grep -c '^service: glm-')" = 2 ] && ok "monitor service 行 = 2(每后端一行)" || bad "monitor service 行 != 2"
+echo "$MON" | grep -q '| glm | H100' && ok "monitor model/gpu_type 正确" || bad "monitor model/gpu_type 不对"
 
 # ---------- 4) scale 跟随 ----------
 say "scale 后端 2→3,验证跟随"
