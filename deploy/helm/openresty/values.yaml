@@ -9,7 +9,7 @@ replicas: 2                # master-standby:2 副本,只有 leader 收流量(见
 # openresty 的路由态(active_conns/adaptive-cc/health-timer)是 pod 内共享内存,不能 active-active。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.6
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.7
   port: 8081
   appTcp: "127.0.0.1:18080"    # readiness 还要求本端口可连(有路由 listener 才算就绪)
 
@@ -28,7 +28,7 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.6
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.7
   process: "nginx: master"
 
 service:

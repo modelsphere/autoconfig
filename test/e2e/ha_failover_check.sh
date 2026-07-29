@@ -7,7 +7,7 @@ NS=${NS:-kimi}
 CHARTS=${CHARTS:-$HERE/charts}
 OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
 CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
-ACR=${ACR:-harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.6}
+ACR=${ACR:-harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.7}
 AUTH_KEY=${AUTH_KEY:-REDACTED-SEE-DEPLOY-DOCS}
 FAIL=0; say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 
@@ -15,7 +15,7 @@ FAIL=0; say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ ech
 eps(){ kubectl -n "$NS" get endpointslice -l kubernetes.io/service-name="$1" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' 2>/dev/null | grep -c true; }
 leaderpod(){ kubectl -n "$NS" get lease "$1" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null; }
 
-say "helm upgrade openresty/cart → 0.3.6(HA:replicas2 + ha-gate)"
+say "helm upgrade openresty/cart → 0.3.7(HA:replicas2 + ha-gate)"
 helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" --set fullnameOverride=openresty \
   --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" --set reload.image="$ACR" >/dev/null && ok "openresty upgraded" || bad "openresty upgrade 失败"
 helm -n "$NS" upgrade --install cart "$CHARTS/cart" --set fullnameOverride=cart \
@@ -52,16 +52,25 @@ PYEOF
 }
 infer | grep -q '"content"' && ok "failover 前推理 OK" || bad "failover 前推理失败"
 
-say "failover:删 openresty leader pod,验 standby 接管"
+say "failover:删 openresty leader pod,测切换耗时(计划内 SIGTERM 路径)"
 LEADER=$(leaderpod openresty-ha)
 echo "  当前 leader pod=$LEADER"
+t0=$(date +%s%3N)
 kubectl -n "$NS" delete pod "$LEADER" --wait=false 2>/dev/null
-# 等新 leader(holder 变化)+ Service 仍恰好 1 个 Ready 端点
-NEW=""
-for i in $(seq 1 30); do NEW=$(leaderpod openresty-ha); [ -n "$NEW" ] && [ "$NEW" != "$LEADER" ] && break; sleep 3; done
+# 紧密轮询 Service active 端点:记录跌到 0 与回到 1 的时刻
+drop=""; rec=""
+for i in $(seq 1 120); do
+  e=$(eps openresty); now=$(date +%s%3N)
+  [ -z "$drop" ] && [ "$e" = 0 ] && drop=$now
+  [ "$e" = 1 ] && { [ -n "$drop" ] && { rec=$now; break; }; [ $((now-t0)) -gt 4000 ] && { rec=$now; break; }; }
+done
+NEW=$(leaderpod openresty-ha)
 [ -n "$NEW" ] && [ "$NEW" != "$LEADER" ] && ok "standby 接管 leader:$LEADER → $NEW" || bad "leader 未切换(仍 $NEW)"
-for i in $(seq 1 20); do [ "$(eps openresty)" = 1 ] && break; sleep 3; done
-[ "$(eps openresty)" = 1 ] && ok "切换后 Service 仍恰好 1 个 Ready 端点" || bad "切换后 Ready 端点=$(eps openresty)"
+if [ -n "$rec" ]; then
+  if [ -n "$drop" ]; then echo "  ⏱ 切换:delete→恢复 = $((rec-t0))ms,其中 Service 0 端点窗口 = $((rec-drop))ms"
+  else echo "  ⏱ 切换:全程未跌到 0 端点(无缝)"; fi
+fi
+[ "$(eps openresty)" = 1 ] && ok "切换后 Service 恰好 1 个 active 端点" || bad "切换后端点=$(eps openresty)"
 
 say "failover 后推理仍正常"
 for i in $(seq 1 20); do infer | grep -q '"content"' && { ok "failover 后推理 OK"; break; }; sleep 3; [ "$i" = 20 ] && bad "failover 后推理失败"; done

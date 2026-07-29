@@ -2,4 +2,4 @@ resources:
 - manager.yaml
 images:
 - name: harbor.4pd.io/hardcore-tech/autoconfig
-  newTag: "0.3.6"
+  newTag: "0.3.7"

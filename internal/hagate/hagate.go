@@ -1,7 +1,11 @@
 // Package hagate 是 master-standby 用的 leader 选举 + 标签门控:2 副本都保持 Ready(健康),
 // 但只有持 Lease 的 leader 给自己打 active 标签(且本地 app 端口可连);Service selector 匹配该标签
 // → 只有 leader 进 endpoints。用标签而非 readiness 门控,避免 standby 永久 NotReady 卡住 Deployment 滚动。
-// leader 挂了 Lease 到期(~LeaseDuration),standby 接管打标签 → 自动 failover。
+//
+// failover:
+//   - 计划内(SIGTERM:删 pod/滚动/驱逐):捕获信号 → 取消 context → ReleaseOnCancel 主动释放 Lease
+//     + 摘掉自己 active 标签 → standby ~1-2s(RetryPeriod)接管,近乎无缝。
+//   - 硬崩(节点宕/kill -9):无从释放,standby 等 Lease 过期(~LeaseDuration)接管。
 package hagate
 
 import (
@@ -10,7 +14,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,10 +28,16 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
-// Run 启动 leader 选举 + 标签门控。leaseName/ns 定位 Lease,id 是本 pod(POD_NAME)。
-// labelKey/labelVal 是 active 标签(Service selector 匹配它);appTCP 非空时还要求本地端口可连才打标签。
-// httpAddr 暴露 /healthz(200=leader,供调试/liveness)。
-func Run(leaseName, ns, id, httpAddr, appTCP, labelKey, labelVal string) error {
+// Config 是 hagate 的运行参数。
+type Config struct {
+	Lease, Namespace, Identity string
+	HTTPAddr, AppTCP           string
+	LabelKey, LabelVal         string
+	LeaseDuration, RenewDeadline, RetryPeriod time.Duration
+}
+
+// Run 启动 leader 选举 + 标签门控,阻塞直到收到 SIGTERM/SIGINT(优雅释放后退出)。
+func Run(c Config) error {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return err
@@ -45,47 +58,66 @@ func Run(leaseName, ns, id, httpAddr, appTCP, labelKey, labelVal string) error {
 		_, _ = w.Write([]byte("standby"))
 	})
 	go func() {
-		if err := http.ListenAndServe(httpAddr, nil); err != nil {
-			log.Fatalf("healthz listen %s: %v", httpAddr, err)
+		if err := http.ListenAndServe(c.HTTPAddr, nil); err != nil {
+			log.Fatalf("healthz listen %s: %v", c.HTTPAddr, err)
 		}
+	}()
+
+	// 信号 → 取消 ctx(RunOrDie 收到后 ReleaseOnCancel 释放 Lease)
+	ctx, cancel := context.WithCancel(context.Background())
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigc
+		log.Printf("signal received, releasing lease + label (%s)", c.Identity)
+		_ = setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, false) // 先摘标签,Service 立刻剔除本 pod
+		cancel()
 	}()
 
 	// 标签协调:desired = leader 且(未配 appTCP 或端口可连);与当前标签不符就 patch。
 	go func() {
 		have := false
 		for {
-			want := leader.Load() && (appTCP == "" || dialOK(appTCP))
+			want := leader.Load() && (c.AppTCP == "" || dialOK(c.AppTCP))
 			if want != have {
-				if err := setPodLabel(cs, ns, id, labelKey, labelVal, want); err != nil {
-					log.Printf("set label %s=%v: %v", labelKey, want, err)
+				if err := setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, want); err != nil {
+					log.Printf("set label %s=%v: %v", c.LabelKey, want, err)
 				} else {
 					have = want
-					log.Printf("pod %s active=%v", id, want)
+					log.Printf("pod %s active=%v", c.Identity, want)
 				}
 			}
-			time.Sleep(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		}
 	}()
 
 	lock := &resourcelock.LeaseLock{
-		LeaseMeta:  metav1.ObjectMeta{Name: leaseName, Namespace: ns},
+		LeaseMeta:  metav1.ObjectMeta{Name: c.Lease, Namespace: c.Namespace},
 		Client:     cs.CoordinationV1(),
-		LockConfig: resourcelock.ResourceLockConfig{Identity: id},
+		LockConfig: resourcelock.ResourceLockConfig{Identity: c.Identity},
 	}
-	for { // 丢主后回到候选态继续抢,不退出(pod 不重启,变 standby 热备)
-		leaderelection.RunOrDie(context.Background(), leaderelection.LeaderElectionConfig{
+	for { // 丢主后回到候选态继续抢;收到信号(ctx 取消)则退出
+		leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 			Lock:            lock,
-			ReleaseOnCancel: true,
-			LeaseDuration:   15 * time.Second,
-			RenewDeadline:   10 * time.Second,
-			RetryPeriod:     2 * time.Second,
+			ReleaseOnCancel: true, // ctx 取消时把 Lease 释放掉 → standby 立刻可抢
+			LeaseDuration:   c.LeaseDuration,
+			RenewDeadline:   c.RenewDeadline,
+			RetryPeriod:     c.RetryPeriod,
 			Callbacks: leaderelection.LeaderCallbacks{
-				OnStartedLeading: func(ctx context.Context) { leader.Store(true); log.Printf("became leader (%s)", id) },
-				OnStoppedLeading: func() { leader.Store(false); log.Printf("lost leadership (%s)", id) },
+				OnStartedLeading: func(ctx context.Context) { leader.Store(true); log.Printf("became leader (%s)", c.Identity) },
+				OnStoppedLeading: func() { leader.Store(false); log.Printf("lost leadership (%s)", c.Identity) },
 			},
 		})
 		leader.Store(false)
-		time.Sleep(2 * time.Second)
+		if ctx.Err() != nil { // 收到信号,优雅退出
+			log.Printf("shutting down (%s)", c.Identity)
+			return nil
+		}
+		time.Sleep(1 * time.Second)
 	}
 }
 
