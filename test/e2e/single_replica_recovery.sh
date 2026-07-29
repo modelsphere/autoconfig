@@ -23,10 +23,14 @@ spec:
       - name: openresty
         image: ${OR_IMG}
         volumeMounts: [{ name: routes, mountPath: /usr/local/openresty/nginx/conf/conf.d/routes }]
+        startupProbe:                      # 与 chart 一致:startup 给慢启动预算,readiness 快探
+          exec: { command: ["sh","-c","pgrep -f 'nginx: master' >/dev/null"] }
+          periodSeconds: 2
+          failureThreshold: 30
         readinessProbe:
           exec: { command: ["sh","-c","pgrep -f 'nginx: master' >/dev/null"] }
-          initialDelaySeconds: 10
-          periodSeconds: 10
+          periodSeconds: 2
+          failureThreshold: 2
       volumes: [{ name: routes, configMap: { name: openresty-conf } }]
 YAML
 for i in $(seq 1 40); do [ "$(avail)" = 1 ] && break; sleep 2; done
@@ -40,7 +44,7 @@ tdrop=""; for i in $(seq 1 100); do [ "$(avail)" = 0 ] && { tdrop=$(date +%s%3N)
 trec="";  for i in $(seq 1 120); do [ "$(avail)" = 1 ] && { trec=$(date +%s%3N); break; }; sleep 1; done
 echo "  ⏱ 单副本 Deployment 重建恢复:"
 [ -n "$tdrop" ] && echo "     delete → 端点掉 0        = $((tdrop-t0))ms"
-[ -n "$trec" ]  && echo "     delete → 新 pod Ready     = $((trec-t0))ms(主要 = readiness initialDelay 10s + 起容器)" || echo "     120s 未恢复"
+[ -n "$trec" ]  && echo "     delete → 新 pod Ready     = $((trec-t0))ms(= 起容器 + nginx 起 + startup/readiness 探到)" || echo "     120s 未恢复"
 
 kubectl -n "$NS" delete deploy ortest --wait=false >/dev/null 2>&1
 echo "(ortest 已清理;不碰线上 openresty)"

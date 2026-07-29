@@ -30,10 +30,13 @@ spec:
             - name: mconf                 # base + autoconfig services 同一 ConfigMap;monitor 60s 自热加载(无 sidecar)
               mountPath: /etc/monitor/conf.d
           {{- if .Values.livenessProbe.enabled }}
-          livenessProbe:                  # dashboard 端口存活
+          startupProbe:                   # 慢启动预算:dashboard 端口起来前不判 live(最多 ~60s)
             tcpSocket: { port: {{ .Values.service.port }} }
-            initialDelaySeconds: 20
-            periodSeconds: 20
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:                  # startup 过后才生效 → snappy 快抓假死
+            tcpSocket: { port: {{ .Values.service.port }} }
+            periodSeconds: 10
             failureThreshold: 3
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}

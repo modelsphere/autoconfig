@@ -31,15 +31,18 @@ spec:
             - name: cfg                 # autoconfig 写的 config.yaml(整卷挂到 /workspace/configs)
               mountPath: /workspace/configs
           {{- if .Values.livenessProbe.enabled }}
-          livenessProbe:                # 端口存活
+          startupProbe:                 # 慢启动预算:端口起来前不判 live/ready(最多 ~60s)
             tcpSocket: { port: {{ .Values.service.port }} }
-            initialDelaySeconds: 20
-            periodSeconds: 20
-            failureThreshold: 3
-          readinessProbe:               # 健康即 Ready(主备两副本都 Ready);谁收流量由 ha-active 标签定
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:                # startup 过后才生效 → snappy 快抓假死
             tcpSocket: { port: {{ .Values.service.port }} }
-            initialDelaySeconds: 10
             periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:               # startup 过后端口已在 → 秒 Ready;谁收流量由 ha-active 标签定
+            tcpSocket: { port: {{ .Values.service.port }} }
+            periodSeconds: 2
+            failureThreshold: 2
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.reload.enabled }}

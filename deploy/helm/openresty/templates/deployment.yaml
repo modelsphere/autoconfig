@@ -32,17 +32,18 @@ spec:
             - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
           {{- if .Values.livenessProbe.enabled }}
-          livenessProbe:                    # master 进程存活(不看端口——空路由时无 listener 属正常)
-            exec:
-              command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"]
-            initialDelaySeconds: 15
-            periodSeconds: 20
-            failureThreshold: 3
-          readinessProbe:                   # 健康即 Ready(主备两副本都 Ready,Deployment 滚动正常);
-            exec:                            # 谁收流量由 ha-gate 的 active 标签 + Service selector 决定
-              command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"]
-            initialDelaySeconds: 10
+          startupProbe:                     # 慢启动预算:nginx master 出现前不判 live/ready(最多 ~60s)
+            exec: { command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"] }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:                    # startup 过后才生效 → 可 snappy、无 initialDelay(不会启动期误杀);快抓假死
+            exec: { command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"] }
             periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:                   # startup 过后 nginx 已在 → 秒 Ready;谁收流量另由 ha-gate active 标签决定
+            exec: { command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"] }
+            periodSeconds: 2
+            failureThreshold: 2
           {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.reload.enabled }}
