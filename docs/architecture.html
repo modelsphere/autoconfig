@@ -1,0 +1,260 @@
+<title>autoconfig 架构</title>
+<style>
+  :root{
+    --bg:#eef1f6; --surface:#ffffff; --surface2:#f7f9fc;
+    --ink:#141b26; --muted:#586576; --faint:#8593a3;
+    --line:#d7dee8; --grid:#e7ecf3;
+    --accent:#3352e1; --accent-soft:rgba(51,82,225,.10);
+    --be:#2f6fed;  --be-soft:rgba(47,111,237,.09);
+    --cm:#7b52e0;  --cm-soft:rgba(123,82,224,.10);
+    --pod:#0e9b7c; --pod-soft:rgba(14,155,124,.10);
+    --side:#c07d0a;--side-soft:rgba(192,125,10,.12);
+    --data:#3d4b5c;
+    --shadow:0 1px 2px rgba(20,30,45,.05),0 10px 30px -14px rgba(20,30,45,.16);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0c1116; --surface:#121923; --surface2:#0f151d;
+      --ink:#e6ecf3; --muted:#93a1b2; --faint:#5f6e80;
+      --line:#243040; --grid:#1a2330;
+      --accent:#6d86ff; --accent-soft:rgba(109,134,255,.14);
+      --be:#5b8bff;  --be-soft:rgba(91,139,255,.13);
+      --cm:#a488ff;  --cm-soft:rgba(164,136,255,.14);
+      --pod:#2fc7a1; --pod-soft:rgba(47,199,161,.13);
+      --side:#e0a53a;--side-soft:rgba(224,165,58,.15);
+      --data:#8595a8;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 34px -16px rgba(0,0,0,.66);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f6; --surface:#ffffff; --surface2:#f7f9fc;
+    --ink:#141b26; --muted:#586576; --faint:#8593a3;
+    --line:#d7dee8; --grid:#e7ecf3;
+    --accent:#3352e1; --accent-soft:rgba(51,82,225,.10);
+    --be:#2f6fed; --be-soft:rgba(47,111,237,.09);
+    --cm:#7b52e0; --cm-soft:rgba(123,82,224,.10);
+    --pod:#0e9b7c; --pod-soft:rgba(14,155,124,.10);
+    --side:#c07d0a; --side-soft:rgba(192,125,10,.12);
+    --data:#3d4b5c;
+    --shadow:0 1px 2px rgba(20,30,45,.05),0 10px 30px -14px rgba(20,30,45,.16);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0c1116; --surface:#121923; --surface2:#0f151d;
+    --ink:#e6ecf3; --muted:#93a1b2; --faint:#5f6e80;
+    --line:#243040; --grid:#1a2330;
+    --accent:#6d86ff; --accent-soft:rgba(109,134,255,.14);
+    --be:#5b8bff; --be-soft:rgba(91,139,255,.13);
+    --cm:#a488ff; --cm-soft:rgba(164,136,255,.14);
+    --pod:#2fc7a1; --pod-soft:rgba(47,199,161,.13);
+    --side:#e0a53a; --side-soft:rgba(224,165,58,.15);
+    --data:#8595a8;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 34px -16px rgba(0,0,0,.66);
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+  .wrap{max-width:1040px;margin:0 auto;padding:56px 24px 84px}
+
+  .eyebrow{font:700 12px/1 ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);margin:0 0 16px}
+  h1{font-size:clamp(28px,5vw,44px);line-height:1.1;letter-spacing:-.022em;text-wrap:balance;margin:0 0 18px;font-weight:820}
+  .lede{font-size:17px;color:var(--muted);max-width:70ch;margin:0 0 4px}
+  .lede strong{color:var(--ink);font-weight:650}
+
+  h2{font-size:clamp(17px,2.4vw,21px);letter-spacing:-.01em;margin:0;font-weight:760}
+  .plane{margin-top:44px;background:var(--surface);border:1px solid var(--line);border-radius:16px;
+    padding:20px 22px 24px;box-shadow:var(--shadow)}
+  .plane-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+  .tag{font:700 10.5px/1 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase;
+    padding:5px 9px;border-radius:6px}
+  .tag.data{color:var(--data);background:color-mix(in srgb,var(--data) 12%,transparent)}
+  .tag.cfg{color:var(--accent);background:var(--accent-soft)}
+  .sub{color:var(--muted);font-size:13.5px;margin:8px 0 18px;max-width:74ch}
+
+  /* ---- flow ---- */
+  .flow{overflow-x:auto;padding:6px 2px 10px}
+  .row{display:flex;align-items:center;gap:6px;min-width:max-content}
+  .stack{display:flex;flex-direction:column;gap:12px}
+
+  .node{background:var(--surface2);border:1px solid var(--line);border-radius:12px;
+    padding:12px 15px;min-width:158px}
+  .kind{display:block;font:600 10px/1 ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase;margin-bottom:7px}
+  .nt{font-size:14.5px;font-weight:700;letter-spacing:-.005em}
+  .ns{font-size:12px;color:var(--muted);margin-top:3px}
+  .ns .mono{font-size:11.5px}
+  .be .kind{color:var(--be)}  .be{border-color:color-mix(in srgb,var(--be) 34%,var(--line));background:var(--be-soft)}
+  .cm .kind{color:var(--cm)}  .cm{border-color:color-mix(in srgb,var(--cm) 34%,var(--line));background:var(--cm-soft)}
+  .pd .kind{color:var(--pod)} .pd{border-color:color-mix(in srgb,var(--pod) 34%,var(--line));background:var(--pod-soft)}
+
+  /* agent node bigger */
+  .agent{min-width:230px;background:var(--surface);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+  .agent .kind{color:var(--accent)}
+  .cfgchip{display:inline-flex;align-items:center;gap:6px;font:600 10.5px ui-monospace,monospace;
+    color:var(--cm);background:var(--cm-soft);border:1px solid color-mix(in srgb,var(--cm) 30%,var(--line));
+    border-radius:6px;padding:4px 8px;margin-bottom:10px}
+  .sinks{display:flex;gap:8px;margin-top:10px}
+  .mini{flex:1;background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .mini b{font-size:12px;font-weight:700}
+  .mini span{display:block;font:11px ui-monospace,monospace;color:var(--muted);margin-top:2px}
+  .disc{background:var(--surface2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px}
+  .disc b{font-weight:700}
+  .disc .mono{font-size:11px;color:var(--muted)}
+
+  /* pods with reload */
+  .pod-in{display:flex;align-items:center;gap:8px;margin-top:9px}
+  .chip{font:600 11.5px ui-monospace,monospace;border-radius:7px;padding:7px 9px;white-space:nowrap}
+  .chip.app{background:var(--surface);border:1px solid color-mix(in srgb,var(--pod) 32%,var(--line));color:var(--ink)}
+  .chip.side{background:var(--side-soft);border:1px solid color-mix(in srgb,var(--side) 34%,var(--line));color:var(--side)}
+  .sig{display:inline-flex;flex-direction:column;align-items:center;color:var(--side);font:700 9px ui-monospace,monospace;letter-spacing:.06em}
+  .sig svg{display:block}
+
+  /* arrows between stages */
+  .arr{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;min-width:88px;color:var(--accent);flex:none}
+  .arr .albl{font:600 10.5px ui-monospace,monospace;color:var(--muted);white-space:nowrap;text-align:center;letter-spacing:.02em}
+  .arr.data{color:var(--data);min-width:104px}
+  .arr svg{display:block}
+
+  /* steps (real sequence) */
+  .steps{list-style:none;counter-reset:s;margin:22px 0 0;padding:0;display:grid;gap:11px}
+  .steps li{counter-increment:s;position:relative;padding:13px 16px 13px 52px;background:var(--surface2);
+    border:1px solid var(--line);border-radius:11px;font-size:13.5px}
+  .steps li::before{content:counter(s);position:absolute;left:12px;top:12px;width:26px;height:26px;border-radius:7px;
+    background:var(--accent);color:#fff;font:700 13px/26px ui-monospace,monospace;text-align:center}
+  .steps b{font-weight:700}
+  .steps .mono{font-size:12px}
+
+  /* cards */
+  section.keys{margin-top:44px}
+  .keys h2{margin-bottom:16px}
+  .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:13px;padding:17px 19px;box-shadow:var(--shadow)}
+  .card .ct{display:flex;align-items:center;gap:9px;font-size:14.5px;font-weight:730;margin-bottom:7px;letter-spacing:-.005em}
+  .card .dot{width:9px;height:9px;border-radius:3px;flex:none}
+  .card p{margin:0;font-size:13px;color:var(--muted)}
+  .card p .mono{font-size:12px;color:var(--ink)}
+
+  code{font-family:ui-monospace,Menlo,monospace;font-size:.88em;background:var(--grid);padding:.12em .42em;border-radius:5px}
+  .note{font-size:12.5px;color:var(--muted);border-left:2px solid var(--line);padding:3px 0 3px 14px;margin:20px 0 0;max-width:76ch}
+  footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--faint)}
+  footer .mono{color:var(--muted)}
+  a{color:var(--accent)}
+
+  @media (max-width:640px){
+    .cards{grid-template-columns:1fr}
+    .wrap{padding:40px 16px 64px}
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">autoconfig · k8s 路由层配置同步</p>
+  <h1>后端扩缩容，路由器配置自己跟上</h1>
+  <p class="lede">一个 k8s 控制器：watch 后端 pod（<strong>EndpointSlice 或 label</strong>），按模型分桶，自动改写 <strong>openresty 的 peers</strong> 和 <strong>cache-aware-router 的 workers</strong>，再触发优雅重载——不再手工维护路由器的后端列表。</p>
+
+  <!-- ============ DATA PLANE ============ -->
+  <section class="plane">
+    <div class="plane-head"><span class="tag data">数据平面</span><h2>请求怎么流</h2></div>
+    <p class="sub">openresty → CART → 后端。autoconfig <b>不在这条链路上</b>，只维护这三者的后端配置。</p>
+    <div class="flow"><div class="row">
+      <div class="node"><span class="kind" style="color:var(--muted)">client</span><div class="nt">客户端 / 上游</div></div>
+      <div class="arr data"><span class="albl">请求</span><svg width="104" height="12" viewBox="0 0 104 12"><line x1="0" y1="6" x2="92" y2="6" stroke="currentColor" stroke-width="2.4" stroke-dasharray="7 4"/><path d="M92,1 L102,6 L92,11 Z" fill="currentColor"/></svg></div>
+      <div class="node pd"><span class="kind">pod</span><div class="nt">openresty</div><div class="ns">session 路由网关</div></div>
+      <div class="arr data"><span class="albl">peers = CART(优先)</span><svg width="104" height="12" viewBox="0 0 104 12"><line x1="0" y1="6" x2="92" y2="6" stroke="currentColor" stroke-width="2.4" stroke-dasharray="7 4"/><path d="M92,1 L102,6 L92,11 Z" fill="currentColor"/></svg></div>
+      <div class="node pd"><span class="kind">pod</span><div class="nt">cache-aware-router</div><div class="ns">CART · 前缀缓存亲和</div></div>
+      <div class="arr data"><span class="albl">workers</span><svg width="104" height="12" viewBox="0 0 104 12"><line x1="0" y1="6" x2="92" y2="6" stroke="currentColor" stroke-width="2.4" stroke-dasharray="7 4"/><path d="M92,1 L102,6 L92,11 Z" fill="currentColor"/></svg></div>
+      <div class="node be"><span class="kind">pod ×N</span><div class="nt">后端 pods</div><div class="ns">vllm / sglang</div></div>
+    </div></div>
+  </section>
+
+  <!-- ============ CONFIG PLANE ============ -->
+  <section class="plane">
+    <div class="plane-head"><span class="tag cfg">配置平面</span><h2>配置怎么同步（autoconfig 的活）</h2></div>
+    <p class="sub">发现 → 渲染 → 写 ConfigMap → 挂载 → SIGHUP。同一份 agent 配置同时驱动 CART 的 workers 和 openresty 的 peers。</p>
+    <div class="flow"><div class="row">
+
+      <div class="node be"><span class="kind">pod ×N</span><div class="nt">后端 pods</div><div class="ns">按模型分桶<br>LWS leader / 单机 / 单卡</div></div>
+
+      <div class="arr"><span class="albl">list / watch</span><svg width="88" height="12" viewBox="0 0 88 12"><line x1="0" y1="6" x2="76" y2="6" stroke="currentColor" stroke-width="2"/><path d="M76,1.5 L86,6 L76,10.5 Z" fill="currentColor"/></svg></div>
+
+      <div class="node agent">
+        <span class="kind">deployment</span>
+        <div class="nt" style="margin-bottom:2px">autoconfig agent</div>
+        <div class="ns" style="margin-bottom:9px">中心控制循环 · RBAC 一处</div>
+        <span class="cfgchip">⇩ ConfigMap: autoconfig-config（热更）</span>
+        <div class="disc"><b>discovery</b> — 按 target<br><span class="mono">EndpointSlice(service) / label(selector) · 只取 Ready</span></div>
+        <div class="sinks">
+          <div class="mini"><b>sink: cart</b><span>→ workers</span></div>
+          <div class="mini"><b>sink: openresty</b><span>→ peers</span></div>
+        </div>
+      </div>
+
+      <div class="arr"><span class="albl">write（diff）</span><svg width="88" height="12" viewBox="0 0 88 12"><line x1="0" y1="6" x2="76" y2="6" stroke="currentColor" stroke-width="2"/><path d="M76,1.5 L86,6 L76,10.5 Z" fill="currentColor"/></svg></div>
+
+      <div class="stack">
+        <div class="node cm"><span class="kind">configmap</span><div class="nt">cart-config</div><div class="ns"><span class="mono">config.yaml</span> + workers</div></div>
+        <div class="node cm"><span class="kind">configmap</span><div class="nt">openresty-conf</div><div class="ns">session_route_*.conf</div></div>
+      </div>
+
+      <div class="arr"><span class="albl">整卷挂<br>~1min</span><svg width="88" height="12" viewBox="0 0 88 12"><line x1="0" y1="6" x2="76" y2="6" stroke="currentColor" stroke-width="2"/><path d="M76,1.5 L86,6 L76,10.5 Z" fill="currentColor"/></svg></div>
+
+      <div class="stack">
+        <div class="node pd">
+          <span class="kind">pod</span><div class="nt">CART pod</div>
+          <div class="pod-in">
+            <span class="chip app">cache-aware-router</span>
+            <span class="sig"><svg width="26" height="10" viewBox="0 0 26 10"><line x1="26" y1="5" x2="10" y2="5" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M10,1 L2,5 L10,9 Z" fill="currentColor"/></svg>SIGHUP</span>
+            <span class="chip side">reload</span>
+          </div>
+          <div class="ns">shareProcessNamespace</div>
+        </div>
+        <div class="node pd">
+          <span class="kind">pod</span><div class="nt">openresty pod</div>
+          <div class="pod-in">
+            <span class="chip app">openresty</span>
+            <span class="sig"><svg width="26" height="10" viewBox="0 0 26 10"><line x1="26" y1="5" x2="10" y2="5" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M10,1 L2,5 L10,9 Z" fill="currentColor"/></svg>SIGHUP</span>
+            <span class="chip side">reload</span>
+          </div>
+          <div class="ns">include <span class="mono">conf.d/routes/</span></div>
+        </div>
+      </div>
+
+    </div></div>
+
+    <ol class="steps">
+      <li><b>discover</b> — 按 target 用 EndpointSlice(<span class="mono">service</span>)或 label(<span class="mono">selector</span>)列出 <b>Ready</b> 端点，按模型分桶（排空中端点自动排除）。</li>
+      <li><b>render</b> — cart sink 拼 <span class="mono">workers</span>；openresty sink 改写或模板生成 <span class="mono">peers</span>（可 <b>CART 优先 + 后端兜底</b>，带 priority）。</li>
+      <li><b>diff &amp; write</b> — 和上次比，<b>变了才写</b> ConfigMap；发现为空 <b>保留上次（fail-safe）</b>，绝不写空。</li>
+      <li><b>propagate</b> — ConfigMap 整卷挂进消费方 pod（kubelet <span class="mono">~1min</span>，非 subPath）。</li>
+      <li><b>reload</b> — sidecar inotify 到变化 → <b>SIGHUP</b> 主进程优雅重载；坏配置只 warn、保留旧配置。</li>
+    </ol>
+  </section>
+
+  <!-- ============ KEY DESIGN ============ -->
+  <section class="keys">
+    <h2>关键设计</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="ct"><span class="dot" style="background:var(--be)"></span>发现：EndpointSlice 优先，label 兜底</div>
+        <p><span class="mono">service</span> 走 EndpointSlice——原生 <b>Ready / Terminating</b> 语义，排空中端点自动排除，前提是 Service 只选服务端点（LWS Service 配成只选 leader）；没建 Service 的单机 / 单卡用 <span class="mono">selector</span>。</p>
+      </div>
+      <div class="card">
+        <div class="ct"><span class="dot" style="background:var(--data)"></span>CART 优先 + 后端兜底</div>
+        <p>一条 route 的 peers 可多来源带 <b>priority</b>：CART 作 priority-1 优先、后端桶作 priority-0 兜底——<b>CART 挂了 openresty 直连后端</b>，不丢流量。</p>
+      </div>
+      <div class="card">
+        <div class="ct"><span class="dot" style="background:var(--accent)"></span>免重启热更</div>
+        <p>agent 每周期重读 config，变了重建 sinks；<b>加 / 删模型只改配置</b>（config 也走 ConfigMap 挂载）。读失败保留上次好配置。</p>
+      </div>
+      <div class="card">
+        <div class="ct"><span class="dot" style="background:var(--side)"></span>一个二进制，两个角色</div>
+        <p>agent 做发现；同一个二进制 <span class="mono">--reload-mode</span> 当 sidecar，靠 <span class="mono">shareProcessNamespace</span> 给同 pod 主进程发 SIGHUP。CART / openresty 零改。</p>
+      </div>
+    </div>
+    <p class="note">数据平面里 openresty 的 peers 也可以直连后端（不经 CART）——是否插 CART、CART 优先还是纯 CART，全由 agent 配置的 <code>sources</code> 决定，代码不变。</p>
+  </section>
+
+  <footer>
+    <p>repo <span class="mono">git@gitlab.4pd.io:inference-production-stack/autoconfig</span> · 镜像 <span class="mono">harbor.4pd.io/hardcore-tech/autoconfig:0.1.0</span> · 已在 k8s-cpu-20 + 真 CART v0.6.0 端到端验证</p>
+  </footer>
+</div>
