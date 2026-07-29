@@ -20,11 +20,10 @@ spec:
         - name: controller
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not .Values.leaderElection }}
           args:
-            - --controller
-            {{- if not .Values.leaderElection }}
             - --leader-elect=false
-            {{- end }}
+          {{- end }}
           env:
             - name: PS_NAMESPACE
               valueFrom:
