@@ -1,0 +1,25 @@
+{{- if .Values.ha.enabled }}
+# ha-gate 需要管自己那把 Lease(master-standby 选举)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "openresty.fullname" . }}-ha
+  labels: {{- include "openresty.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openresty.fullname" . }}-ha
+  labels: {{- include "openresty.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openresty.fullname" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openresty.fullname" . }}-ha
+{{- end }}

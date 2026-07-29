@@ -3,7 +3,22 @@ image:
   tag: ""              # 缺省用 Chart.appVersion(v0.6.0)
   pullPolicy: IfNotPresent
 
-replicas: 1
+replicas: 2                # master-standby:2 副本,只有 leader 收流量(单 active 保缓存 + 计数正确)
+
+# master-standby(主备):ha-gate sidecar 选举,只有 leader 通过 readiness → 只有它进 Service。
+# CART 有本地 radix 缓存,active-active 会分裂缓存 → 命中率下降;单 active 保持一份热缓存。
+ha:
+  enabled: true
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.5
+  port: 8081
+  appTcp: "127.0.0.1:8071"
+
+livenessProbe:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
 
 # CART 配置 ConfigMap(config.yaml):**chart 建初值**(server 块 + 初始 workers),autoconfig 更新
 # (等价手动改 CM;Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 写的 config.yaml)。没 autoconfig 时手动编辑。
@@ -22,7 +37,7 @@ ulimitNofile: 65535
 
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.4
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.5
   process: "cache-aware-router"
 
 service:

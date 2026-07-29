@@ -3,7 +3,21 @@ image:
   tag: ""              # 缺省用 Chart.appVersion(0.1.0)
   pullPolicy: IfNotPresent
 
-replicas: 1
+replicas: 1                # 单 active:monitor 的采集/告警是自主循环,readiness 门控挡不住它 →
+                           # 2 副本会双告警/双动作。真热备需把「进程」按 leader 门控(monitor 侧改造),故先单副本。
+
+# ha 默认关(见上):monitor 不适合 readiness 门控式主备。留字段便于将来接「leader 门控进程」。
+ha:
+  enabled: false
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.5
+  port: 8081
+  appTcp: "127.0.0.1:8080"
+
+livenessProbe:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: false           # 单副本无 PDB 意义
 
 # monitor conf.d ConfigMap:**chart 建初值**(base 阈值 + 可选初始 services),autoconfig 更新
 # (每模型一个 <model>.monitor.conf key;Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 加的 key)。

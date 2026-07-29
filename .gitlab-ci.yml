@@ -14,6 +14,7 @@ stages: [build]
 variables:
   IMAGE: harbor.4pd.io/hardcore-tech/autoconfig                 # controller
   RELOAD_IMAGE: harbor.4pd.io/hardcore-tech/autoconfig-reload   # reload sidecar(独立小镜像)
+  HAGATE_IMAGE: harbor.4pd.io/hardcore-tech/autoconfig-hagate   # master-standby leader 选举门控 sidecar
 
 build:image:
   stage: build
@@ -34,3 +35,13 @@ build:reload:
     - docker build -f Dockerfile.reload -t "$RELOAD_IMAGE:$CI_COMMIT_TAG" -t "$RELOAD_IMAGE:latest" .
     - docker push "$RELOAD_IMAGE:$CI_COMMIT_TAG"
     - docker push "$RELOAD_IMAGE:latest"
+
+build:hagate:
+  stage: build
+  tags: [public-buildx]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - docker build -f Dockerfile.hagate -t "$HAGATE_IMAGE:$CI_COMMIT_TAG" -t "$HAGATE_IMAGE:latest" .
+    - docker push "$HAGATE_IMAGE:$CI_COMMIT_TAG"
+    - docker push "$HAGATE_IMAGE:latest"

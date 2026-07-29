@@ -14,6 +14,9 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- if .Values.ha.enabled }}
+      serviceAccountName: {{ include "openresty.fullname" . }}   # ha-gate 用它管 Lease
+      {{- end }}
       {{- if .Values.reload.enabled }}
       shareProcessNamespace: true   # reload sidecar 靠此给 nginx master 发 SIGHUP
       {{- end }}
@@ -28,6 +31,14 @@ spec:
           volumeMounts:
             - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:                    # master 进程存活(不看端口——空路由时无 listener 属正常)
+            exec:
+              command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
         {{- if .Values.reload.enabled }}
         - name: reload
@@ -37,16 +48,42 @@ spec:
             - name: routes
               mountPath: /watch
         {{- end }}
+        {{- if .Values.ha.enabled }}
+        - name: hagate                       # master-standby:只有 leader /healthz=200 → 只有它进 Service
+          image: {{ .Values.ha.image }}
+          args: ["--lease", "{{ include "openresty.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}]
+          env:
+            - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+          readinessProbe:                    # 门控 pod-readiness = 该 pod 是否 leader(且 app 端口可连)
+            httpGet: { path: /healthz, port: {{ .Values.ha.port }} }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+        {{- end }}
       volumes:
         - name: routes
           configMap:
             name: {{ .Values.configMapName }}
+      {{- if or .Values.affinity .Values.ha.enabled }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:                     # 主备尽量分散到不同节点(软约束,单节点也能起)
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "openresty.selectorLabels" . | nindent 20 }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity: {{- toYaml . | nindent 8 }}
       {{- end }}

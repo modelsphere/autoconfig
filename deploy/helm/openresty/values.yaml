@@ -3,7 +3,22 @@ image:
   tag: ""              # 缺省用 Chart.appVersion(0.2.0-routes,基座 baked 版)
   pullPolicy: IfNotPresent
 
-replicas: 1
+replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)
+
+# master-standby(主备):ha-gate sidecar 选举,只有持 Lease 的 leader 通过 readiness → 只有它进 Service。
+# openresty 的路由态(active_conns/adaptive-cc/health-timer)是 pod 内共享内存,不能 active-active。
+ha:
+  enabled: true
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.5
+  port: 8081
+  appTcp: "127.0.0.1:18080"    # readiness 还要求本端口可连(有路由 listener 才算就绪)
+
+livenessProbe:
+  enabled: true                # 探 nginx master 进程存活
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1              # 驱逐/滚动时至少留 1 个(保住备)
 
 # 路由 ConfigMap(挂到 conf.d/routes/):**chart 创建初值**,autoconfig 更新(等价手动改 CM;
 # Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 加的 key)。没 autoconfig 时手动编辑此 CM 即可。
@@ -13,7 +28,7 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.4
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.5
   process: "nginx: master"
 
 service:

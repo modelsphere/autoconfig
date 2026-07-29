@@ -14,6 +14,9 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- if .Values.ha.enabled }}
+      serviceAccountName: {{ include "monitor.fullname" . }}   # ha-gate 用它管 Lease
+      {{- end }}
       containers:
         - name: monitor
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -26,17 +29,50 @@ spec:
           volumeMounts:
             - name: mconf                 # base + autoconfig services 同一 ConfigMap;monitor 60s 自热加载(无 sidecar)
               mountPath: /etc/monitor/conf.d
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:                  # dashboard 端口存活
+            tcpSocket: { port: {{ .Values.service.port }} }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 3
+          {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.ha.enabled }}
+        - name: hagate                    # master-standby:只有 leader 采集/告警(避免双 active 双告警)
+          image: {{ .Values.ha.image }}
+          args: ["--lease", "{{ include "monitor.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}]
+          env:
+            - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+          readinessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.ha.port }} }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+        {{- end }}
       volumes:
         - name: mconf
           configMap:
             name: {{ .Values.configMapName }}
+      {{- if or .Values.affinity .Values.ha.enabled }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:                  # 主备尽量分散到不同节点(软约束)
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "monitor.selectorLabels" . | nindent 20 }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity: {{- toYaml . | nindent 8 }}
       {{- end }}

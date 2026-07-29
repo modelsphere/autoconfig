@@ -1,0 +1,12 @@
+# autoconfig-hagate 镜像 —— master-standby 的 leader 选举门控 sidecar(cmd/hagate)。
+# openresty/cart/monitor pod 里当 sidecar:只有持 Lease 的 leader 让 /healthz=200,
+# readinessProbe 打它 → 只有 leader 进 Service endpoints(主备)。多阶段 + vendor 离线编译。
+#   docker build -f Dockerfile.hagate -t harbor.4pd.io/hardcore-tech/autoconfig-hagate:<tag> .
+FROM harbor.4pd.io/library/golang:1.23.3-alpine3.20 AS build
+WORKDIR /src
+COPY . .
+RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o /out/hagate ./cmd/hagate
+
+FROM harbor.4pd.io/hardcore-tech/python:3.12-alpine
+COPY --from=build /out/hagate /usr/local/bin/hagate
+ENTRYPOINT ["/usr/local/bin/hagate"]
