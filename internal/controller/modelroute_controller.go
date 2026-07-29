@@ -106,7 +106,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			base = cm.Data[ref.Key]
 		}
 		cartYAML := sink.RenderCart(base, backends, c.MaxLoad)
-		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}, true); err != nil {
+		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("write cart configmap: %w", err)
 		}
 		cartPeers, err = discovery.Discover(ctx, r.Clientset, config.Target{
@@ -135,7 +135,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("render route: %w", err)
 	}
 	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Openresty.OutputConfigMap,
-		map[string]string{openrestyKey(rb.Spec.Openresty.Route): conf}, false); err != nil {
+		map[string]string{openrestyKey(rb.Spec.Openresty.Route): conf}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("write openresty configmap: %w", err)
 	}
 
@@ -160,7 +160,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, nginxName, backends, nginxPeers, routerPeers)
 		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
-			map[string]string{monitorKey(rb.Name): monConf}, false); err != nil {
+			map[string]string{monitorKey(rb.Name): monConf}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("write monitor configmap: %w", err)
 		}
 	}
@@ -177,8 +177,9 @@ func openrestyKey(route string) string { return "session_route_" + route + ".con
 func monitorKey(name string) string { return name + ".monitor.conf" }
 
 // writeConfigMap 把 data 的 key merge 进目标 ConfigMap(其余 key 保留),不存在则建。
-// exclusive=true(cart 专属)时设 controllerReference → 删 RB 级联 GC;共享的 openresty 不设(靠 finalizer 摘 key)。
-func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1.ModelRoute, ref string, data map[string]string, exclusive bool) error {
+// 三个目标 ConfigMap(cart/openresty/monitor)的生命周期都归 helm chart / 手工所有,autoconfig 只更新内容、
+// 不设 ownerRef(避免抢占 chart-created ConfigMap + 每 resync 误标脏触发多余 reload);删 RB 时靠 finalizer 摘 key。
+func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1.ModelRoute, ref string, data map[string]string) error {
 	ns, name := splitNSName(ref, rb.Namespace)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cm corev1.ConfigMap
@@ -187,11 +188,6 @@ func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1
 			cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Data: map[string]string{}}
 			for k, v := range data {
 				cm.Data[k] = v
-			}
-			if exclusive && ns == rb.Namespace {
-				if err := controllerutil.SetControllerReference(rb, &cm, r.Scheme); err != nil {
-					return err
-				}
 			}
 			return r.Create(ctx, &cm)
 		}
@@ -208,11 +204,6 @@ func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1
 				changed = true
 			}
 		}
-		if exclusive && ns == rb.Namespace {
-			if err := controllerutil.SetControllerReference(rb, &cm, r.Scheme); err == nil {
-				changed = true
-			}
-		}
 		if !changed {
 			return nil // 无变化不写,避免多余 reload
 		}
@@ -220,9 +211,14 @@ func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1
 	})
 }
 
-// cleanupSharedKeys 删 RB 时,从共享 ConfigMap(openresty + 可选 monitor)里摘掉自己那个 key。
-// cart 的 ConfigMap 是专属 + ownerRef,k8s 自动级联 GC,无需在此处理。
+// cleanupSharedKeys 删 RB 时,从各共享 ConfigMap(cart / openresty / 可选 monitor)里摘掉自己那个 key。
+// ConfigMap 本体归 chart / 手工所有,不由 autoconfig 删除。
 func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routingv1.ModelRoute) error {
+	if c := rb.Spec.Cart; c != nil {
+		if err := r.removeConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace); err != nil {
+			return err
+		}
+	}
 	if err := r.removeConfigMapKey(ctx, rb.Spec.Openresty.OutputConfigMap, openrestyKey(rb.Spec.Openresty.Route), rb.Namespace); err != nil {
 		return err
 	}
@@ -302,10 +298,9 @@ func splitNSName(ref, defaultNS string) (ns, name string) {
 	return defaultNS, ref
 }
 
-// SetupWithManager 注册:watch ModelRoute + 自己拥有的 ConfigMap(cart-config)。
+// SetupWithManager 注册:watch ModelRoute(ConfigMap 不再由 autoconfig 拥有,靠 10s resync 兜底重算)。
 func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&routingv1.ModelRoute{}).
-		Owns(&corev1.ConfigMap{}).
 		Complete(r)
 }

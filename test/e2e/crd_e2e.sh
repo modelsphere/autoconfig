@@ -4,12 +4,12 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.3 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.4 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.3}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.4}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -149,13 +149,13 @@ waiteq 3 "status.backends(scale后)" rb_backends
 for i in $(seq 1 20); do n=$(kubectl -n "$NS" get cm cart-config -o jsonpath='{.data.config\.yaml}' | grep -c 'url:'); [ "$n" = 3 ] && break; sleep 3; done
 [ "$n" = 3 ] && ok "cart workers 跟随到 3" || bad "cart workers 未跟随($n)"
 
-# ---------- 5) 删除清理:finalizer 摘 openresty key + ownerRef GC cart-config ----------
+# ---------- 5) 删除清理:finalizer 从各共享 ConfigMap 摘 key(CM 本体归 chart/手工,不删)----------
 say "删除 ModelRoute,验证清理"
 kubectl -n "$NS" delete mr glm --timeout=60s
 for i in $(seq 1 20); do kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_glm\.conf}' 2>/dev/null | grep -q . || break; sleep 3; done
 kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_glm\.conf}' 2>/dev/null | grep -q . && bad "openresty key 未被 finalizer 摘除" || ok "openresty key 已摘除(finalizer)"
-for i in $(seq 1 20); do kubectl -n "$NS" get cm cart-config >/dev/null 2>&1 || break; sleep 3; done
-kubectl -n "$NS" get cm cart-config >/dev/null 2>&1 && bad "cart-config 未被 GC" || ok "cart-config 已 GC(ownerRef)"
+for i in $(seq 1 20); do kubectl -n "$NS" get cm cart-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -q . || break; sleep 3; done
+kubectl -n "$NS" get cm cart-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -q . && bad "cart-config config.yaml 未被摘除" || ok "cart-config config.yaml 已摘除(finalizer,CM 本体保留)"
 
 say "结果"
 [ "$FAIL" = 0 ] && echo "ALL PASS ✅" || echo "SOME FAILED ❌"

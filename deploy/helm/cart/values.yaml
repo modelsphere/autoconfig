@@ -22,7 +22,7 @@ ulimitNofile: 65535
 
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.3
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.4
   process: "cache-aware-router"
 
 service:
