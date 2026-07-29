@@ -83,6 +83,12 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
+// String returns a deterministic serialization (for hot-reload change detection).
+func (c *Config) String() string {
+	b, _ := yaml.Marshal(c)
+	return string(b)
+}
+
 // TargetByName returns the target with the given name.
 func (c *Config) TargetByName(name string) *Target {
 	for i := range c.Targets {

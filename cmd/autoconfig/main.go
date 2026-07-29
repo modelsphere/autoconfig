@@ -16,7 +16,6 @@ import (
 	"k8s.io/client-go/rest"
 
 	"autoconfig/internal/agent"
-	"autoconfig/internal/config"
 	"autoconfig/internal/reload"
 )
 
@@ -37,10 +36,6 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatalf("in-cluster config: %v", err)
@@ -52,7 +47,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := agent.Run(ctx, cs, cfg); err != nil && err != context.Canceled {
+	if err := agent.Run(ctx, cs, *cfgPath); err != nil && err != context.Canceled {
 		log.Fatalf("agent: %v", err)
 	}
 }
