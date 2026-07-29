@@ -2,12 +2,12 @@
 # 真实组件端到端:autoconfig controller(真 CRD)驱动 **真 openresty + 真 CART + 真 monitor**。
 # 验证不止「写对 ConfigMap」,而是真 router 挂载 + reload sidecar SIGHUP + 真消费。
 # 在能 kubectl 的机器上跑(如 k8s-cpu-20)。依赖同目录:modelroutes.yaml(CRD)、controller.yaml。
-#   IMG_TAG=0.3.2 bash real_e2e.sh [--keep]
+#   IMG_TAG=0.3.3 bash real_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-real}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.2}
+TAG=${IMG_TAG:-0.3.3}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
 OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}

@@ -124,10 +124,38 @@ spec:
                     description: Model:monitor service 行的 model 字段(served-model-name);省略用
                       metadata.name。
                     type: string
+                  nginx:
+                    description: |-
+                      Nginx:可选;openresty 入口发现(service/selector 二选一 + port)。autoconfig 探测其 pod,
+                      生成 monitor 的 nginx: 行(name 用 Service,跨模型同 Service 自动 dedup)。
+                    properties:
+                      includeNotReady:
+                        description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
+                        type: boolean
+                      port:
+                        description: Port:服务端口(配 pod IP)。
+                        type: integer
+                      selector:
+                        description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
+                        type: string
+                      service:
+                        description: Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS
+                          Service 配成只选 leader)。
+                        type: string
+                    required:
+                    - port
+                    type: object
+                    x-kubernetes-validations:
+                    - message: 'discovery: service 和 selector 必须恰好给一个'
+                      rule: has(self.service) != has(self.selector)
                   outputConfigMap:
                     description: OutputConfigMap:autoconfig 写 monitor 配置的 ConfigMap("ns/name",多模型共享,每模型一个
                       key)。
                     type: string
+                  router:
+                    description: 'Router:可选,默认 true(当配了 spec.cart);把探测到的 CART pod
+                      写进 monitor 的 router: 表(.../workers)。设 false 关闭。'
+                    type: boolean
                 required:
                 - outputConfigMap
                 type: object

@@ -74,6 +74,11 @@ type MonitorSpec struct {
 	Model string `json:"model,omitempty"`
 	// GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300 / H200)。
 	GPUType string `json:"gpuType,omitempty"`
+	// Nginx:可选;openresty 入口发现(service/selector 二选一 + port)。autoconfig 探测其 pod,
+	// 生成 monitor 的 nginx: 行(name 用 Service,跨模型同 Service 自动 dedup)。
+	Nginx *Discovery `json:"nginx,omitempty"`
+	// Router:可选,默认 true(当配了 spec.cart);把探测到的 CART pod 写进 monitor 的 router: 表(.../workers)。设 false 关闭。
+	Router *bool `json:"router,omitempty"`
 }
 
 // ModelRouteSpec 是一个模型的完整路由绑定。

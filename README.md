@@ -9,7 +9,7 @@ autoconfig 让路由器配置跟着实时收敛。
 ```
 ┌──── autoconfig controller(Deployment,watch ModelRoute + 发现后端,RBAC 一处,leader 选举 HA)────┐
 │ 每个 ModelRoute(一个模型一条):按 discovery 发现后端(EndpointSlice/label,只取 Ready)          │
-│ 渲染:cart → config.yaml 的 workers;openresty → peers(CART 优先+后端兜底);monitor → services(可选)│
+│ 渲染:cart → workers;openresty → peers(CART 优先+后端兜底);monitor → service+nginx+router 行(可选)│
 │ diff(变了才写)+ fail-safe(发现为空→保留上次)→ 写进各输出 ConfigMap + 回写 status              │
 └──────────────────┬───────────────────────────────────┬────────────────────────────────────────┘
           ConfigMap│(整卷挂,kubelet ~1min)      ConfigMap│
@@ -31,8 +31,11 @@ autoconfig 让路由器配置跟着实时收敛。
 
 > 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「用法」+ [`docs/crd-design.md`](docs/crd-design.md)。
 > (早期的 ConfigMap 驱动「agent 模式」已移除。)
-> **monitor** 也可由 autoconfig 配置(`spec.monitor`,可选):把发现的后端写进 monitor.conf 的 `service:` 行(每后端一行,
-> 格式 `service: <name> | <url> | <model> | <gpu_type>`),写进共享 monitor ConfigMap(每模型一个 key)。
+> **monitor** 也可由 autoconfig 配置(`spec.monitor`,可选),自动探测 + 生成三类行,写进共享 monitor ConfigMap(每模型一个 key):
+> - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端(每实例一行);
+> - `nginx: <svc>-<i> | http://ip:port` —— 探测 openresty 入口 pod(`spec.monitor.nginx` 的 service/selector;name=Service,跨模型自动 dedup);
+> - `router: <name>-router-<i> | http://ip:port/workers` —— 复用已探测的 CART pod(有 `spec.cart` 时默认开,`spec.monitor.router: false` 关)。
+>
 > **monitor 自身每 60s 热加载 monitor.conf、无需 reload sidecar**(区别于 openresty/CART);消费方把该 ConfigMap 挂进 monitor pod 即可。
 
 ### openresty 侧:只把 `.conf` 放 ConfigMap + 一行 include 改动

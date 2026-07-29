@@ -139,9 +139,26 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("write openresty configmap: %w", err)
 	}
 
-	// 4) monitor(可选):把发现的后端渲染成 monitor.conf 的 service 行(共享 ConfigMap,每模型一个 key)
+	// 4) monitor(可选):service(后端)+ nginx(openresty 入口)+ router(CART)行(共享 ConfigMap,每模型一个 key)
 	if m := rb.Spec.Monitor; m != nil {
-		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, backends)
+		var nginxPeers, routerPeers []config.Peer
+		nginxName := ""
+		if n := m.Nginx; n != nil { // 探测 openresty 入口 pod
+			nginxPeers, err = discovery.Discover(ctx, r.Clientset, config.Target{
+				Namespace: rb.Namespace, Service: n.Service, Selector: n.Selector,
+				Port: n.Port, IncludeNotReady: n.IncludeNotReady,
+			})
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("discover openresty (nginx): %w", err)
+			}
+			if nginxName = n.Service; nginxName == "" {
+				nginxName = rb.Spec.Openresty.Route + "-nginx"
+			}
+		}
+		if rb.Spec.Cart != nil && (m.Router == nil || *m.Router) { // 复用已探测的 CART pod 作 router
+			routerPeers = cartPeers
+		}
+		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, nginxName, backends, nginxPeers, routerPeers)
 		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
 			map[string]string{monitorKey(rb.Name): monConf}, false); err != nil {
 			return ctrl.Result{}, fmt.Errorf("write monitor configmap: %w", err)

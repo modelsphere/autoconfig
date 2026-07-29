@@ -4,12 +4,12 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.2 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.3 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.2}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.3}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -69,6 +69,21 @@ kind: Service
 metadata: { name: cart-glm }
 spec: { selector: { app: cart }, ports: [{ port: 8071, targetPort: 8071 }] }
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: openresty-mock, labels: { app: openresty } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: openresty } }
+  template:
+    metadata: { labels: { app: openresty } }
+    spec: { containers: [{ name: c, image: $MOCK, command: ["sleep","infinity"], ports: [{ containerPort: 18083 }] }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: openresty-svc }
+spec: { selector: { app: openresty }, ports: [{ port: 18083, targetPort: 18083 }] }
+---
 apiVersion: v1
 kind: ConfigMap
 metadata: { name: base-cart }
@@ -86,10 +101,15 @@ spec:
     outputConfigMap: $NS/openresty-conf
     values: { ttft_limit_ms: "60000" }
     sources: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
-  monitor: { outputConfigMap: $NS/monitor-conf, model: glm, gpuType: H100 }
+  monitor:
+    outputConfigMap: $NS/monitor-conf
+    model: glm
+    gpuType: H100
+    nginx: { service: openresty-svc, port: 18083 }   # 探测 openresty 入口 → nginx: 行;router 自动用 cartPeers
 YAML
 kubectl -n "$NS" rollout status deploy/glm-backend --timeout=120s
 kubectl -n "$NS" rollout status deploy/cart-glm --timeout=120s
+kubectl -n "$NS" rollout status deploy/openresty-mock --timeout=120s
 
 # ---------- 3) 断言:status + cart workers + openresty peers ----------
 say "验证:status / cart-config / openresty-conf"
@@ -118,6 +138,8 @@ MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm\.monitor\.con
 echo "--- monitor glm.monitor.conf ---"; echo "$MON"
 [ "$(echo "$MON" | grep -c '^service: glm-')" = 2 ] && ok "monitor service 行 = 2(每后端一行)" || bad "monitor service 行 != 2"
 echo "$MON" | grep -q '| glm | H100' && ok "monitor model/gpu_type 正确" || bad "monitor model/gpu_type 不对"
+echo "$MON" | grep -qE '^nginx: openresty-svc-0 \| http://.+:18083$' && ok "monitor nginx 行(openresty 入口)" || bad "无 monitor nginx 行"
+echo "$MON" | grep -qE '^router: glm-router-0 \| http://.+:8071/workers$' && ok "monitor router 行(CART /workers)" || bad "无 monitor router 行"
 
 # ---------- 4) scale 跟随 ----------
 say "scale 后端 2→3,验证跟随"

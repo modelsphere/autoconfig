@@ -26,6 +26,10 @@ spec:
     outputConfigMap: monitor/monitor-conf
     model: glm-5.1-fp8
     gpuType: H100
+    nginx:                           # 可选;探测 openresty 入口 → monitor 的 nginx: 行(name=Service,跨模型 dedup)
+      service: openresty             # openresty 的 k8s Service(同 ns;也可 selector)
+      port: 18083                    # 探活端口(任一 listen 均可,共享 /_active_conns)
+    # router 默认 true(有 cart 时):把探测到的 CART pod 写进 monitor 的 router: 表(.../workers)。设 false 关闭。
 ---
 # 无 CART 的例子:openresty 直连后端(省略 cart 段,sources 只有 backend)
 apiVersion: routing.gpucluster.io/v1alpha1
