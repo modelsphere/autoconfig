@@ -104,6 +104,13 @@
   .between{display:flex;flex-direction:column;align-items:center;gap:4px;color:var(--data);flex:0 0 auto}
   .between .l{font:600 9.5px ui-monospace,monospace;color:var(--muted);white-space:nowrap;text-align:center;line-height:1.3}
 
+  /* three consumer columns (openresty / CART / monitor) */
+  .cols3{display:flex;gap:16px;align-items:flex-start;justify-content:center;width:100%;flex-wrap:wrap;margin-top:2px}
+  .col{display:flex;flex-direction:column;align-items:center;flex:1 1 240px;max-width:300px}
+  .col .pod{width:100%;min-width:0;flex:none}
+  .ctrs.one{grid-template-columns:1fr}
+  .mnote{margin-top:10px;font-size:11px;color:var(--muted);text-align:center;line-height:1.4}
+
   footer{margin-top:22px;font-size:12px;color:var(--faint);text-align:center}
   footer .mono{color:var(--muted)}
 
@@ -116,12 +123,12 @@
 
 <div class="wrap">
   <p class="eyebrow">架构设计 · 讨论稿</p>
-  <h1>autoconfig 怎么和 openresty / CART 协作</h1>
-  <p class="lede">autoconfig 发现后端、给 openresty 和 CART 各写一份配置；每个 pod 里的 <b>reload sidecar</b> 收到变化就 SIGHUP 主容器优雅重载。<b>实线 = 配置流，虚线 = 请求流。</b></p>
+  <h1>autoconfig 怎么和 openresty / CART / monitor 协作</h1>
+  <p class="lede">autoconfig 发现后端，自动给 <b>openresty、CART、monitor</b> 各写一份配置。openresty / CART 由 <b>reload sidecar</b> 收 SIGHUP 热重载；<b>monitor 每 60s 自动热加载 <span class="mono">monitor.conf</span>，无需 sidecar</b>。<b>实线 = 配置流，虚线 = 请求 / 健康流。</b></p>
 
   <div class="legend">
-    <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--accent)" stroke-width="2.4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--accent)"/></svg>配置流（autoconfig 写 config → sidecar 重载）</span>
-    <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--data)" stroke-width="2.4" stroke-dasharray="6 4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--data)"/></svg>请求流（数据平面）</span>
+    <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--accent)" stroke-width="2.4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--accent)"/></svg>配置流（autoconfig 写 config → 消费方重载）</span>
+    <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--data)" stroke-width="2.4" stroke-dasharray="6 4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--data)"/></svg>请求 / 健康流（数据平面）</span>
   </div>
 
   <div class="scene">
@@ -130,45 +137,54 @@
     <div class="box agent">
       <span class="kind">deployment</span>
       <div class="nm">autoconfig agent</div>
-      <div class="desc">watch 后端 pod（EndpointSlice / label）→ 渲染 → 写 ConfigMap</div>
+      <div class="desc">watch 后端 pod（EndpointSlice / label）→ 渲染 → 写各消费方的 config</div>
     </div>
 
-    <!-- two config arrows fanning to the two pods -->
-    <div class="fan">
-      <div class="down"><span class="l">写 openresty-conf</span>
-        <svg width="12" height="34" viewBox="0 0 12 34"><line x1="6" y1="0" x2="6" y2="25" stroke="currentColor" stroke-width="2"/><path d="M1,25 L6,33 L11,25 Z" fill="currentColor"/></svg></div>
-      <div class="down"><span class="l">写 cart-config</span>
-        <svg width="12" height="34" viewBox="0 0 12 34"><line x1="6" y1="0" x2="6" y2="25" stroke="currentColor" stroke-width="2"/><path d="M1,25 L6,33 L11,25 Z" fill="currentColor"/></svg></div>
-    </div>
+    <!-- three consumers: openresty / CART / monitor -->
+    <div class="cols3">
 
-    <!-- pods with explicit sidecars -->
-    <div class="pods">
-      <div class="pod">
-        <div class="pod-hd"><span class="kind">pod</span><span class="pnm">openresty</span><span class="spn">shareProcessNS</span></div>
-        <div class="ctrs">
-          <div class="ctr app"><span class="clab">container</span><div class="cnm">openresty</div></div>
-          <div class="hup"><span class="hl">SIGHUP</span><svg width="30" height="12" viewBox="0 0 30 12"><line x1="30" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
-          <div class="ctr rl"><span class="clab">sidecar</span><div class="cnm">reload</div></div>
+      <div class="col">
+        <div class="down"><span class="l">写 openresty-conf</span>
+          <svg width="12" height="30" viewBox="0 0 12 30"><line x1="6" y1="0" x2="6" y2="21" stroke="currentColor" stroke-width="2"/><path d="M1,21 L6,29 L11,21 Z" fill="currentColor"/></svg></div>
+        <div class="pod">
+          <div class="pod-hd"><span class="kind">pod</span><span class="pnm">openresty</span><span class="spn">shareProcessNS</span></div>
+          <div class="ctrs">
+            <div class="ctr app"><span class="clab">container</span><div class="cnm">openresty</div></div>
+            <div class="hup"><span class="hl">SIGHUP</span><svg width="28" height="12" viewBox="0 0 28 12"><line x1="28" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
+            <div class="ctr rl"><span class="clab">sidecar</span><div class="cnm">reload</div></div>
+          </div>
         </div>
       </div>
 
-      <div class="between">
-        <span class="l">数据平面<br>peers=CART 优先</span>
-        <svg width="70" height="12" viewBox="0 0 70 12"><line x1="0" y1="6" x2="58" y2="6" stroke="currentColor" stroke-width="2.4" stroke-dasharray="7 4"/><path d="M58,1 L68,6 L58,11 Z" fill="currentColor"/></svg>
-      </div>
-
-      <div class="pod">
-        <div class="pod-hd"><span class="kind">pod</span><span class="pnm">CART</span><span class="spn">shareProcessNS</span></div>
-        <div class="ctrs">
-          <div class="ctr app"><span class="clab">container</span><div class="cnm">cache-aware-router</div></div>
-          <div class="hup"><span class="hl">SIGHUP</span><svg width="30" height="12" viewBox="0 0 30 12"><line x1="30" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
-          <div class="ctr rl"><span class="clab">sidecar</span><div class="cnm">reload</div></div>
+      <div class="col">
+        <div class="down"><span class="l">写 cart-config</span>
+          <svg width="12" height="30" viewBox="0 0 12 30"><line x1="6" y1="0" x2="6" y2="21" stroke="currentColor" stroke-width="2"/><path d="M1,21 L6,29 L11,21 Z" fill="currentColor"/></svg></div>
+        <div class="pod">
+          <div class="pod-hd"><span class="kind">pod</span><span class="pnm">CART</span><span class="spn">shareProcessNS</span></div>
+          <div class="ctrs">
+            <div class="ctr app"><span class="clab">container</span><div class="cnm">cache-aware-router</div></div>
+            <div class="hup"><span class="hl">SIGHUP</span><svg width="28" height="12" viewBox="0 0 28 12"><line x1="28" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
+            <div class="ctr rl"><span class="clab">sidecar</span><div class="cnm">reload</div></div>
+          </div>
         </div>
       </div>
+
+      <div class="col">
+        <div class="down"><span class="l">写 monitor.conf</span>
+          <svg width="12" height="30" viewBox="0 0 12 30"><line x1="6" y1="0" x2="6" y2="21" stroke="currentColor" stroke-width="2"/><path d="M1,21 L6,29 L11,21 Z" fill="currentColor"/></svg></div>
+        <div class="pod">
+          <div class="pod-hd"><span class="kind">pod</span><span class="pnm">monitor</span><span class="spn">无 sidecar</span></div>
+          <div class="ctrs one">
+            <div class="ctr app"><span class="clab">container</span><div class="cnm">monitor</div></div>
+          </div>
+          <div class="mnote">monitor.conf 每 60s 自动热加载，<br>无需 SIGHUP / sidecar</div>
+        </div>
+      </div>
+
     </div>
 
-    <!-- data arrow down to backends -->
-    <div class="down data"><span class="l">CART → 后端 &nbsp;·&nbsp; autoconfig watch 发现 ↑</span>
+    <!-- data / health arrow down to backends -->
+    <div class="down data"><span class="l">数据平面 openresty → CART → 后端 &nbsp;·&nbsp; monitor 采指标 &nbsp;·&nbsp; autoconfig watch 发现 ↑</span>
       <svg width="12" height="34" viewBox="0 0 12 34"><line x1="6" y1="0" x2="6" y2="25" stroke="currentColor" stroke-width="2.4" stroke-dasharray="6 4"/><path d="M1,25 L6,33 L11,25 Z" fill="currentColor"/></svg></div>
 
     <!-- backends -->
@@ -180,5 +196,5 @@
 
   </div>
 
-  <footer><span class="mono">autoconfig</span> = 中心 agent（发现+写配置）+ 各 pod 的 reload sidecar（同一二进制 <span class="mono">--reload-mode</span>）· openresty / CART 零改</footer>
+  <footer><span class="mono">autoconfig</span> = 中心 agent（发现 + 写配置）+ 各 pod 的 reload sidecar（openresty / CART 收 SIGHUP；monitor 靠自身 60s 热加载）· 三者零改</footer>
 </div>
