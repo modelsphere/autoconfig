@@ -117,6 +117,23 @@ ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`
 openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/routes/*.conf;`(lua_package_path 不变)。
 —— autoconfig **代码零改**:baseConfigDir 只放 `.conf`、消费方把输出 ConfigMap 挂到 `conf.d/routes/` 即可。
 
+## CRD 模式(controller)—— 一个模型一个 RouterBinding
+
+除了「一个大 ConfigMap + 轮询 agent」,autoconfig 还有 **CRD controller 模式**(`autoconfig --controller`):
+输入从 ConfigMap 换成 **`RouterBinding`(routing.4pd.io/v1alpha1)**,一个模型一个对象;`kubectl apply` 当场校验、
+`kubectl get routerbinding` 直接看发现了几个后端/CART/ready。**发现(`internal/discovery`)、渲染(`internal/sink`)、
+reload sidecar 全部复用**,只是「输入」变 CR、多回写 `status`。设计见 [`docs/crd-design.md`](docs/crd-design.md)。
+
+```bash
+kubectl apply -f config/crd/routerbindings.yaml     # 装 CRD
+kubectl apply -f deploy/controller.yaml             # 起 controller(SA/RBAC/Deployment,leader 选举 HA)
+kubectl apply -f config/samples/routerbinding-glm.yaml
+kubectl get rb -A                                   # NAME/BACKENDS/CART/READY/AGE
+```
+一个 `RouterBinding` 同时驱动 **CART 的 workers**(cart-config,专属 → ownerRef 级联 GC)和 **openresty 的 peers**
+(openresty-conf,多路由共享 → finalizer 摘 key);`cart` 段可选(省略 = openresty 直连后端)。消费方 pod +
+reload sidecar 与 agent 模式**完全一样**。两模式共用一个镜像/二进制,`--controller` 开关切换。
+
 ## 构建
 
 **多阶段 build,依赖已 vendor(`vendor/` 入库),全程离线**——不联网、不预置二进制:

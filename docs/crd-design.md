@@ -100,8 +100,13 @@ Manager(leader 选举)
 - **何时不值**:模型很少、配置很稳 —— ConfigMap 已够,CRD 是过度设计。
 - **最值钱的两条是 ① apply 校验 + ② status**;若只想先要这俩,可先做,不必一步到位上全套 operator 生态。
 
-## 7. 待定(讨论点)
+## 7. 已定的决策
 
-1. **一个 CR 还是两个**:`RouterBinding` 同时含 openresty + cart,还是拆成 `RouteBinding`(openresty)+ `CartBinding`(cart)?后者职责更单一、可独立分权。
-2. **reload**:继续 sidecar,还是 controller 经 pods/exec 触发?
-3. **CART 发现归属**(与 qiliguo 对齐项):走 autoconfig 外部写 CART config(本方案),还是 CART 自身 watch EndpointSlice(他们 M1 文档)?若选后者,`RouterBinding` 的 `cart` 段可退化为「只把 CART 加进 openresty 的 sources」。
+1. **CART 发现归 autoconfig**(不改 CART):autoconfig 外部发现后端 → 写 CART 的 `config.yaml`(workers)+ SIGHUP。因此 `RouterBinding` 有完整的 `cart` 段。
+2. **单个 CR**(`RouterBinding`,一个模型一个),`cart` 段**可选**——省略 = openresty 直连后端。理由:CART 归 autoconfig 后,「模型 X 的后端桶」这**一个 `discovery` 同时喂 CART 的 workers 和 openresty 的兜底 source**,单 CR = 单一真相;现状 1 模型=1 CART=1 route。将来若出现「一个 CART 被多条路由共享 / 一条路由 fan 多个 CART / 团队分权」再拆(加法式:`sources` 支持 `cartRef` 引用独立 CartBinding)。
+3. **reload 仍走 sidecar**(同一二进制 `--reload-mode`),controller 不碰 reload。
+
+## 8. 输出 ConfigMap 的归属与清理
+
+- **cart 的 outputConfigMap**:每模型专属 → 设 **ownerReference**,删 `RouterBinding` 时 k8s 级联 GC。
+- **openresty 的 outputConfigMap**:**多条路由共享一个**(每路由一个 key)→ **不设 ownerRef**(否则删一条会连累整个)。改用 **finalizer**:删 `RouterBinding` 时只移除它那一个 key。

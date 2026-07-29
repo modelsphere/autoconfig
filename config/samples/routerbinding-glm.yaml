@@ -1,0 +1,41 @@
+# 示例:glm-5.1-fp8 —— EndpointSlice 发现后端 + CART 优先 + 后端兜底。
+apiVersion: routing.4pd.io/v1alpha1
+kind: RouterBinding
+metadata:
+  name: glm-5.1-fp8
+  namespace: glm
+spec:
+  discovery:                         # 后端桶(喂 CART workers + openresty backend 来源)
+    service: glm-leader              # 走 EndpointSlice(该 Service 只选 leader);或用 selector
+    port: 8050
+  cart:                              # 可选;省略 = openresty 直连后端
+    service: cart-glm                # CART pod 的发现(供 openresty 的 cart 来源)
+    port: 8071
+    outputConfigMap: glm/cart-config
+    baseConfigRef: { name: base-cart, key: config.base.yaml }
+    maxLoad: 20
+  openresty:
+    route: glm
+    listen: 18083
+    outputConfigMap: openresty/openresty-conf
+    values: { ttft_limit_ms: "60000" }
+    sources:                         # 有序:CART 优先 + 后端兜底
+      - { use: cart,    priority: 1, maxConcurrency: 180 }
+      - { use: backend, priority: 0 }
+---
+# 无 CART 的例子:openresty 直连后端(省略 cart 段,sources 只有 backend)
+apiVersion: routing.4pd.io/v1alpha1
+kind: RouterBinding
+metadata:
+  name: kimi-k2.6
+  namespace: kimi
+spec:
+  discovery:
+    selector: "leaderworkerset.sigs.k8s.io/name=kimi-k26,leaderworkerset.sigs.k8s.io/worker-index=0"
+    port: 8050
+  openresty:
+    route: k26
+    listen: 18082
+    outputConfigMap: openresty/openresty-conf
+    sources:
+      - { use: backend }

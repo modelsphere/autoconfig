@@ -28,7 +28,12 @@ func (c *CartSink) Render(peersByTarget map[string][]config.Peer) (Rendered, err
 		}
 		base = string(b)
 	}
-	maxLoad := c.s.MaxLoad
+	return Rendered{"config.yaml": RenderCart(base, peers, c.s.MaxLoad)}, nil
+}
+
+// RenderCart 把 base config.yaml(不含 workers)+ 发现的后端渲染成完整 config.yaml。
+// ConfigMap-agent(CartSink)与 CRD controller 共用这一个纯函数。maxLoad<=0 用默认 20。
+func RenderCart(base string, peers []config.Peer, maxLoad int) string {
 	if maxLoad == 0 {
 		maxLoad = 20
 	}
@@ -42,5 +47,5 @@ func (c *CartSink) Render(peersByTarget map[string][]config.Peer) (Rendered, err
 		}
 		fmt.Fprintf(&b, "  - url: \"http://%s:%d\"\n    max_load: %d\n", p.IP, p.Port, ml)
 	}
-	return Rendered{"config.yaml": b.String()}, nil
+	return b.String()
 }

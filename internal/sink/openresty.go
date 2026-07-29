@@ -2,6 +2,7 @@ package sink
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,12 @@ import (
 
 	"autoconfig/internal/config"
 )
+
+// defaultRouteTmpl 内置路由模板(= deploy/openresty-route.tmpl 的副本)。
+// Template 路径为空时用它 —— CRD controller 无需挂载模板文件。
+//
+//go:embed route.tmpl
+var defaultRouteTmpl string
 
 // OpenrestySink 生成 openresty 各路由的 conf。两种模式(可并用):
 //   (A) rewrite:读 BaseConfigDir 的现成 conf,按 RouteByTarget 改写 peers 块(其余透传)。
@@ -53,40 +60,56 @@ func (o *OpenrestySink) Render(peersByTarget map[string][]config.Peer) (Rendered
 		}
 	}
 
-	// (B) template 模式:每条 route 用模板生成整个 conf
-	if o.s.Template != "" {
-		tb, err := os.ReadFile(o.s.Template)
-		if err != nil {
-			return nil, fmt.Errorf("read template %s: %w", o.s.Template, err)
-		}
-		tmpl, err := template.New("route").Parse(string(tb))
-		if err != nil {
-			return nil, fmt.Errorf("parse template: %w", err)
+	// (B) template 模式:每条 route 用模板生成整个 conf(Routes 非空即启用;Template 为空用内置模板)
+	if len(o.s.Routes) > 0 {
+		tmplContent := defaultRouteTmpl
+		if o.s.Template != "" {
+			tb, err := os.ReadFile(o.s.Template)
+			if err != nil {
+				return nil, fmt.Errorf("read template %s: %w", o.s.Template, err)
+			}
+			tmplContent = string(tb)
 		}
 		for _, r := range o.s.Routes {
-			file := r.File
-			if file == "" {
+			if r.File == "" {
 				return nil, fmt.Errorf("route (target %q): file required", r.Target)
 			}
-			var buf bytes.Buffer
-			data := struct {
-				Values map[string]interface{}
-				Peers  []config.Peer
-			}{Values: r.Values, Peers: resolveRoutePeers(peersByTarget, r.Sources, r.Target)}
-			if err := tmpl.Execute(&buf, data); err != nil {
-				return nil, fmt.Errorf("render route %s: %w", file, err)
+			conf, err := RenderRoute(tmplContent, r.Values, ResolveSources(peersByTarget, r.Sources, r.Target))
+			if err != nil {
+				return nil, fmt.Errorf("render route %s: %w", r.File, err)
 			}
-			out[file] = buf.String()
+			out[r.File] = conf
 		}
 	}
 	return out, nil
 }
 
-// resolveRoutePeers builds a route's ordered peer list. If sources is set, it concatenates each
+// RenderRoute 用模板给一条 route 生成整个 conf。tmplContent 为空用内置模板。
+// ConfigMap-agent 与 CRD controller 共用。
+func RenderRoute(tmplContent string, values map[string]interface{}, peers []config.Peer) (string, error) {
+	if tmplContent == "" {
+		tmplContent = defaultRouteTmpl
+	}
+	tmpl, err := template.New("route").Parse(tmplContent)
+	if err != nil {
+		return "", fmt.Errorf("parse template: %w", err)
+	}
+	var buf bytes.Buffer
+	data := struct {
+		Values map[string]interface{}
+		Peers  []config.Peer
+	}{Values: values, Peers: peers}
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// ResolveSources builds a route's ordered peer list. If sources is set, it concatenates each
 // source's discovered peers (applying that source's priority/maxConcurrency override) in order —
 // e.g. CART(priority 1) then backends(priority 0). Otherwise it falls back to the single target.
 // Names are assigned per source ("<target>-N"), so peers stay uniquely named across sources.
-func resolveRoutePeers(peersByTarget map[string][]config.Peer, sources []config.RouteSource, singleTarget string) []config.Peer {
+func ResolveSources(peersByTarget map[string][]config.Peer, sources []config.RouteSource, singleTarget string) []config.Peer {
 	if len(sources) == 0 {
 		return nameUnnamed(peersByTarget[singleTarget], singleTarget)
 	}
