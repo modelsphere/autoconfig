@@ -27,3 +27,11 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
 
 查看状态(发现了几个后端 / CART / ready):
   kubectl get routerbindings -A     # 或 kubectl get rb -A
+
+⚠️ 卸载顺序:先删 RouterBinding,再 helm uninstall。
+  RouterBinding 带 finalizer(routing.4pd.io/cleanup),要 controller 在跑才能摘。
+  若先 helm uninstall(删了 controller)再删 RouterBinding / namespace,RB 会卡住、
+  拖住 namespace/CRD 删除。正确顺序:
+    kubectl delete rb --all -A          # 1) 先删所有 RouterBinding(controller 摘 finalizer)
+    helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}   # 2) 再卸载
+  已卡住的补救:kubectl patch rb <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'

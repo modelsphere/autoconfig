@@ -131,7 +131,15 @@ kubectl apply -f config/samples/routerbinding-glm.yaml
 kubectl get rb -A                                   # NAME/BACKENDS/CART/READY/AGE
 ```
 常用 values:`image.tag`、`replicas`(>1 leader 选举 HA)、`crd.install`(默认 true;CRD 带
-`helm.sh/resource-policy: keep`,卸载不删,保护已有 RouterBinding)、`leaderElection`。
+`helm.sh/resource-policy: keep`,卸载不删,保护已有 RouterBinding)、`leaderElection`、
+`routerBindings`(见下,直接在 chart 里声明路由)。
+
+**⚠️ 卸载顺序:先删 RouterBinding,再 `helm uninstall`。** RouterBinding 带 finalizer
+(`routing.4pd.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)再删 RB /
+namespace,RB 会卡住、拖住 namespace/CRD 删除。正确:`kubectl delete rb --all -A` → `helm uninstall`。
+(chart 里用 `routerBindings` 声明的 RB 由 helm 托管,`helm uninstall` 前会随 release 删除,controller
+还在 → 自动摘 finalizer,无此问题。)已卡住的补救:
+`kubectl patch rb <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'`。
 
 裸 manifest(不想用 helm 时):
 ```bash
