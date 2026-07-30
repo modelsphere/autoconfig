@@ -77,13 +77,8 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// 1) 发现后端桶(喂 CART workers + openresty backend 来源)
-	backends, err := discovery.Discover(ctx, r.Clientset, config.Target{
-		Namespace:       rb.Namespace,
-		Service:         rb.Spec.Discovery.Service,
-		Selector:        rb.Spec.Discovery.Selector,
-		Port:            rb.Spec.Discovery.Port,
-		IncludeNotReady: rb.Spec.Discovery.IncludeNotReady,
-	})
+	backends, err := discovery.Discover(ctx, r.Clientset, discoveryTarget(
+		rb.Spec.Discovery.Service, rb.Spec.Discovery.Selector, rb.Spec.Discovery.Port, rb.Spec.Discovery.IncludeNotReady, rb.Namespace))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("discover backends: %w", err)
 	}
@@ -109,9 +104,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("write cart configmap: %w", err)
 		}
-		cartPeers, err = discovery.Discover(ctx, r.Clientset, config.Target{
-			Namespace: rb.Namespace, Service: c.Service, Selector: c.Selector, Port: c.Port,
-		})
+		cartPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(c.Service, c.Selector, c.Port, false, rb.Namespace))
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("discover cart pods: %w", err)
 		}
@@ -144,10 +137,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		var nginxPeers, routerPeers []config.Peer
 		nginxName := ""
 		if n := m.Nginx; n != nil { // 探测 openresty 入口 pod
-			nginxPeers, err = discovery.Discover(ctx, r.Clientset, config.Target{
-				Namespace: rb.Namespace, Service: n.Service, Selector: n.Selector,
-				Port: n.Port, IncludeNotReady: n.IncludeNotReady,
-			})
+			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(n.Service, n.Selector, n.Port, n.IncludeNotReady, rb.Namespace))
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("discover openresty (nginx): %w", err)
 			}
@@ -296,6 +286,16 @@ func splitNSName(ref, defaultNS string) (ns, name string) {
 		return ref[:i], ref[i+1:]
 	}
 	return defaultNS, ref
+}
+
+// discoveryTarget 构造发现 Target。service 支持 "ns/name"(跨 ns 发现,让 ModelRoute 可放别的 ns),
+// 裸名默认用 ModelRoute 的 ns。selector 路径不支持 ns/name(用默认 ns)。
+func discoveryTarget(service, selector string, port int, includeNotReady bool, defaultNS string) config.Target {
+	ns := defaultNS
+	if service != "" {
+		ns, service = splitNSName(service, defaultNS)
+	}
+	return config.Target{Namespace: ns, Service: service, Selector: selector, Port: port, IncludeNotReady: includeNotReady}
 }
 
 // SetupWithManager 注册:watch ModelRoute(ConfigMap 不再由 autoconfig 拥有,靠 10s resync 兜底重算)。

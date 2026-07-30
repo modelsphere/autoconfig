@@ -81,7 +81,7 @@ spec:
                     type: string
                   service:
                     description: CART pod 的发现(供 openresty 的 cart source);service/selector
-                      二选一。
+                      二选一。service 支持 "ns/name" 跨 ns。
                     type: string
                 required:
                 - outputConfigMap
@@ -104,8 +104,9 @@ spec:
                     description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
                     type: string
                   service:
-                    description: Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS
-                      Service 配成只选 leader)。
+                    description: |-
+                      Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS Service 配成只选 leader)。
+                      支持 "ns/name" 跨 ns 发现(裸名默认与 ModelRoute 同 ns),让 ModelRoute 可放中心 ns。
                     type: string
                 type: object
                 x-kubernetes-validations:
@@ -139,8 +140,9 @@ spec:
                         description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
                         type: string
                       service:
-                        description: Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS
-                          Service 配成只选 leader)。
+                        description: |-
+                          Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS Service 配成只选 leader)。
+                          支持 "ns/name" 跨 ns 发现(裸名默认与 ModelRoute 同 ns),让 ModelRoute 可放中心 ns。
                         type: string
                     type: object
                     x-kubernetes-validations:

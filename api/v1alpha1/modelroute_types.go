@@ -8,6 +8,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="has(self.service) != has(self.selector)",message="discovery: service 和 selector 必须恰好给一个"
 type Discovery struct {
 	// Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS Service 配成只选 leader)。
+	// 支持 "ns/name" 跨 ns 发现(裸名默认与 ModelRoute 同 ns),让 ModelRoute 可放中心 ns。
 	Service string `json:"service,omitempty"`
 	// Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
 	Selector string `json:"selector,omitempty"`
@@ -28,7 +29,7 @@ type ConfigMapKeyRef struct {
 // 省略整个 cart 段 = openresty 直连后端(无 CART)。
 // +kubebuilder:validation:XValidation:rule="has(self.service) != has(self.selector)",message="cart: service 和 selector 必须恰好给一个"
 type CartSpec struct {
-	// CART pod 的发现(供 openresty 的 cart source);service/selector 二选一。
+	// CART pod 的发现(供 openresty 的 cart source);service/selector 二选一。service 支持 "ns/name" 跨 ns。
 	Service  string `json:"service,omitempty"`
 	Selector string `json:"selector,omitempty"`
 	// Port:CART 端口。省略则从 EndpointSlice/containerPort 自动推导(单端口)。
