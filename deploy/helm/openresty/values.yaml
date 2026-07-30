@@ -1,6 +1,6 @@
 image:
   repository: harbor.4pd.io/hardcore-tech/llm-openresty
-  tag: "0.2.1-routes"  # 基座 baked 版 + 固定 admin/health 口 8090(/healthz)
+  tag: "0.3.2-dispatch"     # 路径路由 D2 就绪:8080 dispatch + per-model unix socket
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)
