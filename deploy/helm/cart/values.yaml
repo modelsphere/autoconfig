@@ -9,12 +9,12 @@ replicas: 2                # master-standby:2 副本,只有 leader 收流量(单
 # CART 有本地 radix 缓存,active-active 会分裂缓存 → 命中率下降;单 active 保持一份热缓存。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.12
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.13
   port: 8081
   appTcp: "127.0.0.1:8071"
 
-livenessProbe:
-  enabled: true
+probes:
+  enabled: true       # startup+liveness(+readiness)总开关(Helm 约定,非 k8s 语法)
 
 podDisruptionBudget:
   enabled: true
@@ -44,7 +44,7 @@ ulimitNofile: 65535
 
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.12
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.13
   process: "cache-aware-router"
 
 service:

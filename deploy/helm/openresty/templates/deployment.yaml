@@ -28,20 +28,21 @@ spec:
             {{- range .Values.service.ports }}
             - containerPort: {{ .port }}
             {{- end }}
+            - containerPort: {{ .Values.adminPort }}   # 固定 admin/health 口(baked)
           volumeMounts:
             - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
-          {{- if .Values.livenessProbe.enabled }}
-          startupProbe:                     # 慢启动预算:nginx master 出现前不判 live/ready(最多 ~60s)
-            exec: { command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"] }
+          {{- if .Values.probes.enabled }}
+          startupProbe:                     # 慢启动预算:admin 口 /healthz 起来前不判 live/ready(最多 ~60s)
+            httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
             periodSeconds: 2
             failureThreshold: 30
           livenessProbe:                    # startup 过后才生效 → 可 snappy、无 initialDelay(不会启动期误杀);快抓假死
-            exec: { command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"] }
+            httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
             periodSeconds: 10
             failureThreshold: 3
-          readinessProbe:                   # startup 过后 nginx 已在 → 秒 Ready;谁收流量另由 ha-gate active 标签决定
-            exec: { command: ["sh", "-c", "pgrep -f 'nginx: master' >/dev/null"] }
+          readinessProbe:                   # startup 过后 admin 口在 → 秒 Ready;谁收流量另由 ha-gate active 标签决定
+            httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
             periodSeconds: 2
             failureThreshold: 2
           {{- end }}

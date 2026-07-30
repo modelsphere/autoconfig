@@ -7,7 +7,7 @@ NS=${NS:-kimi}
 CHARTS=${CHARTS:-$HERE/charts}
 OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
 CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
-ACR=${ACR:-harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.12}
+ACR=${ACR:-harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.13}
 AUTH_KEY=${AUTH_KEY:-REDACTED-SEE-DEPLOY-DOCS}
 FAIL=0; say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 
@@ -15,7 +15,7 @@ FAIL=0; say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ ech
 eps(){ kubectl -n "$NS" get endpointslice -l kubernetes.io/service-name="$1" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' 2>/dev/null | grep -c true; }
 leaderpod(){ kubectl -n "$NS" get lease "$1" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null; }
 
-say "helm upgrade openresty/cart → 0.3.12(HA:replicas2 + ha-gate)"
+say "helm upgrade openresty/cart → 0.3.13(HA:replicas2 + ha-gate)"
 helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" --set fullnameOverride=openresty \
   --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" --set reload.image="$ACR" >/dev/null && ok "openresty upgraded" || bad "openresty upgrade 失败"
 helm -n "$NS" upgrade --install cart "$CHARTS/cart" --set fullnameOverride=cart \

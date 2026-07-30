@@ -30,7 +30,7 @@ spec:
           volumeMounts:
             - name: cfg                 # autoconfig 写的 config.yaml(整卷挂到 /workspace/configs)
               mountPath: /workspace/configs
-          {{- if .Values.livenessProbe.enabled }}
+          {{- if .Values.probes.enabled }}
           startupProbe:                 # 慢启动预算:端口起来前不判 live/ready(最多 ~60s)
             tcpSocket: { port: {{ .Values.service.port }} }
             periodSeconds: 2

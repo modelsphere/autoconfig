@@ -5,6 +5,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -110,12 +111,26 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// 3) openresty:按 peers 组(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
 	peersByTarget := map[string][]config.Peer{"backend": backends, "cart": cartPeers}
+	// 后端单实例并发(供 cart 动态并发用):backend 组的 maxConcurrency,没配则用 values.default_max
+	backendPerInstance := 0
+	for _, s := range rb.Spec.Openresty.Peers {
+		if s.Use == "backend" && s.MaxConcurrency > 0 {
+			backendPerInstance = s.MaxConcurrency
+		}
+	}
+	if backendPerInstance == 0 {
+		backendPerInstance = atoiOr(rb.Spec.Openresty.Values["default_max"], 0)
+	}
 	var sources []config.RouteSource
 	for _, s := range rb.Spec.Openresty.Peers {
 		if s.Use == "cart" && rb.Spec.Cart == nil {
 			continue // 声明了 cart 来源但没配 cart,跳过
 		}
-		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: s.MaxConcurrency})
+		mc := s.MaxConcurrency
+		if s.Use == "cart" && s.MaxConcurrencyFromBackend {
+			mc = backendPerInstance * len(backends) // CART 总容量 = 后端单实例并发 × 后端数(随扩缩自动变)
+		}
+		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc})
 	}
 	conf, err := sink.RenderRoute(sink.RouteData{
 		Route:  rb.Spec.Openresty.Route,
@@ -290,6 +305,14 @@ func (r *ModelRouteReconciler) readConfigMapKey(ctx context.Context, ref, key, d
 		return ""
 	}
 	return cm.Data[key]
+}
+
+// atoiOr 解析字符串为 int,失败/空则返回 def。
+func atoiOr(s string, def int) int {
+	if v, err := strconv.Atoi(s); err == nil {
+		return v
+	}
+	return def
 }
 
 func splitNSName(ref, defaultNS string) (ns, name string) {

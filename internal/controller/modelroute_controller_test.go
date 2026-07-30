@@ -49,8 +49,8 @@ func TestReconcileGLM(t *testing.T) {
 				Route: "glm", Listen: 18083, OutputConfigMap: "openresty/openresty-conf",
 				Values: map[string]string{"ttft_limit_ms": "60000"},
 				Peers: []routingv1.RoutePeer{
-					{Use: "cart", Priority: 1, MaxConcurrency: 180},
-					{Use: "backend", Priority: 0},
+					{Use: "cart", Priority: 1, MaxConcurrencyFromBackend: true}, // 动态 = 后端并发 × 后端数
+					{Use: "backend", Priority: 0, MaxConcurrency: 100},          // 单实例 100,2 个后端 → cart=200
 				},
 			},
 			Monitor: &routingv1.MonitorSpec{
@@ -106,8 +106,8 @@ func TestReconcileGLM(t *testing.T) {
 		t.Fatalf("get openresty-conf: %v", err)
 	}
 	conf := orCM.Data["session_route_glm.conf"]
-	wantCart := `{ "10.9.0.1", 8071, "cart-0", 1, 180 },`
-	wantBe := `{ "10.1.0.1", 8050, "backend-0" },`
+	wantCart := `{ "10.9.0.1", 8071, "cart-0", 1, 200 },` // cart 动态并发 = 后端 100 × 2 后端 = 200
+	wantBe := `{ "10.1.0.1", 8050, "backend-0", 0, 100 },` // 后端 maxConcurrency 100
 	for _, w := range []string{wantCart, wantBe, "listen 18083", "ttft_limit_ms = 60000"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("openresty conf missing %q\n%s", w, conf)

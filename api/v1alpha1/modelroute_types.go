@@ -45,6 +45,11 @@ type RoutePeer struct {
 	Priority int `json:"priority,omitempty"`
 	// MaxConcurrency:该组所有 peer 的并发上限;省略用 values.default_max。
 	MaxConcurrency int `json:"maxConcurrency,omitempty"`
+	// MaxConcurrencyFromBackend:仅 use:cart 有意义。true = cart 的并发上限动态 = 后端单实例并发 × 后端数
+	// (CART 扇出到 N 个后端,总容量=各后端容量之和,随后端扩缩自动变)。设了它就忽略静态 MaxConcurrency。
+	// 后端单实例并发取 use:backend 组的 maxConcurrency,没配则取 values.default_max。
+	// +optional
+	MaxConcurrencyFromBackend bool `json:"maxConcurrencyFromBackend,omitempty"`
 }
 
 // OpenrestySpec:本模型的 openresty 路由。

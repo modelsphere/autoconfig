@@ -3,5 +3,5 @@ name: openresty
 description: openresty session-router(k8s)——框架基座 baked 进镜像,per-model 路由由 autoconfig 写进 conf.d/routes,reload sidecar 热更
 type: application
 version: 0.1.1
-appVersion: "0.2.0-routes"
+appVersion: "0.2.1-routes"
 keywords: [openresty, routing, autoconfig]

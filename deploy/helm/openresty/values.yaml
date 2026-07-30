@@ -1,20 +1,24 @@
 image:
   repository: harbor.4pd.io/hardcore-tech/llm-openresty
-  tag: ""              # 缺省用 Chart.appVersion(0.2.0-routes,基座 baked 版)
+  tag: "0.2.1-routes"  # 基座 baked 版 + 固定 admin/health 口 8090(/healthz)
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)
 
-# master-standby(主备):ha-gate sidecar 选举,只有持 Lease 的 leader 通过 readiness → 只有它进 Service。
+adminPort: 8090                # baked 的固定 admin/health 口(session_base.conf 里,/healthz);探针 + ha-gate 用它
+
+# master-standby(主备):ha-gate sidecar 选举,只有持 Lease 的 leader 打 active 标签 → 只有它进 Service。
 # openresty 的路由态(active_conns/adaptive-cc/health-timer)是 pod 内共享内存,不能 active-active。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.12
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.13
   port: 8081
-  appTcp: "127.0.0.1:18080"    # readiness 还要求本端口可连(有路由 listener 才算就绪)
+  # appTcp 盯固定 admin 口(不随动态路由端口变);nginx 一起 8090 就在 → 探得到才是真活着
+  appTcp: "127.0.0.1:8090"
 
-livenessProbe:
-  enabled: true                # 探 nginx master 进程存活
+# probes:开关(Helm 约定,非 k8s 语法)——同时开/关 startup+liveness+readiness 三个探针(都打 admin 口 /healthz)
+probes:
+  enabled: true
 
 podDisruptionBudget:
   enabled: true
@@ -28,7 +32,7 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.12
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.13
   process: "nginx: master"
 
 service:
