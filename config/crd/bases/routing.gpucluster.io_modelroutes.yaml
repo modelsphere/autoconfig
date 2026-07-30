@@ -108,8 +108,9 @@ spec:
                   自热加载,无 sidecar)。
                 properties:
                   gpuType:
-                    description: GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300
-                      / H200)。
+                    description: |-
+                      GPUType:monitor service 行的 gpu_type 字段(如 H100 / A100 / H200)。省略 = 从后端所在节点的
+                      GPU label(nvidia.com/gpu.product,GFD 打)自动推导成短名;推不出(无 label / 无 GFD)则留空。显式配则覆盖。
                     type: string
                   model:
                     description: Model:monitor service 行的 model 字段(served-model-name);省略

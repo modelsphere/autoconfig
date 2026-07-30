@@ -9,7 +9,8 @@ KUSTOMIZE_VERSION      ?= v5.4.3
 CONTROLLER_GEN = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
 KUSTOMIZE      = go run sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
 
-HELM_CRD = deploy/helm/autoconfig/crds/routing.gpucluster.io_modelroutes.yaml
+HELM_CRD   = deploy/helm/autoconfig/crds/routing.gpucluster.io_modelroutes.yaml
+HELM_RULES = deploy/helm/autoconfig/files/controller-rules.yaml
 
 .PHONY: all
 all: build
@@ -17,10 +18,14 @@ all: build
 ##@ 代码生成(改了 api/ 类型或 controller 的 +kubebuilder marker 后跑,再提交生成物)
 
 .PHONY: manifests
-manifests: ## 生成 CRD + RBAC(从 marker),并同步 CRD 到 Helm chart。
+manifests: ## 生成 CRD + RBAC(从 marker),并同步 CRD + RBAC rules 到 Helm chart(单一来源)。
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=manager-role paths=./... output:rbac:artifacts:config=config/rbac
 	cp config/crd/bases/routing.gpucluster.io_modelroutes.yaml $(HELM_CRD)
+	@# RBAC 单一来源:kubebuilder marker → config/rbac/role.yaml → 抽出 rules 块同步进 helm chart
+	@# (helm ClusterRole 模板 .Files.Get 这个文件,名字/labels 仍由模板套)。改权限只改 marker。
+	mkdir -p $(dir $(HELM_RULES))
+	awk '/^rules:/{p=1;next} p' config/rbac/role.yaml > $(HELM_RULES)
 
 .PHONY: generate
 generate: ## 生成 deepcopy(zz_generated.deepcopy.go)。

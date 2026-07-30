@@ -2,20 +2,22 @@
 # 验证两个新特性(0.3.8 端口自动推导 + 0.3.19 service ns/name 跨 ns 发现):
 # 在【别的 ns(xns)】建 ModelRoute,discovery.service=kimi/kimi-k26-leader(跨 ns)、【不写 port】,
 # 验证仍发现 kimi leader、端口自动 = 8050。前提:kimi LWS 在跑、autoconfig controller 已升到目标 tag。
-# 依赖同目录:modelroutes.yaml(CRD)、controller.yaml。用法:IMG_TAG=0.3.19 bash verify_crossns_port.sh
+# 依赖:autoconfig helm chart($HERE/charts/autoconfig)。用法:IMG_TAG=0.3.19 bash verify_crossns_port.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TAG=${IMG_TAG:-0.3.19}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
+AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
 NS=xns
 FAIL=0; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 cleanup(){ kubectl delete ns "$NS" --wait=false 2>/dev/null; }
 trap cleanup EXIT
 
 echo "=== 升级 controller 到 $TAG ==="
-kubectl apply -f "$HERE/modelroutes.yaml" >/dev/null
-sed "s#image: $AC:.*#image: $AC:$TAG#" "$HERE/controller.yaml" | kubectl apply -f - >/dev/null
+kubectl apply -f "$AC_CHART/crds/" >/dev/null
+helm -n "$CTRL_NS" upgrade --install autoconfig "$AC_CHART" --create-namespace \
+  --set fullnameOverride=autoconfig-controller --set image.repository="$AC" --set image.tag="$TAG" >/dev/null
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s | tail -1
 
 echo "=== 在 xns ns 建 ModelRoute:跨 ns 发现 kimi leader + 不写 port ==="

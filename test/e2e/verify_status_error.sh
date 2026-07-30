@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # 验证:发现失败(多端口 Service 未显式配 port)时,原因写进 ModelRoute status(DiscoverError),
 # kubectl describe/get 看得到——而非只进 controller 日志。前提:controller 已升到目标 tag。
-# 依赖同目录 modelroutes.yaml、controller.yaml。用法:IMG_TAG=0.3.19 bash verify_status_error.sh
+# 依赖:autoconfig helm chart($HERE/charts/autoconfig)。用法:IMG_TAG=0.3.19 bash verify_status_error.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TAG=${IMG_TAG:-0.3.19}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
+AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
 NS=sterr
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 FAIL=0; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 cleanup(){ kubectl delete ns "$NS" --wait=false 2>/dev/null; }
 trap cleanup EXIT
 
-kubectl apply -f "$HERE/modelroutes.yaml" >/dev/null
-sed "s#image: $AC:.*#image: $AC:$TAG#" "$HERE/controller.yaml" | kubectl apply -f - >/dev/null
+kubectl apply -f "$AC_CHART/crds/" >/dev/null
+helm -n "$CTRL_NS" upgrade --install autoconfig "$AC_CHART" --create-namespace \
+  --set fullnameOverride=autoconfig-controller --set image.repository="$AC" --set image.tag="$TAG" >/dev/null
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s | tail -1
 
 echo "=== 多端口 mock 后端 + 不写 port 的 ModelRoute ==="

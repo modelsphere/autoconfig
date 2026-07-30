@@ -2,7 +2,7 @@
 # 真组件端到端(经 Helm chart):autoconfig controller 驱动 **真 openresty + 真 CART + 真 monitor**,
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
-# 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
+# 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
 #   IMG_TAG=0.3.19 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -28,15 +28,15 @@ cleanup(){ [ "$KEEP" = 1 ] && { echo "(--keep)"; return; }
   helm -n "$NS" uninstall openresty cart monitor 2>/dev/null
   kubectl -n "$NS" delete mr --all --timeout=40s 2>/dev/null
   kubectl delete ns "$NS" --wait=false 2>/dev/null
-  kubectl -n "$CTRL_NS" delete -f "$HERE/controller.yaml" --wait=false 2>/dev/null
+  helm -n "$CTRL_NS" uninstall autoconfig 2>/dev/null
 }
 trap cleanup EXIT
 
-# ---------- 1) CRD + autoconfig controller ----------
-say "install CRD + autoconfig controller ($AC:$TAG)"
-kubectl apply -f "$HERE/modelroutes.yaml"
-kubectl create ns "$CTRL_NS" --dry-run=client -o yaml | kubectl apply -f -
-sed "s#image: $AC:.*#image: $AC:$TAG#" "$HERE/controller.yaml" | kubectl apply -f -
+# ---------- 1) CRD + autoconfig controller(helm chart)----------
+say "helm install autoconfig controller ($AC:$TAG)"
+kubectl apply -f "$CHARTS/autoconfig/crds/"            # CRD 最新 schema(helm crds/ 不做升级)
+helm -n "$CTRL_NS" upgrade --install autoconfig "$CHARTS/autoconfig" --create-namespace \
+  --set fullnameOverride=autoconfig-controller --set image.repository="$AC" --set image.tag="$TAG" >/dev/null
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s || { bad "controller 未就绪"; kubectl -n "$CTRL_NS" get pods; exit 1; }
 ok "controller 就绪"
 

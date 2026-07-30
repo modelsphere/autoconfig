@@ -3,7 +3,7 @@
 # 前置:kimi ns 里 kimi-k26 LWS + kimi-k26-leader Service 已就绪(leader /v1/models=200)。
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
-# 依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
+# 依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
 #   IMG_TAG=0.3.19 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,7 +33,7 @@ cleanup(){ [ "$KEEP" = 1 ] && { echo "(--keep:保留 autoconfig 栈 + kimi)"; re
   helm -n "$NS" uninstall openresty cart monitor 2>/dev/null
   kubectl -n "$NS" delete mr glm-kimi 2>/dev/null
   kubectl -n "$NS" delete cm openresty-conf cart-config monitor-conf 2>/dev/null
-  kubectl -n "$CTRL_NS" delete -f "$HERE/controller.yaml" --wait=false 2>/dev/null
+  helm -n "$CTRL_NS" uninstall autoconfig 2>/dev/null
   echo "(kimi LWS 保留,不动)"
 }
 trap cleanup EXIT
@@ -43,11 +43,11 @@ say "等 kimi-k26 leader Ready(/v1/models=200)"
 kubectl -n "$NS" wait --for=condition=Ready pod -l app=kimi-k26,role=leader --timeout=900s || { bad "kimi leader 未就绪"; kubectl -n "$NS" get pods; exit 1; }
 ok "kimi leader Ready"
 
-# ---------- 1) CRD + autoconfig controller ----------
-say "install CRD + autoconfig controller ($AC:$TAG)"
-kubectl apply -f "$HERE/modelroutes.yaml"
-kubectl create ns "$CTRL_NS" --dry-run=client -o yaml | kubectl apply -f -
-sed "s#image: $AC:.*#image: $AC:$TAG#" "$HERE/controller.yaml" | kubectl apply -f -
+# ---------- 1) CRD + autoconfig controller(helm chart)----------
+say "helm install autoconfig controller ($AC:$TAG)"
+kubectl apply -f "$CHARTS/autoconfig/crds/"            # CRD 最新 schema(helm crds/ 不做升级)
+helm -n "$CTRL_NS" upgrade --install autoconfig "$CHARTS/autoconfig" --create-namespace \
+  --set fullnameOverride=autoconfig-controller --set image.repository="$AC" --set image.tag="$TAG" >/dev/null
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s || { bad "controller 未就绪"; exit 1; }
 ok "controller 就绪"
 

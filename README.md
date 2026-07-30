@@ -64,10 +64,10 @@ kubectl get mr -A                                   # NAME/BACKENDS/CART/READY/A
 CRD 放在 chart 的 `crds/`（Helm install-once、`helm uninstall` **不删**，保护已有 ModelRoute；升级 CRD schema 用
 `make install` 或 `kubectl apply -f config/crd/bases/...`）。
 
-裸 manifest（不用 helm 时）：
+不用 helm 时，用 kustomize（同源生成物，见下方「开发布局」）：
 ```bash
-kubectl apply -f config/crd/bases/routing.gpucluster.io_modelroutes.yaml     # 装 CRD
-kubectl apply -f deploy/controller.yaml                                       # 起 controller
+make install    # 装 CRD（config/crd/bases）
+make deploy     # 起 controller + RBAC（config/default）
 ```
 
 **⚠️ 卸载顺序：先删 ModelRoute，再 `helm uninstall`。** ModelRoute 带 finalizer（`routing.gpucluster.io/cleanup`），

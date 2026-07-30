@@ -3,12 +3,13 @@
 # 装 CRD + controller → mock 后端(Service→EndpointSlice)+ mock CART → ModelRoute
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
-# 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
+# 依赖:autoconfig helm chart(默认 $HERE/charts/autoconfig,含 CRD+RBAC+controller)。
 # 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.19 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
+AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
 IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.19}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
@@ -22,16 +23,15 @@ waiteq(){ local want="$1" desc="$2"; shift 2; local i got; for i in $(seq 1 40);
 cleanup(){ [ "$KEEP" = 1 ] && { echo "(--keep,保留资源)"; return; }
   say "cleanup"
   kubectl delete ns "$NS" --wait=false 2>/dev/null
-  kubectl -n "$CTRL_NS" delete -f "$HERE/controller.yaml" --wait=false 2>/dev/null
+  helm -n "$CTRL_NS" uninstall autoconfig 2>/dev/null
 }
 trap cleanup EXIT
 
-# ---------- 1) CRD + controller ----------
-say "install CRD + controller ($IMG)"
-kubectl apply -f "$HERE/modelroutes.yaml"
-kubectl create ns "$CTRL_NS" --dry-run=client -o yaml | kubectl apply -f -
-# 用传入 IMG 覆盖 controller.yaml 里的 image
-sed "s#image: harbor.4pd.io/hardcore-tech/autoconfig:.*#image: $IMG#" "$HERE/controller.yaml" | kubectl apply -f -
+# ---------- 1) CRD + controller(helm chart:CRD+RBAC+controller 一把装)----------
+say "helm install autoconfig controller ($IMG)"
+kubectl apply -f "$AC_CHART/crds/"                      # 确保 CRD 是最新 schema(helm crds/ 不做升级)
+helm -n "$CTRL_NS" upgrade --install autoconfig "$AC_CHART" --create-namespace \
+  --set fullnameOverride=autoconfig-controller --set image.repository="${IMG%:*}" --set image.tag="${IMG##*:}" >/dev/null
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s || { bad "controller 未就绪"; kubectl -n "$CTRL_NS" get pods; exit 1; }
 ok "controller 就绪"
 

@@ -13,15 +13,10 @@ kind: ClusterRole
 metadata:
   name: {{ include "autoconfig.clusterRoleName" . }}
   labels: {{- include "autoconfig.labels" . | nindent 4 }}
+# rules 由 `make manifests` 从 kubebuilder marker 生成的 config/rbac/role.yaml 抽出到 files/controller-rules.yaml,
+# 这里直接引入 —— 权限只在 controller.go 的 +kubebuilder:rbac marker 改,不再手抄。
 rules:
-- { apiGroups: ["routing.gpucluster.io"], resources: ["modelroutes"], verbs: ["get","list","watch","update","patch"] }
-- { apiGroups: ["routing.gpucluster.io"], resources: ["modelroutes/status"], verbs: ["get","update","patch"] }
-- { apiGroups: ["routing.gpucluster.io"], resources: ["modelroutes/finalizers"], verbs: ["update"] }
-- { apiGroups: [""], resources: ["configmaps"], verbs: ["get","list","watch","create","update","patch","delete"] }
-- { apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"] }
-- { apiGroups: ["discovery.k8s.io"], resources: ["endpointslices"], verbs: ["get","list","watch"] }
-- { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get","list","watch","create","update","patch","delete"] }
-- { apiGroups: [""], resources: ["events"], verbs: ["create","patch"] }
+{{ .Files.Get "files/controller-rules.yaml" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
