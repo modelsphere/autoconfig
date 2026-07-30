@@ -9,20 +9,7 @@ autoconfig 让这几处配置跟着自动收敛。
 
 ## 工作原理
 
-```
-┌──── autoconfig controller(Deployment,watch ModelRoute + EndpointSlice,RBAC 一处)──────────────┐
-│ 每个 ModelRoute(一个模型一条):按 discovery 发现后端(EndpointSlice/label,只取 Ready)          │
-│ 渲染:cart → workers;openresty → peers(CART 优先+后端兜底);monitor → service+nginx+router(可选)│
-│ diff(变了才写)+ fail-safe(发现为空→保留上次)→ 写各输出 ConfigMap + 回写 status              │
-└──────────────────┬───────────────────────────────────┬────────────────────────────────────────┘
-          ConfigMap│(整卷挂,kubelet ~1min)      ConfigMap│
-          ┌────────▼──────── CART pod ────────┐ ┌───────▼──── openresty pod ──────┐
-          │ [cart] 读 config.yaml             │ │ [openresty] include conf.d/routes│
-          │ [reload]  文件变→SIGHUP           │ │ [reload]  文件变→SIGHUP          │
-          │ [hagate]  leader 才打 active 标签 │ │ [hagate]  leader 才打 active 标签│
-          │   shareProcessNamespace           │ │   shareProcessNamespace          │
-          └───────────────────────────────────┘ └──────────────────────────────────┘
-```
+![autoconfig 架构:controller 发现后端 → 写 openresty / CART / monitor 三个 ConfigMap,消费方 pod 里 reload sidecar 收 SIGHUP 热重载](docs/architecture.png)
 
 三个独立二进制 / 镜像,各司其职:
 
