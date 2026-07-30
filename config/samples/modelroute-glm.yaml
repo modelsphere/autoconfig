@@ -1,17 +1,18 @@
-# 示例:glm-5.1-fp8 —— EndpointSlice 发现后端 + CART 优先 + 后端兜底。
+# 示例:glm-5.1-fp8 —— ModelRoute 放【中心 ns routing】,跨 ns 发现各组件(service 用 ns/name)。
+# service 写 "ns/name" 跨 ns;裸名则与本 ModelRoute 同 ns。port 省略 → 从 Service 的 EndpointSlice 自动取。
 apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
   name: glm-5.1-fp8
-  namespace: glm
+  namespace: routing                 # ← 中心 ns;后端/组件都在别的 ns,靠下面的 ns/name 跨 ns 发现
 spec:
   discovery:                         # 后端桶(喂 CART workers + openresty backend 来源)
-    service: glm-leader              # 走 EndpointSlice(该 Service 只选 leader,与本 ModelRoute 同 ns);或用 selector
-    # port 省略 → 从 Service 的 EndpointSlice 自动取(单端口);多端口/selector 才需显式写 port: 8050
+    service: glm/glm-leader          # ns/name:glm ns 的 leader Service(EndpointSlice 只选 leader)
+    # port 省略 → 从 EndpointSlice 自动取(单端口);多端口/selector 才需显式 port: 8050
   cart:                              # 可选;省略 = openresty 直连后端
-    service: cart-glm                # CART pod 的发现(供 openresty 的 cart 来源)
-    port: 8071
-    outputConfigMap: glm/cart-config
+    service: cart/cart-glm           # ns/name:cart ns 的 CART pod
+    # port 省略 → 自动取(CART 端口)
+    outputConfigMap: cart/cart-config
     baseConfigRef: { name: base-cart, key: config.base.yaml }
     maxLoad: 20
   openresty:
@@ -27,7 +28,7 @@ spec:
     model: glm-5.1-fp8
     gpuType: H100
     nginx:                           # 可选;探测 openresty 入口 → monitor 的 nginx: 行(name=Service,跨模型 dedup)
-      service: openresty             # openresty 的 k8s Service(同 ns;也可 selector)
+      service: openresty/openresty   # ns/name:openresty ns 的入口 Service
       port: 18083                    # 探活端口(任一 listen 均可,共享 /_active_conns)
     # router 默认 true(有 cart 时):把探测到的 CART pod 写进 monitor 的 router: 表(.../workers)。设 false 关闭。
 ---
@@ -39,8 +40,8 @@ metadata:
   namespace: kimi
 spec:
   discovery:
+    # selector 路径按【本 ModelRoute 的 ns】(kimi)发现,不支持 ns/name;port 也可省略(从 containerPort 自动取)
     selector: "leaderworkerset.sigs.k8s.io/name=kimi-k26,leaderworkerset.sigs.k8s.io/worker-index=0"
-    port: 8050
   openresty:
     route: k26
     listen: 18082

@@ -80,7 +80,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	backends, err := discovery.Discover(ctx, r.Clientset, discoveryTarget(
 		rb.Spec.Discovery.Service, rb.Spec.Discovery.Selector, rb.Spec.Discovery.Port, rb.Spec.Discovery.IncludeNotReady, rb.Namespace))
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("discover backends: %w", err)
+		// 发现失败(如端口不唯一、Service 不存在):写进 status 让 kubectl describe 看得到,而非只进日志
+		r.setStatus(ctx, req.NamespacedName, 0, 0, false, "DiscoverError", fmt.Sprintf("discover backends: %v", err))
+		return ctrl.Result{RequeueAfter: resyncEvery}, nil
 	}
 	if len(backends) == 0 {
 		// fail-safe:绝不写空(CART 拒空 workers、openresty 会丢全部流量)。标记 not-ready 后重试。
@@ -106,7 +108,8 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		cartPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(c.Service, c.Selector, c.Port, false, rb.Namespace))
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("discover cart pods: %w", err)
+			r.setStatus(ctx, req.NamespacedName, len(backends), 0, false, "DiscoverError", fmt.Sprintf("discover cart: %v", err))
+			return ctrl.Result{RequeueAfter: resyncEvery}, nil
 		}
 	}
 
@@ -139,7 +142,8 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if n := m.Nginx; n != nil { // 探测 openresty 入口 pod
 			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(n.Service, n.Selector, n.Port, n.IncludeNotReady, rb.Namespace))
 			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("discover openresty (nginx): %w", err)
+				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
+				return ctrl.Result{RequeueAfter: resyncEvery}, nil
 			}
 			if nginxName = n.Service; nginxName == "" {
 				nginxName = rb.Spec.Openresty.Route + "-nginx"
