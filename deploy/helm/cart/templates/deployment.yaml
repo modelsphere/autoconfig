@@ -67,7 +67,7 @@ spec:
       volumes:
         - name: cfg
           configMap:
-            name: {{ .Values.configMapName }}   # chart 建初值,autoconfig 更新
+            name: {{ include "cart.configMapName" . }}   # chart 建初值,autoconfig 更新
       {{- if or .Values.affinity .Values.ha.enabled }}
       affinity:
         {{- if .Values.affinity }}

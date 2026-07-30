@@ -3,7 +3,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .Values.configMapName }}
+  name: {{ include "cart.configMapName" . }}
   labels: {{- include "cart.labels" . | nindent 4 }}
 data:
   config.yaml: |

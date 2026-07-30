@@ -9,21 +9,21 @@ spec:
   discovery:                         # 后端桶(喂 CART workers + openresty backend 来源)
     service: glm/glm-leader          # ns/name:glm ns 的 leader Service(EndpointSlice 只选 leader)
     # port 省略 → 从 EndpointSlice 自动取(单端口);多端口/selector 才需显式 port: 8050
-  cart:                              # 可选;省略 = openresty 直连后端
-    service: cart/cart-glm           # ns/name:cart ns 的 CART pod(发现它 → openresty cart peer + monitor router)
+  cart:                              # 可选;省略 = openresty 直连后端。⚠️ CART 一个模型一个,下面都是本模型专属(非共享)
+    service: glm/cart-glm            # ns/name:glm ns 里本模型的 CART Service(每模型独立;发现它 → openresty cart peer + monitor router)
     # port 省略 → 自动取(CART 端口)
-    outputConfigMap: cart/cart-config  # autoconfig 只重填此 CM 的 workers 段;底稿(server/cache/health)由 cart chart 建
+    outputConfigMap: glm/cart-glm-config  # 本模型专属 = cart chart 的 <fullname>-config(cart-glm → cart-glm-config);autoconfig 只重填 workers 段
     maxLoad: 20                      # 每 worker 的 max_load(默认 20)
   openresty:
     route: glm
     listen: 18083
-    outputConfigMap: openresty/openresty-conf
+    outputConfigMap: openresty/openresty-conf   # 【共享】一个 openresty 服务所有模型;每模型一个 key(session_route_glm.conf)
     values: { ttft_limit_ms: "60000" }
     sources:                         # 有序:CART 优先 + 后端兜底
       - { use: cart,    priority: 1, maxConcurrency: 180 }
       - { use: backend, priority: 0 }
   monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
-    outputConfigMap: monitor/monitor-conf
+    outputConfigMap: monitor/monitor-conf   # 【共享】一个 monitor 看所有模型;每模型一个 key(glm-5.1-fp8.monitor.conf)
     model: glm-5.1-fp8
     gpuType: H100
     nginx:                           # 可选;探测 openresty 入口 → monitor 的 nginx: 行(name=Service,跨模型 dedup)

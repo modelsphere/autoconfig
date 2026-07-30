@@ -15,3 +15,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/name: {{ include "cart.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
+{{/* cart-config 名:默认 <fullname>-config(按 release 唯一,多 cart 同 ns 不撞);可用 configMapName 覆盖。
+     ⚠️ ModelRoute.cart.outputConfigMap 必须指到这个名。 */}}
+{{- define "cart.configMapName" -}}
+{{- .Values.configMapName | default (printf "%s-config" (include "cart.fullname" .)) -}}
+{{- end -}}

@@ -22,7 +22,9 @@ podDisruptionBudget:
 
 # CART 配置 ConfigMap(config.yaml):chart 建**唯一底稿**(server/cache/health),autoconfig 只重填 workers 段。
 # 这就是 CART 的 base——per-model 的 port/cache 等直接改这里(每个模型一个 cart release)。不再有单独的 baseConfigRef。
-configMapName: cart-config
+# ⚠️ cart 是【一个模型一个】,此 CM 也按模型独立。名字默认 = <fullname>-config(按 release 唯一,多 cart 同 ns 不撞);
+#    ModelRoute.cart.outputConfigMap 必须指到这个名。留空用默认,或显式覆盖。
+configMapName: ""
 
 # 底稿 config.yaml(server/cache/health + 占位 workers)。autoconfig 保留这部分、只替换 workers:;
 # standalone(无 autoconfig)时可在此直接写死 workers。
