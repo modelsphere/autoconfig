@@ -19,14 +19,16 @@ func TestResolveSourcesAndRenderRoute(t *testing.T) {
 		{Target: "glm-backends", Priority: 0},                  // 后端兜底
 	}, "")
 
-	conf, err := RenderRoute("", map[string]interface{}{"route": "glm", "listen": 18083}, peers)
+	conf, err := RenderRoute(RouteData{Route: "glm", Listen: 18083, Peers: peers,
+		Extra: map[string]string{"ttft_limit_ms": "60000", "zz_new_tunable": "9"}}) // 任意 key 原样渲染
 	if err != nil {
 		t.Fatalf("RenderRoute: %v", err)
 	}
 	wantCart := `{ "10.0.0.1", 8071, "cart-glm-0", 1, 180 },`
 	wantBe1 := `{ "10.1.0.1", 8050, "glm-backends-0" },`
 	wantBe2 := `{ "10.1.0.2", 8050, "glm-backends-1" },`
-	for _, w := range []string{wantCart, wantBe1, wantBe2, "listen 18083"} {
+	// Extra 任意 key(含 openresty 以后新加的)都渲染,无需改代码
+	for _, w := range []string{wantCart, wantBe1, wantBe2, "listen 18083", "ttft_limit_ms = 60000,", "zz_new_tunable = 9,"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("rendered conf missing %q\n---\n%s", w, conf)
 		}
@@ -41,7 +43,7 @@ func TestResolveSourcesSingleTarget(t *testing.T) {
 	peers := ResolveSources(map[string][]config.Peer{
 		"glm-backends": {{IP: "10.1.0.1", Port: 8050}},
 	}, nil, "glm-backends")
-	conf, err := RenderRoute("", map[string]interface{}{"route": "glm", "listen": 18083}, peers)
+	conf, err := RenderRoute(RouteData{Route: "glm", Listen: 18083, Peers: peers})
 	if err != nil {
 		t.Fatalf("RenderRoute: %v", err)
 	}

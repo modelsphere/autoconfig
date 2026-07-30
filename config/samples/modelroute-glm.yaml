@@ -18,17 +18,18 @@ spec:
     route: glm
     listen: 18083
     outputConfigMap: openresty/openresty-conf   # 【共享】一个 openresty 服务所有模型;每模型一个 key(session_route_glm.conf)
-    values: { ttft_limit_ms: "60000" }
-    sources:                         # 有序:CART 优先 + 后端兜底
+    values:                        # 任意调优项,原样渲染进 lua(openresty 加新项无需改代码;数字不加引号)
+      ttft_limit_ms: "60000"
+      default_max:   "120"         # 没配 maxConcurrency 的 peer 默认并发
+    peers:                         # 有序 peer 组:CART 优先 + 后端兜底
       - { use: cart,    priority: 1, maxConcurrency: 180 }
-      - { use: backend, priority: 0 }
+      - { use: backend, priority: 0, maxConcurrency: 120 }
   monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
     outputConfigMap: monitor/monitor-conf   # 【共享】一个 monitor 看所有模型;每模型一个 key(glm-5.1-fp8.monitor.conf)
     model: glm-5.1-fp8
     gpuType: H100
-    nginx:                           # 可选;探测 openresty 入口 → monitor 的 nginx: 行(name=Service,跨模型 dedup)
-      service: openresty/openresty   # ns/name:openresty ns 的入口 Service
-      port: 18083                    # 探活端口(任一 listen 均可,共享 /_active_conns)
+    nginx:                           # 可选;探测 openresty 入口 → monitor 的 nginx: 行
+      service: openresty/openresty   # openresty 入口 Service(ns/name);端口用本模型的 openresty.listen(每端口=一个模型),不用写 port
     # router 默认 true(有 cart 时):把探测到的 CART pod 写进 monitor 的 router: 表(.../workers)。设 false 关闭。
 ---
 # 无 CART 的例子:openresty 直连后端(省略 cart 段,sources 只有 backend)
@@ -45,5 +46,5 @@ spec:
     route: k26
     listen: 18082
     outputConfigMap: openresty/openresty-conf
-    sources:
+    peers:
       - { use: backend }

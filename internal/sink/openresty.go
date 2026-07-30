@@ -16,20 +16,22 @@ var defaultRouteTmpl string
 
 // RenderRoute 用模板给一条 openresty route 生成整个 conf(dicts + server + register_route + peers)。
 // tmplContent 为空用内置模板。
-func RenderRoute(tmplContent string, values map[string]interface{}, peers []config.Peer) (string, error) {
-	if tmplContent == "" {
-		tmplContent = defaultRouteTmpl
-	}
-	tmpl, err := template.New("route").Parse(tmplContent)
+// RouteData 喂给 route.tmpl。Route/Listen 是结构;Extra 是任意调优项(原样渲染进 lua 返回表,
+// text/template range map 按 key 排序 → 确定性);Peers 是发现结果。
+type RouteData struct {
+	Route  string
+	Listen int
+	Extra  map[string]string
+	Peers  []config.Peer
+}
+
+func RenderRoute(d RouteData) (string, error) {
+	tmpl, err := template.New("route").Parse(defaultRouteTmpl)
 	if err != nil {
 		return "", fmt.Errorf("parse template: %w", err)
 	}
 	var buf bytes.Buffer
-	data := struct {
-		Values map[string]interface{}
-		Peers  []config.Peer
-	}{Values: values, Peers: peers}
-	if err := tmpl.Execute(&buf, data); err != nil {
+	if err := tmpl.Execute(&buf, d); err != nil {
 		return "", err
 	}
 	return buf.String(), nil

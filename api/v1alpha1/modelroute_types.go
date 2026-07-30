@@ -36,14 +36,14 @@ type CartSpec struct {
 	MaxLoad int `json:"maxLoad,omitempty"`
 }
 
-// RouteSource:openresty 一条 route 的一个 peer 来源。
-type RouteSource struct {
+// RoutePeer:openresty 一条 route 的一组 peer 来源(cart 组 / backend 组)。
+type RoutePeer struct {
 	// Use:"cart"(引用本模型的 CART pod)或 "backend"(引用 discovery 的后端桶)。
 	// +kubebuilder:validation:Enum=cart;backend
 	Use string `json:"use"`
 	// Priority:openresty peer 优先级(CART 优先=1,后端兜底=0)。
 	Priority int `json:"priority,omitempty"`
-	// MaxConcurrency:该来源 peer 的并发上限覆盖。
+	// MaxConcurrency:该组所有 peer 的并发上限;省略用 values.default_max。
 	MaxConcurrency int `json:"maxConcurrency,omitempty"`
 }
 
@@ -53,12 +53,13 @@ type OpenrestySpec struct {
 	Route string `json:"route"`
 	// Listen:server 监听端口。
 	Listen int `json:"listen"`
-	// Sources:有序 peer 来源(如 cart 优先 + backend 兜底)。
+	// Peers:有序 peer 组(如 cart 优先 + backend 兜底)。
 	// +kubebuilder:validation:MinItems=1
-	Sources []RouteSource `json:"sources"`
+	Peers []RoutePeer `json:"peers"`
 	// OutputConfigMap:openresty 输出 ConfigMap("ns/name",多路由共享,每路由一个 key)。
 	OutputConfigMap string `json:"outputConfigMap"`
-	// Values:传给模板的额外值(如 ttft_limit_ms、tps_limit_tps、default_max)。
+	// Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。openresty 加新调优项无需改代码。
+	// 常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
 	Values map[string]string `json:"values,omitempty"`
 }
 
@@ -71,15 +72,16 @@ type MonitorSpec struct {
 	Model string `json:"model,omitempty"`
 	// GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300 / H200)。
 	GPUType string `json:"gpuType,omitempty"`
-	// Nginx:可选;openresty 入口发现(service/selector 二选一 + port)。autoconfig 探测其 pod,
-	// 生成 monitor 的 nginx: 行(name 用 Service,跨模型同 Service 自动 dedup)。
+	// Nginx:可选;openresty 入口发现(service/selector)。autoconfig 探测其 pod,生成 monitor 的 nginx: 行。
+	// 端口用【本模型的 openresty.listen】(nginx.port 忽略)→ 每模型/每端口一条 nginx 行,name=本模型;
+	// 多模型指同一 openresty Service 时,各按自己的 listen 端口探,「每个端口代表一个模型」。
 	Nginx *Discovery `json:"nginx,omitempty"`
 	// Router:可选,默认 true(当配了 spec.cart);把探测到的 CART pod 写进 monitor 的 router: 表(.../workers)。设 false 关闭。
 	Router *bool `json:"router,omitempty"`
 }
 
 // ModelRouteSpec 是一个模型的完整路由绑定。
-// +kubebuilder:validation:XValidation:rule="!self.openresty.sources.exists(s, s.use == 'cart') || has(self.cart)",message="openresty.sources 用了 cart,但没配 spec.cart"
+// +kubebuilder:validation:XValidation:rule="!self.openresty.peers.exists(s, s.use == 'cart') || has(self.cart)",message="openresty.peers 用了 cart,但没配 spec.cart"
 type ModelRouteSpec struct {
 	// Discovery:本模型的后端桶(喂 CART 的 workers、openresty 的 backend 来源、monitor 的 services)。
 	Discovery Discovery `json:"discovery"`

@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CHART=${CHART:-$HERE/autoconfig}
 NS=${NS:-autoconfig}
 TNS=${TNS:-ac-helm-e2e}
-IMG_TAG=${IMG_TAG:-0.3.11}
+IMG_TAG=${IMG_TAG:-0.3.12}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -57,7 +57,7 @@ spec:
     route: demo
     listen: 18099
     outputConfigMap: $TNS/openresty-conf
-    sources: [{ use: backend }]
+    peers: [{ use: backend }]
 YAML
 kubectl -n "$TNS" rollout status deploy/be --timeout=120s
 waiteq 2 "rb.status.backends" kubectl -n "$TNS" get mr demo -o jsonpath='{.status.backends}'

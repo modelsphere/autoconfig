@@ -4,12 +4,12 @@
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.11 bash real_kimi_e2e.sh [--keep]
+#   IMG_TAG=0.3.12 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-kimi}                      # 与 kimi LWS 同 ns(discovery 同 ns)
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.11}
+TAG=${IMG_TAG:-0.3.12}
 CHARTS=${CHARTS:-$HERE/charts}
 KIMI_SVC=${KIMI_SVC:-kimi-k26-leader}
 MODEL=${MODEL:-kimi-k2.6}
@@ -76,7 +76,7 @@ spec:
     route: kimi
     listen: $LISTEN
     outputConfigMap: $NS/openresty-conf
-    sources: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
+    peers: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
   monitor:
     outputConfigMap: $NS/monitor-conf
     model: $MODEL
@@ -102,7 +102,7 @@ echo "$OR" | grep -q "$LEADER_IP\", 8050, \"backend-0\"" && ok "openresty 后端
 MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm-kimi\.monitor\.conf}')
 echo "--- monitor glm-kimi.monitor.conf ---"; echo "$MON"
 echo "$MON" | grep -qE "^service: glm-kimi-0 \| http://$LEADER_IP:8050 \| $MODEL \| A100$" && ok "monitor service=kimi leader" || bad "monitor service 不对"
-echo "$MON" | grep -qE '^nginx: openresty-0 \|' && ok "monitor nginx 行" || bad "monitor 无 nginx 行"
+echo "$MON" | grep -qE '^nginx: kimi-k2.6-0 \| http://.+:18080$' && ok "monitor nginx 行" || bad "monitor 无 nginx 行"
 echo "$MON" | grep -qE '^router: glm-kimi-router-0 \|.+/workers$' && ok "monitor router 行" || bad "monitor 无 router 行"
 
 # ---------- 5) 真消费:发一条 /v1/chat/completions 经 openresty→CART→kimi ----------

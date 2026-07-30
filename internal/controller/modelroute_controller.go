@@ -108,20 +108,21 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// 3) openresty:按 sources(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
+	// 3) openresty:按 peers 组(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
 	peersByTarget := map[string][]config.Peer{"backend": backends, "cart": cartPeers}
 	var sources []config.RouteSource
-	for _, s := range rb.Spec.Openresty.Sources {
+	for _, s := range rb.Spec.Openresty.Peers {
 		if s.Use == "cart" && rb.Spec.Cart == nil {
 			continue // 声明了 cart 来源但没配 cart,跳过
 		}
 		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: s.MaxConcurrency})
 	}
-	values := map[string]interface{}{"route": rb.Spec.Openresty.Route, "listen": rb.Spec.Openresty.Listen}
-	for k, v := range rb.Spec.Openresty.Values {
-		values[k] = v
-	}
-	conf, err := sink.RenderRoute("", values, sink.ResolveSources(peersByTarget, sources, "backend"))
+	conf, err := sink.RenderRoute(sink.RouteData{
+		Route:  rb.Spec.Openresty.Route,
+		Listen: rb.Spec.Openresty.Listen,
+		Extra:  rb.Spec.Openresty.Values, // 任意调优项,原样渲染
+		Peers:  sink.ResolveSources(peersByTarget, sources, "backend"),
+	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render route: %w", err)
 	}
@@ -135,13 +136,14 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		var nginxPeers, routerPeers []config.Peer
 		nginxName := ""
 		if n := m.Nginx; n != nil { // 探测 openresty 入口 pod
-			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(n.Service, n.Selector, n.Port, n.IncludeNotReady, rb.Namespace))
+			// 端口用【本模型的 openresty.listen】→ monitor 每个 nginx 端口代表一个模型(每模型独立 key,不 dedup)
+			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(n.Service, n.Selector, rb.Spec.Openresty.Listen, n.IncludeNotReady, rb.Namespace))
 			if err != nil {
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil
 			}
-			if nginxName = n.Service; nginxName == "" {
-				nginxName = rb.Spec.Openresty.Route + "-nginx"
+			if nginxName = m.Model; nginxName == "" { // 名字按模型,每模型/每端口一条 nginx 行
+				nginxName = rb.Name
 			}
 		}
 		if rb.Spec.Cart != nil && (m.Router == nil || *m.Router) { // 复用已探测的 CART pod 作 router

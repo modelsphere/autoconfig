@@ -117,8 +117,9 @@ spec:
                     type: string
                   nginx:
                     description: |-
-                      Nginx:可选;openresty 入口发现(service/selector 二选一 + port)。autoconfig 探测其 pod,
-                      生成 monitor 的 nginx: 行(name 用 Service,跨模型同 Service 自动 dedup)。
+                      Nginx:可选;openresty 入口发现(service/selector)。autoconfig 探测其 pod,生成 monitor 的 nginx: 行。
+                      端口用【本模型的 openresty.listen】(nginx.port 忽略)→ 每模型/每端口一条 nginx 行,name=本模型;
+                      多模型指同一 openresty Service 时,各按自己的 listen 端口探,「每个端口代表一个模型」。
                     properties:
                       includeNotReady:
                         description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
@@ -160,16 +161,14 @@ spec:
                     description: OutputConfigMap:openresty 输出 ConfigMap("ns/name",多路由共享,每路由一个
                       key)。
                     type: string
-                  route:
-                    description: Route:路由短名(dict/register 用),如 "glm"。
-                    type: string
-                  sources:
-                    description: Sources:有序 peer 来源(如 cart 优先 + backend 兜底)。
+                  peers:
+                    description: Peers:有序 peer 组(如 cart 优先 + backend 兜底)。
                     items:
-                      description: RouteSource:openresty 一条 route 的一个 peer 来源。
+                      description: RoutePeer:openresty 一条 route 的一组 peer 来源(cart 组
+                        / backend 组)。
                       properties:
                         maxConcurrency:
-                          description: MaxConcurrency:该来源 peer 的并发上限覆盖。
+                          description: MaxConcurrency:该组所有 peer 的并发上限;省略用 values.default_max。
                           type: integer
                         priority:
                           description: Priority:openresty peer 优先级(CART 优先=1,后端兜底=0)。
@@ -186,24 +185,29 @@ spec:
                       type: object
                     minItems: 1
                     type: array
+                  route:
+                    description: Route:路由短名(dict/register 用),如 "glm"。
+                    type: string
                   values:
                     additionalProperties:
                       type: string
-                    description: Values:传给模板的额外值(如 ttft_limit_ms、tps_limit_tps、default_max)。
+                    description: |-
+                      Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。openresty 加新调优项无需改代码。
+                      常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
                     type: object
                 required:
                 - listen
                 - outputConfigMap
+                - peers
                 - route
-                - sources
                 type: object
             required:
             - discovery
             - openresty
             type: object
             x-kubernetes-validations:
-            - message: openresty.sources 用了 cart,但没配 spec.cart
-              rule: '!self.openresty.sources.exists(s, s.use == ''cart'') || has(self.cart)'
+            - message: openresty.peers 用了 cart,但没配 spec.cart
+              rule: '!self.openresty.peers.exists(s, s.use == ''cart'') || has(self.cart)'
           status:
             description: ModelRouteStatus 是 controller 回写的观测状态。
             properties:

@@ -9,7 +9,7 @@ import (
 
 // RenderMonitor 渲染一个模型在 monitor.conf 里的块(与现有 monitor.conf 约定一致):
 //   service: <mrName>-<i> | http://ip:port | <model> | <gpu_type>   —— 后端(每实例一行)
-//   nginx:   <nginxName>-<i> | http://ip:port                        —— openresty 入口(base url;monitor 探 /_active_conns)
+//   nginx:   <model>-<i> | http://ip:<listen>                        —— openresty 入口(每模型/每端口一条;monitor 探 /_active_conns)
 //   router:  <mrName>-router-<i> | http://ip:port/workers            —— CART(Router tab;url 为 /workers 端点)
 // model 为空用 mrName;nginxPeers/routerPeers 为空则不出对应行。
 func RenderMonitor(mrName, model, gpuType, nginxName string, backends, nginxPeers, routerPeers []config.Peer) string {

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 验证:发现失败(多端口 Service 未显式配 port)时,原因写进 ModelRoute status(DiscoverError),
 # kubectl describe/get 看得到——而非只进 controller 日志。前提:controller 已升到目标 tag。
-# 依赖同目录 modelroutes.yaml、controller.yaml。用法:IMG_TAG=0.3.11 bash verify_status_error.sh
+# 依赖同目录 modelroutes.yaml、controller.yaml。用法:IMG_TAG=0.3.12 bash verify_status_error.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TAG=${IMG_TAG:-0.3.11}
+TAG=${IMG_TAG:-0.3.12}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 NS=sterr
@@ -35,7 +35,7 @@ kind: ModelRoute
 metadata: { name: mp }
 spec:
   discovery: { service: be-multi }            # ← 多端口且不写 port → 应报 DiscoverError
-  openresty: { route: mp, listen: 18080, outputConfigMap: $NS/openresty-conf, sources: [{ use: backend }] }
+  openresty: { route: mp, listen: 18080, outputConfigMap: $NS/openresty-conf, peers: [{ use: backend }] }
 YAML
 kubectl -n "$NS" rollout status deploy/be --timeout=60s | tail -1
 

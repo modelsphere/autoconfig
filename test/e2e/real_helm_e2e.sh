@@ -3,12 +3,12 @@
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.11 bash real_helm_e2e.sh [--keep]
+#   IMG_TAG=0.3.12 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-helm}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.11}
+TAG=${IMG_TAG:-0.3.12}
 CHARTS=${CHARTS:-$HERE/charts}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
@@ -85,7 +85,7 @@ spec:
     route: glm
     listen: 18083
     outputConfigMap: $NS/openresty-conf
-    sources: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
+    peers: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
   monitor:
     outputConfigMap: $NS/monitor-conf
     model: glm-5.1-fp8
@@ -127,7 +127,7 @@ for i in $(seq 1 30); do kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc
 MM=$(kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc/monitor/conf.d/glm.monitor.conf 2>/dev/null')
 echo "--- monitor pod 内 glm.monitor.conf ---"; echo "$MM"
 [ "$(echo "$MM" | grep -c '^service: glm-')" -ge 2 ] && ok "monitor 消费 service 行(每后端一行)" || bad "monitor service 行不对"
-echo "$MM" | grep -qE '^nginx: openresty-0 \| http://.+:18083$' && ok "monitor 消费 nginx 行(openresty 入口)" || bad "monitor 无 nginx 行"
+echo "$MM" | grep -qE '^nginx: glm-5.1-fp8-0 \| http://.+:18083$' && ok "monitor 消费 nginx 行(name=model,port=listen)" || bad "monitor 无 nginx 行"
 echo "$MM" | grep -qE '^router: glm-router-0 \| http://.+:8071/workers$' && ok "monitor 消费 router 行(CART /workers)" || bad "monitor 无 router 行"
 kubectl -n "$NS" logs deploy/monitor --tail=200 2>/dev/null | grep -qiE 'Traceback|ValueError|line [0-9]+:' && bad "monitor 日志有配置解析错误" || ok "monitor 加载 conf.d 无解析错误"
 

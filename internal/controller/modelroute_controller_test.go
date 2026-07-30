@@ -48,7 +48,7 @@ func TestReconcileGLM(t *testing.T) {
 			Openresty: routingv1.OpenrestySpec{
 				Route: "glm", Listen: 18083, OutputConfigMap: "openresty/openresty-conf",
 				Values: map[string]string{"ttft_limit_ms": "60000"},
-				Sources: []routingv1.RouteSource{
+				Peers: []routingv1.RoutePeer{
 					{Use: "cart", Priority: 1, MaxConcurrency: 180},
 					{Use: "backend", Priority: 0},
 				},
