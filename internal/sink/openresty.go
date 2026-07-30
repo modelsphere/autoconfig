@@ -9,7 +9,7 @@ import (
 	"autoconfig/internal/config"
 )
 
-// defaultRouteTmpl 内置路由模板(= deploy/openresty-route.tmpl 的副本),controller 无需挂载模板文件。
+// defaultRouteTmpl 内置路由模板(route.tmpl 编进二进制,controller 无需挂载模板文件)。
 //
 //go:embed route.tmpl
 var defaultRouteTmpl string

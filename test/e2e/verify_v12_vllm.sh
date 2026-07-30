@@ -28,8 +28,8 @@ spec:
     outputConfigMap: $NS/openresty-conf
     values: { ttft_limit_ms: "60000", zz_custom_tunable: "7" }   # 任意 key:自定义的也渲染
     peers:
-      - { use: cart,    priority: 1, maxConcurrency: 180 }
-      - { use: backend, priority: 0, maxConcurrency: 120 }        # backend 也配并发上限
+      - { use: cart,    priority: 1, maxConcurrencyFromBackend: true }   # 动态=后端并发 × 后端数
+      - { use: backend, priority: 0, maxConcurrency: 120 }               # 单实例 120(vllm-mock 1 后端 → cart=120)
   monitor:
     outputConfigMap: $NS/monitor-conf
     model: $MODEL_LABEL
@@ -43,7 +43,7 @@ waiteq 1 "status.cartPeers" kubectl -n "$NS" get mr opt -o jsonpath='{.status.ca
 echo "=== Q5 peers + Q4 任意 values(openresty-conf)==="
 OR=$(kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_opt\.conf}')
 echo "--- session_route_opt.conf ---"; echo "$OR" | grep -E 'peers|cart-0|backend-0|ttft|zz_custom'
-echo "$OR" | grep -qE '"cart-0", 1, 180' && ok "peers:CART 优先(1,180)" || bad "无 CART peer"
+echo "$OR" | grep -qE '"cart-0", 1, 120' && ok "peers:CART 动态并发=后端120 × 1 后端=120" || bad "CART 动态并发不对"
 echo "$OR" | grep -qE '"backend-0", 0, 120' && ok "peers:backend maxConcurrency=120(第5元素)" || bad "backend maxConc 不对"
 echo "$OR" | grep -q 'ttft_limit_ms = 60000' && ok "values:ttft_limit_ms 渲染" || bad "ttft 未渲染"
 echo "$OR" | grep -q 'zz_custom_tunable = 7' && ok "values:自定义 key 也原样渲染(无需改代码)" || bad "自定义 value 未渲染"
