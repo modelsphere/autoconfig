@@ -52,49 +52,56 @@ type RoutePeer struct {
 	MaxConcurrencyFromBackend bool `json:"maxConcurrencyFromBackend,omitempty"`
 }
 
-// OpenrestySpec:本模型的 openresty 路由。
-type OpenrestySpec struct {
-	// Route:路由短名(dict/register 用),如 "glm"。
-	Route string `json:"route"`
+// NginxSpec:本模型的 nginx(openresty)路由 —— 渲染 peers 到 session_route_<route>.conf。
+type NginxSpec struct {
+	// Route:路由短名(openresty dict/register 用,= conf 文件名 session_route_<route>.conf)。
+	// 省略 = 用 metadata.name。⚠️ 会做 openresty lua_shared_dict 名(active_conns_<route> 等),
+	// 想用简单标识(字母数字/下划线)或 name 含 -/. 时,显式给个短 route。
+	// +optional
+	Route string `json:"route,omitempty"`
 	// Listen:server 监听端口。
 	Listen int `json:"listen"`
 	// Peers:有序 peer 组(如 cart 优先 + backend 兜底)。
 	// +kubebuilder:validation:MinItems=1
 	Peers []RoutePeer `json:"peers"`
-	// OutputConfigMap:openresty 输出 ConfigMap("ns/name",多路由共享,每路由一个 key)。
+	// OutputConfigMap:输出 ConfigMap("ns/name",多路由共享,每路由一个 key)。
 	OutputConfigMap string `json:"outputConfigMap"`
-	// Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。openresty 加新调优项无需改代码。
+	// Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。nginx 加新调优项无需改代码。
 	// 常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
 	Values map[string]string `json:"values,omitempty"`
+	// Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
+	// 端口用本模型的 listen(每端口 = 一个模型)。与 selector 二选一(都配则 service 优先)。
+	Service string `json:"service,omitempty"`
+	// Selector:可选;nginx 入口的 pod label 发现(没建 Service 时的兜底)。
+	Selector string `json:"selector,omitempty"`
 }
 
-// MonitorSpec:可选;有 = autoconfig 把发现的后端写进 monitor 的 services 列表。
-// monitor 自身每 60s 热加载 monitor.conf,无需 reload sidecar(不同于 openresty/CART)。
+// MonitorSpec:可选;把发现的后端/入口/CART 写进共享 monitor.conf(每模型一个 key)。
+// monitor 自身每 60s 热加载 monitor.conf,无需 reload sidecar(不同于 nginx/CART)。
 type MonitorSpec struct {
 	// OutputConfigMap:autoconfig 写 monitor 配置的 ConfigMap("ns/name",多模型共享,每模型一个 key)。
 	OutputConfigMap string `json:"outputConfigMap"`
-	// Model:monitor service 行的 model 字段(served-model-name);省略用 metadata.name。
+	// Model:monitor service 行的 model 字段(served-model-name);省略 = metadata.name。
 	Model string `json:"model,omitempty"`
 	// GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300 / H200)。
 	GPUType string `json:"gpuType,omitempty"`
-	// Nginx:可选;openresty 入口发现(service/selector)。autoconfig 探测其 pod,生成 monitor 的 nginx: 行。
-	// 端口用【本模型的 openresty.listen】(nginx.port 忽略)→ 每模型/每端口一条 nginx 行,name=本模型;
-	// 多模型指同一 openresty Service 时,各按自己的 listen 端口探,「每个端口代表一个模型」。
-	Nginx *Discovery `json:"nginx,omitempty"`
-	// Router:可选,默认 true(当配了 spec.cart);把探测到的 CART pod 写进 monitor 的 router: 表(.../workers)。设 false 关闭。
+	// Nginx:可选,默认 true(当 spec.nginx 配了 service/selector);复用 nginx 入口发现,写 monitor 的 nginx: 行
+	//(端口用 spec.nginx.listen,每端口 = 一个模型,name = 本模型)。设 false 关闭。
+	Nginx *bool `json:"nginx,omitempty"`
+	// Router:可选,默认 true(当配了 spec.cart);复用 spec.cart 发现的 CART pod,写 monitor 的 router: 表(.../workers)。设 false 关闭。
 	Router *bool `json:"router,omitempty"`
 }
 
 // ModelRouteSpec 是一个模型的完整路由绑定。
-// +kubebuilder:validation:XValidation:rule="!self.openresty.peers.exists(s, s.use == 'cart') || has(self.cart)",message="openresty.peers 用了 cart,但没配 spec.cart"
-// +kubebuilder:validation:XValidation:rule="!self.openresty.peers.exists(s, s.use == 'cart' && has(s.maxConcurrencyFromBackend) && s.maxConcurrencyFromBackend) || self.openresty.peers.exists(s, s.use == 'backend' && has(s.maxConcurrency) && s.maxConcurrency > 0)",message="cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(> 0)作乘数"
+// +kubebuilder:validation:XValidation:rule="!self.nginx.peers.exists(s, s.use == 'cart') || has(self.cart)",message="nginx.peers 用了 cart,但没配 spec.cart"
+// +kubebuilder:validation:XValidation:rule="!self.nginx.peers.exists(s, s.use == 'cart' && has(s.maxConcurrencyFromBackend) && s.maxConcurrencyFromBackend) || self.nginx.peers.exists(s, s.use == 'backend' && has(s.maxConcurrency) && s.maxConcurrency > 0)",message="cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(> 0)作乘数"
 type ModelRouteSpec struct {
-	// Discovery:本模型的后端桶(喂 CART 的 workers、openresty 的 backend 来源、monitor 的 services)。
+	// Discovery:本模型的后端桶(喂 CART 的 workers、nginx 的 backend 来源、monitor 的 services)。
 	Discovery Discovery `json:"discovery"`
-	// Cart:可选;有 = autoconfig 管这个 CART,无 = openresty 直连后端。
+	// Cart:可选;有 = autoconfig 管这个 CART,无 = nginx 直连后端。
 	Cart *CartSpec `json:"cart,omitempty"`
-	// Openresty:openresty 路由。
-	Openresty OpenrestySpec `json:"openresty"`
+	// Nginx:nginx(openresty)路由。
+	Nginx NginxSpec `json:"nginx"`
 	// Monitor:可选;有 = 把发现的后端也写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)。
 	Monitor *MonitorSpec `json:"monitor,omitempty"`
 }

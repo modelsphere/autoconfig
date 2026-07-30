@@ -55,7 +55,7 @@ spec:
             description: ModelRouteSpec 是一个模型的完整路由绑定。
             properties:
               cart:
-                description: Cart:可选;有 = autoconfig 管这个 CART,无 = openresty 直连后端。
+                description: Cart:可选;有 = autoconfig 管这个 CART,无 = nginx 直连后端。
                 properties:
                   maxLoad:
                     description: MaxLoad:每 worker 的 max_load,默认 20。
@@ -81,8 +81,8 @@ spec:
                 - message: 'cart: service 和 selector 必须恰好给一个'
                   rule: has(self.service) != has(self.selector)
               discovery:
-                description: Discovery:本模型的后端桶(喂 CART 的 workers、openresty 的 backend
-                  来源、monitor 的 services)。
+                description: Discovery:本模型的后端桶(喂 CART 的 workers、nginx 的 backend 来源、monitor
+                  的 services)。
                 properties:
                   includeNotReady:
                     description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
@@ -112,53 +112,33 @@ spec:
                       / H200)。
                     type: string
                   model:
-                    description: Model:monitor service 行的 model 字段(served-model-name);省略用
-                      metadata.name。
+                    description: Model:monitor service 行的 model 字段(served-model-name);省略
+                      = metadata.name。
                     type: string
                   nginx:
                     description: |-
-                      Nginx:可选;openresty 入口发现(service/selector)。autoconfig 探测其 pod,生成 monitor 的 nginx: 行。
-                      端口用【本模型的 openresty.listen】(nginx.port 忽略)→ 每模型/每端口一条 nginx 行,name=本模型;
-                      多模型指同一 openresty Service 时,各按自己的 listen 端口探,「每个端口代表一个模型」。
-                    properties:
-                      includeNotReady:
-                        description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
-                        type: boolean
-                      port:
-                        description: Port:后端服务端口(配 pod IP)。省略则自动推导:service 路径从 EndpointSlice
-                          取、selector 路径从 containerPort 取(仅单端口可推)。
-                        type: integer
-                      selector:
-                        description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
-                        type: string
-                      service:
-                        description: |-
-                          Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS Service 配成只选 leader)。
-                          支持 "ns/name" 跨 ns 发现(裸名默认与 ModelRoute 同 ns),让 ModelRoute 可放中心 ns。
-                        type: string
-                    type: object
-                    x-kubernetes-validations:
-                    - message: 'discovery: service 和 selector 必须恰好给一个'
-                      rule: has(self.service) != has(self.selector)
+                      Nginx:可选,默认 true(当 spec.nginx 配了 service/selector);复用 nginx 入口发现,写 monitor 的 nginx: 行
+                      (端口用 spec.nginx.listen,每端口 = 一个模型,name = 本模型)。设 false 关闭。
+                    type: boolean
                   outputConfigMap:
                     description: OutputConfigMap:autoconfig 写 monitor 配置的 ConfigMap("ns/name",多模型共享,每模型一个
                       key)。
                     type: string
                   router:
-                    description: 'Router:可选,默认 true(当配了 spec.cart);把探测到的 CART pod
-                      写进 monitor 的 router: 表(.../workers)。设 false 关闭。'
+                    description: 'Router:可选,默认 true(当配了 spec.cart);复用 spec.cart 发现的
+                      CART pod,写 monitor 的 router: 表(.../workers)。设 false 关闭。'
                     type: boolean
                 required:
                 - outputConfigMap
                 type: object
-              openresty:
-                description: Openresty:openresty 路由。
+              nginx:
+                description: Nginx:nginx(openresty)路由。
                 properties:
                   listen:
                     description: Listen:server 监听端口。
                     type: integer
                   outputConfigMap:
-                    description: OutputConfigMap:openresty 输出 ConfigMap("ns/name",多路由共享,每路由一个
+                    description: OutputConfigMap:输出 ConfigMap("ns/name",多路由共享,每路由一个
                       key)。
                     type: string
                   peers:
@@ -174,7 +154,7 @@ spec:
                           description: |-
                             MaxConcurrencyFromBackend:仅 use:cart 有意义。true = cart 的并发上限动态 = 后端单实例并发 × 后端数
                             (CART 扇出到 N 个后端,总容量=各后端容量之和,随后端扩缩自动变)。设了它就忽略静态 MaxConcurrency。
-                            后端单实例并发取 use:backend 组的 maxConcurrency,没配则取 values.default_max。
+                            后端单实例并发取 use:backend 组的 maxConcurrency —— CEL 校验强制此时它必须 > 0(见 ModelRouteSpec)。
                           type: boolean
                         priority:
                           description: Priority:openresty peer 优先级(CART 优先=1,后端兜底=0)。
@@ -192,34 +172,43 @@ spec:
                     minItems: 1
                     type: array
                   route:
-                    description: Route:路由短名(dict/register 用),如 "glm"。
+                    description: |-
+                      Route:路由短名(openresty dict/register 用,= conf 文件名 session_route_<route>.conf)。
+                      省略 = 用 metadata.name。⚠️ 会做 openresty lua_shared_dict 名(active_conns_<route> 等),
+                      想用简单标识(字母数字/下划线)或 name 含 -/. 时,显式给个短 route。
+                    type: string
+                  selector:
+                    description: Selector:可选;nginx 入口的 pod label 发现(没建 Service 时的兜底)。
+                    type: string
+                  service:
+                    description: |-
+                      Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
+                      端口用本模型的 listen(每端口 = 一个模型)。与 selector 二选一(都配则 service 优先)。
                     type: string
                   values:
                     additionalProperties:
                       type: string
                     description: |-
-                      Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。openresty 加新调优项无需改代码。
+                      Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。nginx 加新调优项无需改代码。
                       常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
                     type: object
                 required:
                 - listen
                 - outputConfigMap
                 - peers
-                - route
                 type: object
             required:
             - discovery
-            - openresty
+            - nginx
             type: object
             x-kubernetes-validations:
-            - message: openresty.peers 用了 cart,但没配 spec.cart
-              rule: '!self.openresty.peers.exists(s, s.use == ''cart'') || has(self.cart)'
+            - message: nginx.peers 用了 cart,但没配 spec.cart
+              rule: '!self.nginx.peers.exists(s, s.use == ''cart'') || has(self.cart)'
             - message: cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(>
                 0)作乘数
-              rule: '!self.openresty.peers.exists(s, s.use == ''cart'' && has(s.maxConcurrencyFromBackend)
-                && s.maxConcurrencyFromBackend) || self.openresty.peers.exists(s,
-                s.use == ''backend'' && has(s.maxConcurrency) && s.maxConcurrency
-                > 0)'
+              rule: '!self.nginx.peers.exists(s, s.use == ''cart'' && has(s.maxConcurrencyFromBackend)
+                && s.maxConcurrencyFromBackend) || self.nginx.peers.exists(s, s.use
+                == ''backend'' && has(s.maxConcurrency) && s.maxConcurrency > 0)'
           status:
             description: ModelRouteStatus 是 controller 回写的观测状态。
             properties:

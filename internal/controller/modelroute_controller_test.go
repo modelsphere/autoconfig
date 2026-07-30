@@ -45,7 +45,7 @@ func TestReconcileGLM(t *testing.T) {
 			Cart: &routingv1.CartSpec{
 				Service: "cart-glm", Port: 8071, OutputConfigMap: "glm/cart-config", MaxLoad: 20,
 			},
-			Openresty: routingv1.OpenrestySpec{
+			Nginx: routingv1.NginxSpec{
 				Route: "glm", Listen: 18083, OutputConfigMap: "openresty/openresty-conf",
 				Values: map[string]string{"ttft_limit_ms": "60000"},
 				Peers: []routingv1.RoutePeer{

@@ -115,19 +115,19 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// 3) openresty:按 peers 组(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
+	// 3) nginx:按 peers 组(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
 	peersByTarget := map[string][]config.Peer{"backend": backends, "cart": cartPeers}
 	// 后端单实例并发(供 cart 动态并发用):backend 组的 maxConcurrency。
 	// CEL 校验保证「maxConcurrencyFromBackend → backend.maxConcurrency>0」,故不需 default_max 兜底;
-	// 万一为 0(校验被绕过),cart 并发=0 → 运行时 openresty 用 conf 里的 default_max 兜。
+	// 万一为 0(校验被绕过),cart 并发=0 → 运行时 nginx 用 conf 里的 default_max 兜。
 	backendPerInstance := 0
-	for _, s := range rb.Spec.Openresty.Peers {
+	for _, s := range rb.Spec.Nginx.Peers {
 		if s.Use == "backend" && s.MaxConcurrency > 0 {
 			backendPerInstance = s.MaxConcurrency
 		}
 	}
 	var sources []config.RouteSource
-	for _, s := range rb.Spec.Openresty.Peers {
+	for _, s := range rb.Spec.Nginx.Peers {
 		if s.Use == "cart" && rb.Spec.Cart == nil {
 			continue // 声明了 cart 来源但没配 cart,跳过
 		}
@@ -137,27 +137,29 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc})
 	}
+	route := nginxRoute(&rb)
 	conf, err := sink.RenderRoute(sink.RouteData{
-		Route:  rb.Spec.Openresty.Route,
-		Listen: rb.Spec.Openresty.Listen,
-		Extra:  rb.Spec.Openresty.Values, // 任意调优项,原样渲染
+		Route:  route,
+		Listen: rb.Spec.Nginx.Listen,
+		Extra:  rb.Spec.Nginx.Values, // 任意调优项,原样渲染
 		Peers:  sink.ResolveSources(peersByTarget, sources, "backend"),
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render route: %w", err)
 	}
-	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Openresty.OutputConfigMap,
-		map[string]string{openrestyKey(rb.Spec.Openresty.Route): conf}); err != nil {
-		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Openresty.OutputConfigMap, err)
+	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Nginx.OutputConfigMap,
+		map[string]string{openrestyKey(route): conf}); err != nil {
+		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
 	}
 
 	// 4) monitor(可选):service(后端)+ nginx(openresty 入口)+ router(CART)行(共享 ConfigMap,每模型一个 key)
 	if m := rb.Spec.Monitor; m != nil {
 		var nginxPeers, routerPeers []config.Peer
 		nginxName := ""
-		if n := m.Nginx; n != nil { // 探测 openresty 入口 pod
-			// 端口用【本模型的 openresty.listen】→ monitor 每个 nginx 端口代表一个模型(每模型独立 key,不 dedup)
-			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(n.Service, n.Selector, rb.Spec.Openresty.Listen, n.IncludeNotReady, rb.Namespace))
+		// nginx: 行 —— 复用 spec.nginx 的入口 Service/selector(默认开;spec.monitor.nginx:false 关;没配 service/selector 则跳过)
+		if (m.Nginx == nil || *m.Nginx) && (rb.Spec.Nginx.Service != "" || rb.Spec.Nginx.Selector != "") {
+			// 端口用【本模型的 nginx.listen】→ monitor 每个 nginx 端口代表一个模型(每模型独立 key,不 dedup)
+			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(rb.Spec.Nginx.Service, rb.Spec.Nginx.Selector, rb.Spec.Nginx.Listen, false, rb.Namespace))
 			if err != nil {
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil
@@ -183,6 +185,14 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // openrestyKey 是这条路由在 openresty ConfigMap 里的 key(= 文件名)。
 func openrestyKey(route string) string { return "session_route_" + route + ".conf" }
+
+// nginxRoute 返回本路由的短名:spec.nginx.route 优先,省略则用 metadata.name。
+func nginxRoute(rb *routingv1.ModelRoute) string {
+	if rb.Spec.Nginx.Route != "" {
+		return rb.Spec.Nginx.Route
+	}
+	return rb.Name
+}
 
 // monitorKey 是这个模型在共享 monitor ConfigMap 里的 key。
 func monitorKey(name string) string { return name + ".monitor.conf" }
@@ -232,7 +242,7 @@ func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routin
 			return err
 		}
 	}
-	if err := r.removeConfigMapKey(ctx, rb.Spec.Openresty.OutputConfigMap, openrestyKey(rb.Spec.Openresty.Route), rb.Namespace); err != nil {
+	if err := r.removeConfigMapKey(ctx, rb.Spec.Nginx.OutputConfigMap, openrestyKey(nginxRoute(rb)), rb.Namespace); err != nil {
 		return err
 	}
 	if m := rb.Spec.Monitor; m != nil {
@@ -386,7 +396,7 @@ func referencesPodBySelector(mr *routingv1.ModelRoute, podNS string, podLabels m
 	if c := mr.Spec.Cart; c != nil && sel(c.Service, c.Selector) {
 		return true
 	}
-	if m := mr.Spec.Monitor; m != nil && m.Nginx != nil && sel(m.Nginx.Service, m.Nginx.Selector) {
+	if sel(mr.Spec.Nginx.Service, mr.Spec.Nginx.Selector) { // nginx 入口 selector 路径
 		return true
 	}
 	return false
@@ -428,7 +438,7 @@ func referencesService(mr *routingv1.ModelRoute, ns, svc string) bool {
 	if c := mr.Spec.Cart; c != nil && match(c.Service) {
 		return true
 	}
-	if m := mr.Spec.Monitor; m != nil && m.Nginx != nil && match(m.Nginx.Service) {
+	if match(mr.Spec.Nginx.Service) { // nginx 入口 Service(供 monitor nginx 行);扩缩即时重算
 		return true
 	}
 	return false

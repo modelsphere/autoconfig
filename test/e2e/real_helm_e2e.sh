@@ -3,12 +3,12 @@
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.17 bash real_helm_e2e.sh [--keep]
+#   IMG_TAG=0.3.18 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-helm}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.17}
+TAG=${IMG_TAG:-0.3.18}
 CHARTS=${CHARTS:-$HERE/charts}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
@@ -81,16 +81,17 @@ metadata: { name: glm }
 spec:
   discovery: { service: be-svc, port: 8050 }
   cart: { service: cart, port: 8071, outputConfigMap: $NS/cart-config, maxLoad: 20 }
-  openresty:
+  nginx:
     route: glm
     listen: 18083
     outputConfigMap: $NS/openresty-conf
+    service: openresty                     # nginx 入口(openresty chart Service)→ monitor nginx 行
     peers: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
   monitor:
     outputConfigMap: $NS/monitor-conf
     model: glm-5.1-fp8
     gpuType: H100
-    nginx: { service: openresty, port: 18083 }   # 探测 openresty chart 的 Service → nginx: 行
+    # nginx/router 默认开(配了 spec.nginx.service 和 cart)
 YAML
 
 # controller 写出内容(权威 ConfigMap)

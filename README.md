@@ -15,7 +15,7 @@
 
 | 组件 | 镜像 | 角色 |
 |---|---|---|
-| **controller** | `autoconfig`（`cmd/`） | 唯一发现逻辑 + RBAC 一处；watch ModelRoute + EndpointSlice → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
+| **controller** | `autoconfig`（`cmd/`） | 唯一发现逻辑 + RBAC 一处；watch ModelRoute + EndpointSlice + Pod → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
 | **reload sidecar** | `autoconfig-reload`（`cmd/reload`） | 跑在消费方 pod 里，watch 挂载的 ConfigMap 文件，变化就 `kill -HUP` 主进程（靠 `shareProcessNamespace`）。CART / openresty 收 SIGHUP 优雅重载。 |
 | **hagate sidecar** | `autoconfig-hagate`（`cmd/hagate`） | 消费方 **master-standby**：2 副本都保持 Ready，但只有持 Lease 的 leader 给自己 pod 打 `<name>-active=true` 标签；Service selector 带这个标签 → **只有 leader 进 endpoints**。用标签而非 readiness 门控，standby 不会永久 NotReady 卡住滚动。 |
 
@@ -29,12 +29,12 @@
 `ModelRoute`（`routing.gpucluster.io/v1alpha1`），一个模型一个对象。字段说明见样例
 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。一条 ModelRoute 可同时驱动：
 
-- **CART 的 workers**（写 cart-config，专属 → ownerRef 级联 GC）；`cart` 段可选，省略 = openresty 直连后端。
-- **openresty 的 peers**（写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。
+- **CART 的 workers**（写 cart-config，专属 → ownerRef 级联 GC）；`cart` 段可选，省略 = nginx 直连后端。
+- **nginx 的 peers**（`spec.nginx`，写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。`route` 省略 = `metadata.name`。
 - **monitor 的三类行**（`spec.monitor`，可选；每模型一个 key）：
-  - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；
-  - `nginx: <svc>-<i> | http://ip:port` —— 探测 openresty 入口 pod（`spec.monitor.nginx` 的 service/selector；跨模型自动 dedup）；
-  - `router: <name>-router-<i> | http://ip:port/workers` —— 复用已探测的 CART pod（有 `spec.cart` 时默认开，`spec.monitor.router: false` 关）。
+  - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；`model` 省略 = `metadata.name`；
+  - `nginx: <svc>-<i> | http://ip:port` —— **复用 `spec.nginx.service/selector`** 探测 nginx 入口（配了就默认开，`spec.monitor.nginx: false` 关）；
+  - `router: <name>-router-<i> | http://ip:port/workers` —— **复用 `spec.cart`** 发现的 CART pod（有 `spec.cart` 时默认开，`spec.monitor.router: false` 关）。
   - monitor 自身每 60s 热加载 monitor.conf、**无需 reload sidecar**（区别于 openresty/CART）；消费方把该 ConfigMap 挂进 monitor pod 即可。
 
 ## 消费方接入

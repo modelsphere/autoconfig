@@ -27,11 +27,12 @@ modelRoutes: []
 #    spec:
 #      discovery: { service: glm-leader, port: 8050 }
 #      cart: { service: cart-glm, outputConfigMap: glm/cart-config, maxLoad: 20 }   # 底稿由 cart chart 建,autoconfig 只填 workers
-#      openresty:
-#        route: glm
+#      nginx:
+#        route: glm                       # 省略 = metadata.name
 #        listen: 18083
 #        outputConfigMap: openresty/openresty-conf
-#        sources: [ { use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 } ]
+#        service: openresty/openresty     # 可选:nginx 入口 → monitor nginx 行
+#        peers: [ { use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 } ]
 
 nameOverride: ""
 fullnameOverride: ""

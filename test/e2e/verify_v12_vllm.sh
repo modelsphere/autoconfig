@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 验证 0.3.17 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
+# 验证 0.3.18 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
 #   Q5 sources→peers、Q4 values 任意 key、Q1 monitor nginx 每端口(port=openresty.listen、name=model)
 #   + backend maxConcurrency、+ 真推理 openresty→CART→vllm。
-# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.17)。用法:bash verify_v12_vllm.sh
+# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.18)。用法:bash verify_v12_vllm.sh
 set -uo pipefail
 NS=${NS:-kimi}
 BACKEND_SVC=${BACKEND_SVC:-e2e-test/vllm-mock-vllm-svc}
@@ -22,10 +22,11 @@ metadata: { name: opt }
 spec:
   discovery: { service: $BACKEND_SVC }        # 跨 ns,port 自动=8000
   cart: { service: cart, outputConfigMap: $NS/cart-config, maxLoad: 20 }
-  openresty:
+  nginx:
     route: opt
     listen: $LISTEN
     outputConfigMap: $NS/openresty-conf
+    service: openresty                         # nginx 入口 Service → monitor nginx 行(端口用 listen $LISTEN)
     values: { ttft_limit_ms: "60000", zz_custom_tunable: "7" }   # 任意 key:自定义的也渲染
     peers:
       - { use: cart,    priority: 1, maxConcurrencyFromBackend: true }   # 动态=后端并发 × 后端数
@@ -34,7 +35,7 @@ spec:
     outputConfigMap: $NS/monitor-conf
     model: $MODEL_LABEL
     gpuType: A100
-    nginx: { service: openresty }              # 无 port → 用 openresty.listen($LISTEN)
+    # nginx/router 默认开(配了 spec.nginx.service 和 cart)
 YAML
 waiteq true "status.ready" kubectl -n "$NS" get mr opt -o jsonpath='{.status.ready}'
 waiteq 1 "status.backends(vllm-mock,跨 ns)" kubectl -n "$NS" get mr opt -o jsonpath='{.status.backends}'

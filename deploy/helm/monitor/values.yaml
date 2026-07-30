@@ -9,7 +9,7 @@ replicas: 1                # 单 active:monitor 的采集/告警是自主循环,
 # ha 默认关(见上):monitor 不适合 readiness 门控式主备。留字段便于将来接「leader 门控进程」。
 ha:
   enabled: false
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.17
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.18
   port: 8081
   appTcp: "127.0.0.1:8080"
 
