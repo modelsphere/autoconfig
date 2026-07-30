@@ -27,9 +27,9 @@ autoconfig 让路由器配置跟着实时收敛。
 
 **验证状态**(别混淆两层):
 - **CRD controller**(现版):k8s-cpu-20 + **mock 后端**已验——发现分桶、**写出的 cart-config/openresty-conf/monitor-conf ConfigMap 内容正确**、status、scale 跟随、fail-safe、删除清理(finalizer/ownerRef)、`make install`/`make deploy`。即验到「autoconfig 写对 ConfigMap」为止。
-- **真 openresty(0.1.0-routes)+ 真 CART(v0.6.0)+ 真 monitor 端到端接入**(真 reload/serve):见 `test/e2e/real_e2e.sh`。
+- **真 openresty + 真 CART + 真 monitor 端到端接入**(经 helm chart,真 reload/serve):见 `test/e2e/real_helm_e2e.sh`;真后端(kimi LWS / vllm)见 `real_kimi_e2e.sh` / `verify_v12_vllm.sh`。
 
-> 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「用法」+ [`docs/crd-design.md`](docs/crd-design.md)。
+> 配置一律用 **`ModelRoute` CRD**(一个模型一条),详见下方「用法」+ 样例 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。
 > (早期的 ConfigMap 驱动「agent 模式」已移除。)
 > **monitor** 也可由 autoconfig 配置(`spec.monitor`,可选),自动探测 + 生成三类行,写进共享 monitor ConfigMap(每模型一个 key):
 > - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端(每实例一行);
@@ -48,7 +48,7 @@ openresty `nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/route
 
 autoconfig controller 的输入是 **`ModelRoute`(routing.gpucluster.io/v1alpha1)**,一个模型一个对象;`kubectl apply` 当场校验、
 `kubectl get modelroute` 直接看发现了几个后端/CART/ready。**发现(`internal/discovery`)、渲染(`internal/sink`)、
-reload sidecar 全部复用**,只是「输入」变 CR、多回写 `status`。设计见 [`docs/crd-design.md`](docs/crd-design.md)。
+reload sidecar 全部复用**,只是「输入」变 CR、多回写 `status`。字段说明见样例 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。
 
 **Helm 部署(推荐)** —— chart 在 `deploy/helm/autoconfig/`(含 CRD + SA/RBAC + Deployment):
 ```bash
