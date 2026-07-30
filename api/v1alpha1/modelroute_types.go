@@ -83,7 +83,8 @@ type MonitorSpec struct {
 	OutputConfigMap string `json:"outputConfigMap"`
 	// Model:monitor service 行的 model 字段(served-model-name);省略 = metadata.name。
 	Model string `json:"model,omitempty"`
-	// GPUType:monitor service 行的 gpu_type 字段(如 H100 / B300 / H200)。
+	// GPUType:monitor service 行的 gpu_type 字段(如 H100 / A100 / H200)。省略 = 从后端所在节点的
+	// GPU label(nvidia.com/gpu.product,GFD 打)自动推导成短名;推不出(无 label / 无 GFD)则留空。显式配则覆盖。
 	GPUType string `json:"gpuType,omitempty"`
 	// Nginx:可选,默认 true(当 spec.nginx 配了 service/selector);复用 nginx 入口发现,写 monitor 的 nginx: 行
 	//(端口用 spec.nginx.listen,每端口 = 一个模型,name = 本模型)。设 false 关闭。

@@ -112,3 +112,21 @@ func TestDerivePortFromSlice(t *testing.T) {
 		t.Error("多端口未配 port 应报错")
 	}
 }
+
+// normalizeGPUProduct:GFD 值取型号短名。
+func TestNormalizeGPUProduct(t *testing.T) {
+	cases := map[string]string{
+		"NVIDIA-A100-SXM4-80GB": "A100",
+		"NVIDIA-H100-80GB-HBM3": "H100",
+		"NVIDIA-H200":           "H200",
+		"NVIDIA-A800-80GB":      "A800",
+		"Tesla-V100-SXM2-16GB":  "V100",
+		"":                      "",
+		"weird":                 "weird",
+	}
+	for in, want := range cases {
+		if got := normalizeGPUProduct(in); got != want {
+			t.Errorf("normalizeGPUProduct(%q)=%q want %q", in, got, want)
+		}
+	}
+}

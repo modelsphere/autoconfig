@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -22,6 +23,74 @@ import (
 
 // serviceNameLabel:EndpointSlice 靠这个 label 归属到 Service(单 Service >100 端点会分多片,全按此聚合)。
 const serviceNameLabel = "kubernetes.io/service-name"
+
+// gpuProductLabel:NVIDIA GPU Feature Discovery(GFD)给节点打的 GPU 型号 label,
+// 值如 "NVIDIA-A100-SXM4-80GB" / "NVIDIA-H100-80GB-HBM3" / "NVIDIA-H200"。
+const gpuProductLabel = "nvidia.com/gpu.product"
+
+// GPUType 推导 target 后端所在节点的 GPU 型号:取第一个就绪端点的 nodeName → 读 node 的 gpu.product label →
+// 归一化成短名(A100/H100/H200…)。推不出(无端点/节点无 GPU label/无 node 读权限)返回 ""。
+func GPUType(ctx context.Context, cs kubernetes.Interface, t config.Target) string {
+	node := firstNodeName(ctx, cs, t)
+	if node == "" {
+		return ""
+	}
+	n, err := cs.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+	if err != nil {
+		return ""
+	}
+	return normalizeGPUProduct(n.Labels[gpuProductLabel])
+}
+
+// firstNodeName 取 target 第一个就绪端点所在的 nodeName(Service 走 EndpointSlice.nodeName,selector 走 pod.spec.nodeName)。
+func firstNodeName(ctx context.Context, cs kubernetes.Interface, t config.Target) string {
+	if t.Service != "" {
+		slices, err := cs.DiscoveryV1().EndpointSlices(t.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: serviceNameLabel + "=" + t.Service,
+		})
+		if err != nil {
+			return ""
+		}
+		for i := range slices.Items {
+			for _, ep := range slices.Items[i].Endpoints {
+				ready := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+				if ready && ep.NodeName != nil && *ep.NodeName != "" {
+					return *ep.NodeName
+				}
+			}
+		}
+		return ""
+	}
+	pods, err := cs.CoreV1().Pods(t.Namespace).List(ctx, metav1.ListOptions{LabelSelector: t.Selector})
+	if err != nil {
+		return ""
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning && p.Spec.NodeName != "" {
+			return p.Spec.NodeName
+		}
+	}
+	return ""
+}
+
+// normalizeGPUProduct 把 GFD 的 gpu.product 值取出型号短名:"NVIDIA-A100-SXM4-80GB" → "A100"、
+// "NVIDIA-H100-80GB-HBM3" → "H100"、"NVIDIA-H200" → "H200"。GFD 值格式 = <厂商>-<型号>-<形态>-<显存>,
+// 型号恒在厂商前缀之后。认不出格式则原样返回(至少保留信息)。
+func normalizeGPUProduct(product string) string {
+	if product == "" {
+		return ""
+	}
+	parts := strings.Split(product, "-")
+	i := 0
+	if len(parts) > 1 && (strings.EqualFold(parts[0], "NVIDIA") || strings.EqualFold(parts[0], "Tesla")) {
+		i = 1 // 跳过厂商前缀,型号是下一段
+	}
+	if i < len(parts) && parts[i] != "" {
+		return parts[i]
+	}
+	return product
+}
 
 // Discover returns the current endpoints for one target (sorted, deduped).
 func Discover(ctx context.Context, cs kubernetes.Interface, t config.Target) ([]config.Peer, error) {

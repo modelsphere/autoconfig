@@ -32,7 +32,7 @@
 - **CART 的 workers**（写 cart-config，专属 → ownerRef 级联 GC）；`cart` 段可选，省略 = nginx 直连后端。
 - **nginx 的 peers**（`spec.nginx`，写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。`route` 省略 = `metadata.name`。
 - **monitor 的三类行**（`spec.monitor`，可选；每模型一个 key）：
-  - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；`model` 省略 = `metadata.name`；
+  - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；`model` 省略 = `metadata.name`；`gpu_type` 省略 = 从后端节点的 `nvidia.com/gpu.product`（GFD）自动推导；
   - `nginx: <svc>-<i> | http://ip:port` —— **复用 `spec.nginx.service/selector`** 探测 nginx 入口（配了就默认开，`spec.monitor.nginx: false` 关）；
   - `router: <name>-router-<i> | http://ip:port/workers` —— **复用 `spec.cart`** 发现的 CART pod（有 `spec.cart` 时默认开，`spec.monitor.router: false` 关）。
   - monitor 自身每 60s 热加载 monitor.conf、**无需 reload sidecar**（区别于 openresty/CART）；消费方把该 ConfigMap 挂进 monitor pod 即可。

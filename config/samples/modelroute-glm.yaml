@@ -3,7 +3,7 @@
 apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
-  name: glm-5.1-fp8
+  name: glm-5.1                       # ← 短标识即可;served-model-name 在 monitor.model 单独给(见下)
   namespace: routing                 # ← 中心 ns;后端/组件都在别的 ns,靠下面的 ns/name 跨 ns 发现
 spec:
   discovery:                         # 后端桶(喂 CART workers + nginx backend 来源)
@@ -15,9 +15,9 @@ spec:
     outputConfigMap: glm/cart-glm-config  # 本模型专属 = cart chart 的 <fullname>-config(cart-glm → cart-glm-config);autoconfig 只重填 workers 段
     maxLoad: 20                      # 每 worker 的 max_load(默认 20)
   nginx:                             # nginx(openresty)路由
-    route: glm                       # 省略 = metadata.name(glm-5.1-fp8);这里给短名做 openresty dict 名(active_conns_glm 等)
+    # route 省略 = metadata.name(glm-5.1);= conf 文件名 session_route_<route>.conf + openresty dict 名
     listen: 18083
-    outputConfigMap: openresty/openresty-conf   # 【共享】一个 nginx 服务所有模型;每模型一个 key(session_route_glm.conf)
+    outputConfigMap: openresty/openresty-conf   # 【共享】一个 nginx 服务所有模型;每模型一个 key(session_route_glm-5.1.conf)
     service: openresty/openresty     # 可选:nginx 入口 Service(ns/name)→ monitor 的 nginx: 行(端口用上面的 listen)+ 入口 pod 扩缩事件驱动
     values:                          # 任意调优项,原样渲染进 lua(nginx 加新项无需改代码;数字不加引号)
       ttft_limit_ms: "60000"
@@ -26,8 +26,10 @@ spec:
       - { use: cart,    priority: 1, maxConcurrencyFromBackend: true }   # 动态并发=后端单实例 × 后端数(随扩缩自动变)
       - { use: backend, priority: 0, maxConcurrency: 120 }               # 后端单实例并发 120(cart 动态并发的乘数)
   monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
-    outputConfigMap: monitor/monitor-conf   # 【共享】一个 monitor 看所有模型;每模型一个 key(glm-5.1-fp8.monitor.conf)
-    gpuType: H100                    # model 省略 = metadata.name(glm-5.1-fp8)
+    outputConfigMap: monitor/monitor-conf   # 【共享】一个 monitor 看所有模型;每模型一个 key(glm-5.1.monitor.conf)
+    model: glm-5.1-fp8               # served-model-name;省略则用 metadata.name(glm-5.1)。名字比 CR 详细时在这给
+    # gpuType 省略 = 从后端所在节点的 GPU label(nvidia.com/gpu.product,GFD)自动推导成 H100/A100/…;推不出或想覆盖才显式写:
+    # gpuType: H100
     # nginx / router 默认都开(因为上面配了 spec.nginx.service 和 spec.cart);各自复用那边的发现,不用再配一遍。设 false 关:
     # nginx: false                   #   关 monitor 的 nginx: 行
     # router: false                  #   关 monitor 的 router: 行(.../workers)
@@ -43,7 +45,7 @@ spec:
     # selector 路径按【本 ModelRoute 的 ns】(kimi)发现,不支持 ns/name;port 也可省略(从 containerPort 自动取)
     selector: "leaderworkerset.sigs.k8s.io/name=kimi-k26,leaderworkerset.sigs.k8s.io/worker-index=0"
   nginx:
-    route: k26                       # 省略 = metadata.name(kimi-k2.6);name 含 -/. 时建议给短名(做 openresty dict 名)
+    # route 省略 = metadata.name(kimi-k2.6)→ session_route_kimi-k2.6.conf
     listen: 18082
     outputConfigMap: openresty/openresty-conf
     peers:

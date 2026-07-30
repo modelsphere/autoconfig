@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 验证 0.3.18 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
+# 验证 0.3.19 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
 #   Q5 sources→peers、Q4 values 任意 key、Q1 monitor nginx 每端口(port=openresty.listen、name=model)
 #   + backend maxConcurrency、+ 真推理 openresty→CART→vllm。
-# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.18)。用法:bash verify_v12_vllm.sh
+# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.19)。用法:bash verify_v12_vllm.sh
 set -uo pipefail
 NS=${NS:-kimi}
 BACKEND_SVC=${BACKEND_SVC:-e2e-test/vllm-mock-vllm-svc}
@@ -34,7 +34,7 @@ spec:
   monitor:
     outputConfigMap: $NS/monitor-conf
     model: $MODEL_LABEL
-    gpuType: A100
+    # gpuType 省略 → 从 vllm-mock 所在节点的 nvidia.com/gpu.product(GFD)自动推导(此集群节点=A100)
     # nginx/router 默认开(配了 spec.nginx.service 和 cart)
 YAML
 waiteq true "status.ready" kubectl -n "$NS" get mr opt -o jsonpath='{.status.ready}'
@@ -55,7 +55,7 @@ for i in $(seq 1 30); do kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.dat
 MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.opt\.monitor\.conf}')
 echo "--- opt.monitor.conf ---"; echo "$MON"
 echo "$MON" | grep -qE "^nginx: $MODEL_LABEL-0 \| http://.+:$LISTEN\$" && ok "nginx:name=model、port=openresty.listen($LISTEN)" || bad "nginx 行不对"
-echo "$MON" | grep -qE "^service: opt-0 \| http://.+:8000 \| $MODEL_LABEL \| A100\$" && ok "service:后端 port 自动=8000(EndpointSlice 取)" || bad "service 行不对"
+echo "$MON" | grep -qE "^service: opt-0 \| http://.+:8000 \| $MODEL_LABEL \| A100\$" && ok "service:port 自动=8000(EndpointSlice)+ gpu_type 自动=A100(节点 GFD label 推导)" || bad "service 行不对(port/gpu_type)"
 
 echo "=== 真推理 openresty:$LISTEN → CART → vllm-mock(opt-125m)==="
 # 等挂载传播 + reload

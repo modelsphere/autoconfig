@@ -50,6 +50,7 @@ type ModelRouteReconciler struct {
 // +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 
 func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -81,9 +82,10 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// 1) 发现后端桶(喂 CART workers + openresty backend 来源)
-	backends, err := discovery.Discover(ctx, r.Clientset, discoveryTarget(
-		rb.Spec.Discovery.Service, rb.Spec.Discovery.Selector, rb.Spec.Discovery.Port, rb.Spec.Discovery.IncludeNotReady, rb.Namespace))
+	// 1) 发现后端桶(喂 CART workers + nginx backend 来源)
+	backendTarget := discoveryTarget(
+		rb.Spec.Discovery.Service, rb.Spec.Discovery.Selector, rb.Spec.Discovery.Port, rb.Spec.Discovery.IncludeNotReady, rb.Namespace)
+	backends, err := discovery.Discover(ctx, r.Clientset, backendTarget)
 	if err != nil {
 		// 发现失败(如端口不唯一、Service 不存在):写进 status 让 kubectl describe 看得到,而非只进日志
 		r.setStatus(ctx, req.NamespacedName, 0, 0, false, "DiscoverError", fmt.Sprintf("discover backends: %v", err))
@@ -171,7 +173,12 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if rb.Spec.Cart != nil && (m.Router == nil || *m.Router) { // 复用已探测的 CART pod 作 router
 			routerPeers = cartPeers
 		}
-		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, nginxName, backends, nginxPeers, routerPeers)
+		// gpuType:显式配了用显式;否则从后端所在节点的 GPU label 自动推导(推不出留空)
+		gpuType := m.GPUType
+		if gpuType == "" {
+			gpuType = discovery.GPUType(ctx, r.Clientset, backendTarget)
+		}
+		monConf := sink.RenderMonitor(rb.Name, m.Model, gpuType, nginxName, backends, nginxPeers, routerPeers)
 		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
 			map[string]string{monitorKey(rb.Name): monConf}); err != nil {
 			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), m.OutputConfigMap, err)
