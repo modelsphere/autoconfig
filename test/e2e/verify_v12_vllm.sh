@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 验证 0.3.15 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
+# 验证 0.3.16 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
 #   Q5 sources→peers、Q4 values 任意 key、Q1 monitor nginx 每端口(port=openresty.listen、name=model)
 #   + backend maxConcurrency、+ 真推理 openresty→CART→vllm。
-# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.15)。用法:bash verify_v12_vllm.sh
+# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.16)。用法:bash verify_v12_vllm.sh
 set -uo pipefail
 NS=${NS:-kimi}
 BACKEND_SVC=${BACKEND_SVC:-e2e-test/vllm-mock-vllm-svc}

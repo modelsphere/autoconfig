@@ -47,7 +47,7 @@ type RoutePeer struct {
 	MaxConcurrency int `json:"maxConcurrency,omitempty"`
 	// MaxConcurrencyFromBackend:仅 use:cart 有意义。true = cart 的并发上限动态 = 后端单实例并发 × 后端数
 	// (CART 扇出到 N 个后端,总容量=各后端容量之和,随后端扩缩自动变)。设了它就忽略静态 MaxConcurrency。
-	// 后端单实例并发取 use:backend 组的 maxConcurrency,没配则取 values.default_max。
+	// 后端单实例并发取 use:backend 组的 maxConcurrency —— CEL 校验强制此时它必须 > 0(见 ModelRouteSpec)。
 	// +optional
 	MaxConcurrencyFromBackend bool `json:"maxConcurrencyFromBackend,omitempty"`
 }

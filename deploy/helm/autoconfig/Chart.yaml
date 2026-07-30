@@ -2,7 +2,7 @@ apiVersion: v2
 name: autoconfig
 description: k8s 后端发现 → 自动同步 openresty peers / cache-aware-router workers(ModelRoute controller)
 type: application
-version: 0.3.15        # chart 版本
-appVersion: "0.3.15"   # 镜像版本(image.tag 缺省用它)
+version: 0.3.16        # chart 版本
+appVersion: "0.3.16"   # 镜像版本(image.tag 缺省用它)
 keywords: [routing, openresty, cache-aware-router, service-discovery, operator]
 home: https://gitlab.4pd.io/inference-production-stack/autoconfig

@@ -18,7 +18,7 @@ func RenderCart(base string, peers []config.Peer, maxLoad int) (string, error) {
 	if base == "" {
 		base = cartDefaultBase
 	}
-	if maxLoad == 0 {
+	if maxLoad <= 0 {
 		maxLoad = 20
 	}
 	doc := map[string]interface{}{}

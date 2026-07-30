@@ -14,7 +14,7 @@ import (
 )
 
 // Run watches watchPath (its dir, since ConfigMap updates swap the ..data symlink) and, on change,
-// SIGHUPs the process whose /proc/<pid>/cmdline contains procMatch. Blocks. Needs shareProcessNamespace.
+// SIGHUPs the process whose argv[0] matches procMatch (see findPID). Blocks. Needs shareProcessNamespace.
 func Run(watchPath, procMatch string) error {
 	if watchPath == "" || procMatch == "" {
 		return fmt.Errorf("reload mode needs --watch and --process")

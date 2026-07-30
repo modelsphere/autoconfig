@@ -63,6 +63,9 @@ func Run(c Config) error {
 		}
 	}()
 
+	// stopping:收到信号后置真,永久强制 want=false —— 协调循环从此不会再把标签打回来。
+	var stopping atomic.Bool
+
 	// 信号 → 取消 ctx(RunOrDie 收到后 ReleaseOnCancel 释放 Lease)
 	ctx, cancel := context.WithCancel(context.Background())
 	sigc := make(chan os.Signal, 1)
@@ -70,27 +73,35 @@ func Run(c Config) error {
 	go func() {
 		<-sigc
 		log.Printf("signal received, releasing lease + label (%s)", c.Identity)
-		_ = setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, false) // 先摘标签,Service 立刻剔除本 pod
+		stopping.Store(true)                                                        // 先封死 want,再摘标签,防协调循环抢回
+		_ = setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, false) // 摘标签,Service 立刻剔除本 pod
 		cancel()
 	}()
 
 	// 标签协调(level-triggered):每轮读 pod 【实际】标签,与 desired(leader 且 appTCP 可连)不符就纠正。
 	// 不用内部 have 猜 —— 标签被外部弄掉(手删/别的东西改)也能自愈,不会「以为 active 其实没标签→零端点断流」。
 	go func() {
-		for {
-			want := leader.Load() && (c.AppTCP == "" || dialOK(c.AppTCP))
+		reconcile := func(want bool) {
 			actual, err := podHasLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal)
 			if err != nil {
 				log.Printf("read pod label: %v", err)
-			} else if actual != want {
+				return
+			}
+			if actual != want {
 				if err := setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, want); err != nil {
 					log.Printf("set label %s=%v: %v", c.LabelKey, want, err)
 				} else {
 					log.Printf("pod %s active=%v (reconciled, actual was %v)", c.Identity, want, actual)
 				}
 			}
+		}
+		for {
+			// stopping 后恒 false:即使这轮的 want 是在信号到来前算出的(TOCTOU),下面 ctx.Done 分支
+			// 会在退出前把标签再摘一次兜底 —— 循环最后一个写动作一定是「移除」。
+			reconcile(!stopping.Load() && leader.Load() && (c.AppTCP == "" || dialOK(c.AppTCP)))
 			select {
 			case <-ctx.Done():
+				reconcile(false) // 退出前最后一次:确保将死 pod 不残留 active 标签(Service 立即剔除)
 				return
 			case <-time.After(2 * time.Second):
 			}
