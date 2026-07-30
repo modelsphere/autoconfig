@@ -6,8 +6,8 @@ metadata:
   namespace: glm
 spec:
   discovery:                         # 后端桶(喂 CART workers + openresty backend 来源)
-    service: glm-leader              # 走 EndpointSlice(该 Service 只选 leader);或用 selector
-    port: 8050
+    service: glm-leader              # 走 EndpointSlice(该 Service 只选 leader,与本 ModelRoute 同 ns);或用 selector
+    # port 省略 → 从 Service 的 EndpointSlice 自动取(单端口);多端口/selector 才需显式写 port: 8050
   cart:                              # 可选;省略 = openresty 直连后端
     service: cart-glm                # CART pod 的发现(供 openresty 的 cart 来源)
     port: 8071

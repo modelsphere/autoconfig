@@ -11,8 +11,9 @@ type Discovery struct {
 	Service string `json:"service,omitempty"`
 	// Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
 	Selector string `json:"selector,omitempty"`
-	// Port:服务端口(配 pod IP)。
-	Port int `json:"port"`
+	// Port:后端服务端口(配 pod IP)。省略则自动推导:service 路径从 EndpointSlice 取、selector 路径从 containerPort 取(仅单端口可推)。
+	// +optional
+	Port int `json:"port,omitempty"`
 	// IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
 	IncludeNotReady bool `json:"includeNotReady,omitempty"`
 }
@@ -30,7 +31,9 @@ type CartSpec struct {
 	// CART pod 的发现(供 openresty 的 cart source);service/selector 二选一。
 	Service  string `json:"service,omitempty"`
 	Selector string `json:"selector,omitempty"`
-	Port     int    `json:"port"`
+	// Port:CART 端口。省略则从 EndpointSlice/containerPort 自动推导(单端口)。
+	// +optional
+	Port int `json:"port,omitempty"`
 	// OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
 	OutputConfigMap string `json:"outputConfigMap"`
 	// BaseConfigRef:CART config.yaml 的静态底稿(不含 workers);省略用内置默认。

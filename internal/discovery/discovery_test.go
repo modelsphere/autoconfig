@@ -78,3 +78,37 @@ func eq(a, b []string) bool {
 	}
 	return true
 }
+
+// 端口自动推导:Target.Port==0 时从 EndpointSlice 的 ports 取(唯一端口);多端口报错。
+func TestDerivePortFromSlice(t *testing.T) {
+	i32 := func(v int32) *int32 { return &v }
+	withPorts := func(s *discoveryv1.EndpointSlice, ports ...int32) *discoveryv1.EndpointSlice {
+		for _, p := range ports {
+			s.Ports = append(s.Ports, discoveryv1.EndpointPort{Port: i32(p)})
+		}
+		return s
+	}
+	ep := discoveryv1.Endpoint{Addresses: []string{"10.2.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: boolp(true)}}
+
+	// 单端口 → 自动取 8050
+	cs := fake.NewSimpleClientset(withPorts(slice("k-1", "k", ep), 8050))
+	peers, err := Discover(context.Background(), cs, config.Target{Namespace: "glm", Service: "k"}) // Port 省略
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	if len(peers) != 1 || peers[0].Port != 8050 {
+		t.Fatalf("auto port: got %+v want port 8050", peers)
+	}
+
+	// 显式 port 覆盖自动推导
+	peers, _ = Discover(context.Background(), cs, config.Target{Namespace: "glm", Service: "k", Port: 9000})
+	if peers[0].Port != 9000 {
+		t.Errorf("explicit port override: got %d want 9000", peers[0].Port)
+	}
+
+	// 多端口且未显式配 → 报错
+	cs2 := fake.NewSimpleClientset(withPorts(slice("k-1", "k", ep), 8050, 8060))
+	if _, err := Discover(context.Background(), cs2, config.Target{Namespace: "glm", Service: "k"}); err == nil {
+		t.Error("多端口未配 port 应报错")
+	}
+}

@@ -75,6 +75,7 @@ spec:
                     description: OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
                     type: string
                   port:
+                    description: Port:CART 端口。省略则从 EndpointSlice/containerPort 自动推导(单端口)。
                     type: integer
                   selector:
                     type: string
@@ -84,7 +85,6 @@ spec:
                     type: string
                 required:
                 - outputConfigMap
-                - port
                 type: object
                 x-kubernetes-validations:
                 - message: 'cart: service 和 selector 必须恰好给一个'
@@ -97,7 +97,8 @@ spec:
                     description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
                     type: boolean
                   port:
-                    description: Port:服务端口(配 pod IP)。
+                    description: Port:后端服务端口(配 pod IP)。省略则自动推导:service 路径从 EndpointSlice
+                      取、selector 路径从 containerPort 取(仅单端口可推)。
                     type: integer
                   selector:
                     description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
@@ -106,8 +107,6 @@ spec:
                     description: Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS
                       Service 配成只选 leader)。
                     type: string
-                required:
-                - port
                 type: object
                 x-kubernetes-validations:
                 - message: 'discovery: service 和 selector 必须恰好给一个'
@@ -133,7 +132,8 @@ spec:
                         description: IncludeNotReady:默认 false 只取 Ready 端点(排空中端点自动排除)。
                         type: boolean
                       port:
-                        description: Port:服务端口(配 pod IP)。
+                        description: Port:后端服务端口(配 pod IP)。省略则自动推导:service 路径从 EndpointSlice
+                          取、selector 路径从 containerPort 取(仅单端口可推)。
                         type: integer
                       selector:
                         description: Selector:走 pod label 发现(兜底:没建 Service 的单机/单卡)。
@@ -142,8 +142,6 @@ spec:
                         description: Service:走 EndpointSlice 发现(推荐);该 Service 需只选服务端点(LWS
                           Service 配成只选 leader)。
                         type: string
-                    required:
-                    - port
                     type: object
                     x-kubernetes-validations:
                     - message: 'discovery: service 和 selector 必须恰好给一个'
