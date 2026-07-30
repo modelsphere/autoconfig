@@ -4,12 +4,12 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.13 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.14 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.13}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.14}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -83,6 +83,19 @@ apiVersion: v1
 kind: Service
 metadata: { name: openresty-svc }
 spec: { selector: { app: openresty }, ports: [{ port: 18083, targetPort: 18083 }] }
+---
+# 三个目标 ConfigMap:生产由 helm chart 建;本 mock 测试没装 chart,预建空的(autoconfig 只更新不创建)
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: cart-config }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: openresty-conf }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: monitor-conf }
 ---
 apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute

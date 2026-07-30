@@ -59,12 +59,15 @@ func TestReconcileGLM(t *testing.T) {
 		},
 	}
 	// chart 预建的 cart-config:底稿(server port 6700)+ 占位 workers;autoconfig 剥掉 workers 段重填
-	base := &corev1.ConfigMap{
+	// chart 预建的三个 ConfigMap(autoconfig 只更新不创建);cart-config 带底稿
+	cmCart := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "cart-config", Namespace: "glm"},
 		Data:       map[string]string{"config.yaml": "server: { host: \"0.0.0.0\", port: 6700 }\nworkers: []"},
 	}
+	cmOR := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "openresty"}}
+	cmMon := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "monitor-conf", Namespace: "monitor"}}
 	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(rb, base).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+		WithObjects(rb, cmCart, cmOR, cmMon).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
 	cs := k8sfake.NewSimpleClientset(
 		epslice("glm-leader-1", "glm-leader", "glm", "10.1.0.1", "10.1.0.2"),
 		epslice("cart-glm-1", "cart-glm", "glm", "10.9.0.1"),

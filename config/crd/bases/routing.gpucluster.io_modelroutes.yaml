@@ -214,6 +214,12 @@ spec:
             x-kubernetes-validations:
             - message: openresty.peers 用了 cart,但没配 spec.cart
               rule: '!self.openresty.peers.exists(s, s.use == ''cart'') || has(self.cart)'
+            - message: cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(>
+                0)作乘数
+              rule: '!self.openresty.peers.exists(s, s.use == ''cart'' && has(s.maxConcurrencyFromBackend)
+                && s.maxConcurrencyFromBackend) || self.openresty.peers.exists(s,
+                s.use == ''backend'' && has(s.maxConcurrency) && s.maxConcurrency
+                > 0)'
           status:
             description: ModelRouteStatus 是 controller 回写的观测状态。
             properties:

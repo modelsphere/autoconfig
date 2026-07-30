@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,7 +20,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	routingv1 "autoconfig/api/v1alpha1"
 	"autoconfig/internal/config"
@@ -95,12 +98,14 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 2) CART(可选):渲染 workers 写 cart-config,并发现 CART pod 供 openresty 引用
 	var cartPeers []config.Peer
 	if c := rb.Spec.Cart; c != nil {
-		// 底稿(server/cache/health)来自 chart 建的 cart-config(values.baseConfig);autoconfig 只重填 workers。
-		// 读现有 config.yaml、剥掉旧 workers 段当底稿;读不到(无 chart)则 RenderCart 用内置默认。
-		base := sink.CartBase(r.readConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace))
-		cartYAML := sink.RenderCart(base, backends, c.MaxLoad)
+		// 底稿(server/cache/health)来自 chart 建的 cart-config(values.baseConfig);autoconfig 只覆盖 workers 键。
+		// 读现有 config.yaml 当底稿(YAML 解析,替换 workers);读不到则用内置默认。
+		cartYAML, rerr := sink.RenderCart(r.readConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace), backends, c.MaxLoad)
+		if rerr != nil {
+			return ctrl.Result{}, fmt.Errorf("render cart config: %w", rerr)
+		}
 		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
-			return ctrl.Result{}, fmt.Errorf("write cart configmap: %w", err)
+			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), 0, c.OutputConfigMap, err)
 		}
 		cartPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(c.Service, c.Selector, c.Port, false, rb.Namespace))
 		if err != nil {
@@ -143,7 +148,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Openresty.OutputConfigMap,
 		map[string]string{openrestyKey(rb.Spec.Openresty.Route): conf}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("write openresty configmap: %w", err)
+		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Openresty.OutputConfigMap, err)
 	}
 
 	// 4) monitor(可选):service(后端)+ nginx(openresty 入口)+ router(CART)行(共享 ConfigMap,每模型一个 key)
@@ -167,7 +172,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, nginxName, backends, nginxPeers, routerPeers)
 		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
 			map[string]string{monitorKey(rb.Name): monConf}); err != nil {
-			return ctrl.Result{}, fmt.Errorf("write monitor configmap: %w", err)
+			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), m.OutputConfigMap, err)
 		}
 	}
 
@@ -182,23 +187,15 @@ func openrestyKey(route string) string { return "session_route_" + route + ".con
 // monitorKey 是这个模型在共享 monitor ConfigMap 里的 key。
 func monitorKey(name string) string { return name + ".monitor.conf" }
 
-// writeConfigMap 把 data 的 key merge 进目标 ConfigMap(其余 key 保留),不存在则建。
-// 三个目标 ConfigMap(cart/openresty/monitor)的生命周期都归 helm chart / 手工所有,autoconfig 只更新内容、
-// 不设 ownerRef(避免抢占 chart-created ConfigMap + 每 resync 误标脏触发多余 reload);删 RB 时靠 finalizer 摘 key。
+// writeConfigMap 把 data 的 key merge 进目标 ConfigMap(其余 key 保留)。
+// **只更新已有 ConfigMap,不创建**——三个目标 CM(cart/openresty/monitor)的生命周期都归 helm chart / 手工所有,
+// autoconfig 只改内容(不设 ownerRef、不创建、删 RB 时只摘 key)。不存在则返回 NotFound(由调用方转成 status 提示 + 重试等 chart)。
 func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1.ModelRoute, ref string, data map[string]string) error {
 	ns, name := splitNSName(ref, rb.Namespace)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cm corev1.ConfigMap
-		err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm)
-		if apierrors.IsNotFound(err) {
-			cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Data: map[string]string{}}
-			for k, v := range data {
-				cm.Data[k] = v
-			}
-			return r.Create(ctx, &cm)
-		}
-		if err != nil {
-			return err
+		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm); err != nil {
+			return err // 含 NotFound —— 不创建,交调用方处理
 		}
 		if cm.Data == nil {
 			cm.Data = map[string]string{}
@@ -215,6 +212,16 @@ func (r *ModelRouteReconciler) writeConfigMap(ctx context.Context, rb *routingv1
 		}
 		return r.Update(ctx, &cm)
 	})
+}
+
+// configMapWriteResult 把 writeConfigMap 的错误转成 reconcile 结果:目标 CM 不存在(chart 还没建)→
+// 写 status(ConfigMapMissing)+ 重试等它;其它错误 → 返回让 controller-runtime 退避重试。
+func (r *ModelRouteReconciler) configMapWriteResult(ctx context.Context, nn types.NamespacedName, backends, cartPeers int, ref string, err error) (ctrl.Result, error) {
+	if apierrors.IsNotFound(err) {
+		r.setStatus(ctx, nn, backends, cartPeers, false, "ConfigMapMissing", fmt.Sprintf("目标 ConfigMap %q 不存在(chart 未建?);autoconfig 只更新不创建", ref))
+		return ctrl.Result{RequeueAfter: resyncEvery}, nil
+	}
+	return ctrl.Result{}, fmt.Errorf("write configmap %s: %w", ref, err)
 }
 
 // cleanupSharedKeys 删 RB 时,从各共享 ConfigMap(cart / openresty / 可选 monitor)里摘掉自己那个 key。
@@ -332,9 +339,54 @@ func discoveryTarget(service, selector string, port int, includeNotReady bool, d
 	return config.Target{Namespace: ns, Service: service, Selector: selector, Port: port, IncludeNotReady: includeNotReady}
 }
 
-// SetupWithManager 注册:watch ModelRoute(ConfigMap 不再由 autoconfig 拥有,靠 10s resync 兜底重算)。
+// SetupWithManager 注册:watch ModelRoute + watch EndpointSlice(后端/CART/openresty 端点变化事件驱动,
+// 映射到引用其 Service 的 ModelRoute 立即重算,不用等 10s resync)。
+// 注:selector(pod label)发现路径不经 EndpointSlice,仍靠 resync 兜底。
 func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&routingv1.ModelRoute{}).
+		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice)).
 		Complete(r)
+}
+
+// modelRoutesForEndpointSlice:EndpointSlice 变化 → 找出 discovery/cart/nginx.service 指向其 Service 的 ModelRoute 入队。
+func (r *ModelRouteReconciler) modelRoutesForEndpointSlice(ctx context.Context, obj client.Object) []reconcile.Request {
+	svc := obj.GetLabels()["kubernetes.io/service-name"]
+	if svc == "" {
+		return nil
+	}
+	ns := obj.GetNamespace()
+	var mrs routingv1.ModelRouteList
+	if err := r.List(ctx, &mrs); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range mrs.Items {
+		if referencesService(&mrs.Items[i], ns, svc) {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: mrs.Items[i].Namespace, Name: mrs.Items[i].Name}})
+		}
+	}
+	return reqs
+}
+
+// referencesService 判断 mr 的 discovery/cart/nginx.service 是否指向 (ns, svc)(支持 ns/name 跨 ns)。
+func referencesService(mr *routingv1.ModelRoute, ns, svc string) bool {
+	match := func(ref string) bool {
+		if ref == "" {
+			return false
+		}
+		rns, rname := splitNSName(ref, mr.Namespace)
+		return rns == ns && rname == svc
+	}
+	if match(mr.Spec.Discovery.Service) {
+		return true
+	}
+	if c := mr.Spec.Cart; c != nil && match(c.Service) {
+		return true
+	}
+	if m := mr.Spec.Monitor; m != nil && m.Nginx != nil && match(m.Nginx.Service) {
+		return true
+	}
+	return false
 }

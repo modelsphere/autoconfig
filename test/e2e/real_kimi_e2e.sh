@@ -4,12 +4,12 @@
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.13 bash real_kimi_e2e.sh [--keep]
+#   IMG_TAG=0.3.14 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-kimi}                      # 与 kimi LWS 同 ns(discovery 同 ns)
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.13}
+TAG=${IMG_TAG:-0.3.14}
 CHARTS=${CHARTS:-$HERE/charts}
 KIMI_SVC=${KIMI_SVC:-kimi-k26-leader}
 MODEL=${MODEL:-kimi-k2.6}

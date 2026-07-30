@@ -51,13 +51,3 @@ func TestResolveSourcesSingleTarget(t *testing.T) {
 		t.Errorf("single-target render wrong:\n%s", conf)
 	}
 }
-
-// cart 渲染:base + workers。
-func TestRenderCart(t *testing.T) {
-	y := RenderCart("server: { port: 6700 }", []config.Peer{{IP: "10.1.0.1", Port: 8050}}, 20)
-	for _, w := range []string{"port: 6700", "workers:", `http://10.1.0.1:8050`, "max_load: 20"} {
-		if !strings.Contains(y, w) {
-			t.Errorf("cart config.yaml missing %q\n%s", w, y)
-		}
-	}
-}

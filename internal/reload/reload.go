@@ -59,8 +59,11 @@ func Run(watchPath, procMatch string) error {
 	}
 }
 
-// findPID scans /proc for a process whose cmdline contains match (using cmdline, not comm,
-// which truncates to 15 chars). Excludes self and autoconfig.
+// findPID scans /proc for a process whose **argv[0]** matches match —— 只比进程标识(argv[0]),
+// 不比整条 cmdline。这样能稳当排除「参数里含 match」的进程(如 reload/hagate sidecar 自己的
+// `--process nginx: master` 参数)。argv[0] 用 cmdline 首段(comm 会截断 15 字符)。
+// 匹配规则(覆盖 nginx 改写 argv[0] + 普通二进制两种):argv[0] == match、basename(argv[0]) == match、
+// 或 argv[0] 以 match 开头(nginx master 的 argv[0] = "nginx: master process ...")。
 func findPID(match string) int {
 	procs, _ := filepath.Glob("/proc/[0-9]*")
 	self := os.Getpid()
@@ -69,8 +72,11 @@ func findPID(match string) int {
 		if err != nil {
 			continue
 		}
-		cmd := strings.ReplaceAll(string(b), "\x00", " ")
-		if strings.Contains(cmd, match) && !strings.Contains(cmd, "autoconfig") {
+		argv0, _, _ := strings.Cut(string(b), "\x00") // cmdline 首段 = argv[0]
+		if argv0 == "" {
+			continue
+		}
+		if argv0 == match || filepath.Base(argv0) == match || strings.HasPrefix(argv0, match) {
 			var pid int
 			if _, err := fmt.Sscanf(filepath.Base(d), "%d", &pid); err == nil && pid != self {
 				return pid

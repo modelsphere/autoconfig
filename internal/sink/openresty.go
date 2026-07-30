@@ -14,8 +14,6 @@ import (
 //go:embed route.tmpl
 var defaultRouteTmpl string
 
-// RenderRoute 用模板给一条 openresty route 生成整个 conf(dicts + server + register_route + peers)。
-// tmplContent 为空用内置模板。
 // RouteData 喂给 route.tmpl。Route/Listen 是结构;Extra 是任意调优项(原样渲染进 lua 返回表,
 // text/template range map 按 key 排序 → 确定性);Peers 是发现结果。
 type RouteData struct {

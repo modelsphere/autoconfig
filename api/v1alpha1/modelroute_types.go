@@ -87,6 +87,7 @@ type MonitorSpec struct {
 
 // ModelRouteSpec 是一个模型的完整路由绑定。
 // +kubebuilder:validation:XValidation:rule="!self.openresty.peers.exists(s, s.use == 'cart') || has(self.cart)",message="openresty.peers 用了 cart,但没配 spec.cart"
+// +kubebuilder:validation:XValidation:rule="!self.openresty.peers.exists(s, s.use == 'cart' && has(s.maxConcurrencyFromBackend) && s.maxConcurrencyFromBackend) || self.openresty.peers.exists(s, s.use == 'backend' && has(s.maxConcurrency) && s.maxConcurrency > 0)",message="cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(> 0)作乘数"
 type ModelRouteSpec struct {
 	// Discovery:本模型的后端桶(喂 CART 的 workers、openresty 的 backend 来源、monitor 的 services)。
 	Discovery Discovery `json:"discovery"`
