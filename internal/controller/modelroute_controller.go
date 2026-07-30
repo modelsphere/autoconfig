@@ -12,6 +12,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -330,16 +331,65 @@ func discoveryTarget(service, selector string, port int, includeNotReady bool, d
 	return config.Target{Namespace: ns, Service: service, Selector: selector, Port: port, IncludeNotReady: includeNotReady}
 }
 
-// SetupWithManager 注册:watch ModelRoute + watch EndpointSlice(后端/CART/openresty 端点变化事件驱动,
-// 映射到引用其 Service 的 ModelRoute 立即重算,不用等 10s resync)。
-// 注:selector(pod label)发现路径不经 EndpointSlice,仍靠 resync 兜底。
+// SetupWithManager 注册两类发现的事件驱动:
+//   - watch EndpointSlice → 映射到「用 service 发现」的 ModelRoute(后端/CART/openresty 走 Service 路径)
+//   - watch Pod          → 映射到「用 selector 发现」的 ModelRoute(没建 Service 的单机/单卡走 pod label 路径)
+//
+// 两条都在端点变化(增删/ready 翻转都会 bump resourceVersion → 元数据 watch 收到事件)时立即重算,
+// 不用等 10s resync;10s resync 仅作兜底。两个 watch 都用 OnlyMetadata(cache 只存元数据,不存 spec/status/endpoints)。
 func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&routingv1.ModelRoute{}).
-		// OnlyMetadata:cache 只存 EndpointSlice 元数据(label/ns,mapFunc 只需这些),不存 endpoints 列表 → 省内存;
-		// 实际端点发现走 clientset live List(不经 cache)。
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice), builder.OnlyMetadata).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForPod), builder.OnlyMetadata).
 		Complete(r)
+}
+
+// modelRoutesForPod:Pod 变化 → 找出「用 selector(pod label)发现」且 selector 命中该 pod 的 ModelRoute 入队。
+// 只处理 selector 路径(service 路径由 EndpointSlice watch 负责);selector 发现按 ModelRoute 自身 ns,故只匹配同 ns 的 pod。
+func (r *ModelRouteReconciler) modelRoutesForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	podLabels := obj.GetLabels()
+	if len(podLabels) == 0 {
+		return nil
+	}
+	ns := obj.GetNamespace()
+	var mrs routingv1.ModelRouteList
+	if err := r.List(ctx, &mrs); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range mrs.Items {
+		if referencesPodBySelector(&mrs.Items[i], ns, podLabels) {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: mrs.Items[i].Namespace, Name: mrs.Items[i].Name}})
+		}
+	}
+	return reqs
+}
+
+// referencesPodBySelector 判断 mr 的 discovery/cart/nginx 里有没有「selector 路径」命中 (podNS, podLabels) 的 pod。
+// selector 路径 = 该 target 只配了 selector 没配 service,且发现 ns = mr.Namespace(selector 不支持 ns/name)。
+func referencesPodBySelector(mr *routingv1.ModelRoute, podNS string, podLabels map[string]string) bool {
+	if mr.Namespace != podNS {
+		return false
+	}
+	sel := func(service, selector string) bool {
+		if service != "" || selector == "" {
+			return false // 走 service 路径,或没配 selector
+		}
+		s, err := labels.Parse(selector)
+		return err == nil && s.Matches(labels.Set(podLabels))
+	}
+	if sel(mr.Spec.Discovery.Service, mr.Spec.Discovery.Selector) {
+		return true
+	}
+	if c := mr.Spec.Cart; c != nil && sel(c.Service, c.Selector) {
+		return true
+	}
+	if m := mr.Spec.Monitor; m != nil && m.Nginx != nil && sel(m.Nginx.Service, m.Nginx.Selector) {
+		return true
+	}
+	return false
 }
 
 // modelRoutesForEndpointSlice:EndpointSlice 变化 → 找出 discovery/cart/nginx.service 指向其 Service 的 ModelRoute 入队。

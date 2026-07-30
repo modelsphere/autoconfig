@@ -145,3 +145,39 @@ func TestReconcileGLM(t *testing.T) {
 			got.Status.Backends, got.Status.CartPeers, got.Status.Ready)
 	}
 }
+
+// referencesPodBySelector:selector 路径命中同 ns pod 才入队;service 路径 / 跨 ns / 不匹配都不入队。
+func TestReferencesPodBySelector(t *testing.T) {
+	mkSel := func(ns, sel string) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: ns},
+			Spec:       routingv1.ModelRouteSpec{Discovery: routingv1.Discovery{Selector: sel}},
+		}
+	}
+	lbl := map[string]string{"app": "kimi", "worker-index": "0"}
+	cases := []struct {
+		name   string
+		mr     *routingv1.ModelRoute
+		podNS  string
+		labels map[string]string
+		want   bool
+	}{
+		{"selector 命中", mkSel("kimi", "app=kimi,worker-index=0"), "kimi", lbl, true},
+		{"selector 不匹配", mkSel("kimi", "app=glm"), "kimi", lbl, false},
+		{"跨 ns 不入队", mkSel("kimi", "app=kimi"), "other", lbl, false},
+		{"service 路径不由 pod 触发", &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "kimi"},
+			Spec:       routingv1.ModelRouteSpec{Discovery: routingv1.Discovery{Service: "kimi/svc"}},
+		}, "kimi", lbl, false},
+		{"cart selector 命中", &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "kimi"},
+			Spec: routingv1.ModelRouteSpec{Discovery: routingv1.Discovery{Service: "kimi/be"},
+				Cart: &routingv1.CartSpec{Selector: "app=kimi"}},
+		}, "kimi", lbl, true},
+	}
+	for _, c := range cases {
+		if got := referencesPodBySelector(c.mr, c.podNS, c.labels); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}

@@ -3,12 +3,12 @@
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.16 bash real_helm_e2e.sh [--keep]
+#   IMG_TAG=0.3.17 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-helm}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.16}
+TAG=${IMG_TAG:-0.3.17}
 CHARTS=${CHARTS:-$HERE/charts}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
