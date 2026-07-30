@@ -132,7 +132,7 @@
 <div class="wrap">
   <p class="eyebrow">架构设计 · 讨论稿</p>
   <h1>autoconfig 怎么和 openresty ／ CART ／ monitor 协作</h1>
-  <p class="lede">autoconfig 自动发现 <b>后端 pods 与 CART pods</b>，给 <b>openresty、CART、monitor</b> 各写一份配置——发现到的 CART 会被<b>注册为 openresty 的优先 peer</b>（后端兜底）。openresty／CART 由 <b>reload sidecar</b> 收 SIGHUP 热重载、并各带一个 <b>hagate sidecar</b>（2 副本 master-standby，只有 leader 打 active 标签进 Service）；<b>monitor 每 60s 自动热加载 <span class="mono">monitor.conf</span>，无需 sidecar</b>。实线＝配置流，虚线＝请求／健康流。</p>
+  <p class="lede">autoconfig 按 <b>Service 自动发现</b>后端与 CART 的端点（watch 其 EndpointSlice），给 <b>openresty、CART、monitor</b> 各写一份配置——发现到的 CART 会被<b>注册为 openresty 的优先 peer</b>（后端兜底）。openresty／CART 由 <b>reload sidecar</b> 收 SIGHUP 热重载、并各带一个 <b>hagate sidecar</b>（2 副本 master-standby，只有 leader 打 active 标签进 Service）；<b>monitor 每 60s 自动热加载 <span class="mono">monitor.conf</span>，无需 sidecar</b>。实线＝配置流，虚线＝请求／健康流。</p>
 
   <div class="legend">
     <span><svg width="34" height="10" viewBox="0 0 34 10"><line x1="0" y1="5" x2="26" y2="5" stroke="var(--accent)" stroke-width="2.4"/><path d="M26,1 L33,5 L26,9 Z" fill="var(--accent)"/></svg>配置流（autoconfig 写 config → 消费方重载）</span>
@@ -145,11 +145,11 @@
     <div class="box agent">
       <span class="kind">deployment</span>
       <div class="nm">autoconfig controller</div>
-      <div class="desc">watch ModelRoute ＋ 发现后端／CART pods（EndpointSlice／label）→ 写各消费方的 config</div>
+      <div class="desc">watch ModelRoute ＋ 按 Service 发现后端／CART 端点（EndpointSlice）→ 写各消费方的 config</div>
     </div>
 
-    <!-- discovery annotation: autoconfig 也发现 CART -->
-    <div class="discover">↑ 自动发现（watch）：<b>后端 pods</b> ＋ <b>CART pods</b>　——　发现到的 CART 写进 openresty 的 peers（优先）</div>
+    <!-- discovery annotation: autoconfig 按 Service watch EndpointSlice -->
+    <div class="discover">↑ 按 Service 发现（watch EndpointSlice）：<b>后端 Service</b> ＋ <b>CART Service</b>　——　发现到的 CART 写进 openresty 的 peers（优先）</div>
 
     <!-- three consumers: openresty ／ CART ／ monitor -->
     <div class="cols3">
@@ -158,7 +158,7 @@
         <div class="down"><span class="l">写 openresty-conf</span>
           <svg width="12" height="30" viewBox="0 0 12 30"><line x1="6" y1="0" x2="6" y2="21" stroke="currentColor" stroke-width="2"/><path d="M1,21 L6,29 L11,21 Z" fill="currentColor"/></svg></div>
         <div class="pod">
-          <div class="pod-hd"><span class="kind">pod ×2</span><span class="pnm">openresty</span><span class="spn">master-standby</span></div>
+          <div class="pod-hd"><span class="kind">deploy ×2</span><span class="pnm">openresty</span><span class="spn">master-standby</span></div>
           <div class="ctrs">
             <div class="ctr app"><span class="clab">container</span><div class="cnm">openresty</div></div>
             <div class="hup"><span class="hl">SIGHUP</span><svg width="28" height="12" viewBox="0 0 28 12"><line x1="28" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
@@ -176,7 +176,7 @@
         <div class="down"><span class="l">写 cart-config</span>
           <svg width="12" height="30" viewBox="0 0 12 30"><line x1="6" y1="0" x2="6" y2="21" stroke="currentColor" stroke-width="2"/><path d="M1,21 L6,29 L11,21 Z" fill="currentColor"/></svg></div>
         <div class="pod">
-          <div class="pod-hd"><span class="kind">pod ×2</span><span class="pnm">CART</span><span class="spn">master-standby</span></div>
+          <div class="pod-hd"><span class="kind">deploy ×2</span><span class="pnm">CART</span><span class="spn">master-standby</span></div>
           <div class="ctrs">
             <div class="ctr app"><span class="clab">container</span><div class="cnm">cache-aware-router</div></div>
             <div class="hup"><span class="hl">SIGHUP</span><svg width="28" height="12" viewBox="0 0 28 12"><line x1="28" y1="6" x2="9" y2="6" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M9,1 L2,6 L9,11 Z" fill="currentColor"/></svg></div>
@@ -193,7 +193,7 @@
         <div class="down"><span class="l">写 monitor.conf</span>
           <svg width="12" height="30" viewBox="0 0 12 30"><line x1="6" y1="0" x2="6" y2="21" stroke="currentColor" stroke-width="2"/><path d="M1,21 L6,29 L11,21 Z" fill="currentColor"/></svg></div>
         <div class="pod">
-          <div class="pod-hd"><span class="kind">pod</span><span class="pnm">monitor</span><span class="spn">无 sidecar</span></div>
+          <div class="pod-hd"><span class="kind">deploy</span><span class="pnm">monitor</span><span class="spn">无 sidecar</span></div>
           <div class="ctrs one">
             <div class="ctr app"><span class="clab">container</span><div class="cnm">monitor</div></div>
           </div>
@@ -209,9 +209,9 @@
 
     <!-- backends -->
     <div class="box be">
-      <span class="kind">pod ×N</span>
-      <div class="nm">后端 pods（vllm／sglang）</div>
-      <div class="desc">按模型分桶 · LWS leader／单机／单卡</div>
+      <span class="kind">service</span>
+      <div class="nm">后端 Service（vllm／sglang）</div>
+      <div class="desc">一模型一 Service · 后含 N 端点（LWS leader／单机／单卡）</div>
     </div>
 
   </div>
