@@ -19,12 +19,6 @@ type Discovery struct {
 	IncludeNotReady bool `json:"includeNotReady,omitempty"`
 }
 
-// ConfigMapKeyRef 引用一个 ConfigMap 的某个 key(如 CART 的 base config.yaml)。
-type ConfigMapKeyRef struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
-}
-
 // CartSpec:本模型的 CART 实例。autoconfig 发现后端 → 写 CART 的 workers;并发现 CART pod 供 openresty 引用。
 // 省略整个 cart 段 = openresty 直连后端(无 CART)。
 // +kubebuilder:validation:XValidation:rule="has(self.service) != has(self.selector)",message="cart: service 和 selector 必须恰好给一个"
@@ -36,9 +30,8 @@ type CartSpec struct {
 	// +optional
 	Port int `json:"port,omitempty"`
 	// OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
+	// 底稿(server/cache/health)由 chart 的 values.baseConfig 建在此 ConfigMap 里;autoconfig 只重填 workers 段。
 	OutputConfigMap string `json:"outputConfigMap"`
-	// BaseConfigRef:CART config.yaml 的静态底稿(不含 workers);省略用内置默认。
-	BaseConfigRef *ConfigMapKeyRef `json:"baseConfigRef,omitempty"`
 	// MaxLoad:每 worker 的 max_load,默认 20。
 	MaxLoad int `json:"maxLoad,omitempty"`
 }

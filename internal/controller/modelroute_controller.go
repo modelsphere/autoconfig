@@ -94,14 +94,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 2) CART(可选):渲染 workers 写 cart-config,并发现 CART pod 供 openresty 引用
 	var cartPeers []config.Peer
 	if c := rb.Spec.Cart; c != nil {
-		base := ""
-		if ref := c.BaseConfigRef; ref != nil {
-			var cm corev1.ConfigMap
-			if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: ref.Name}, &cm); err != nil {
-				return ctrl.Result{}, fmt.Errorf("read cart baseConfigRef %s/%s: %w", rb.Namespace, ref.Name, err)
-			}
-			base = cm.Data[ref.Key]
-		}
+		// 底稿(server/cache/health)来自 chart 建的 cart-config(values.baseConfig);autoconfig 只重填 workers。
+		// 读现有 config.yaml、剥掉旧 workers 段当底稿;读不到(无 chart)则 RenderCart 用内置默认。
+		base := sink.CartBase(r.readConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace))
 		cartYAML := sink.RenderCart(base, backends, c.MaxLoad)
 		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("write cart configmap: %w", err)
@@ -283,6 +278,16 @@ func setCondition(conds *[]metav1.Condition, c metav1.Condition) {
 		}
 	}
 	*conds = append(*conds, c)
+}
+
+// readConfigMapKey 读某 ConfigMap("ns/name" 或裸名)的一个 key,不存在返回 ""。
+func (r *ModelRouteReconciler) readConfigMapKey(ctx context.Context, ref, key, defaultNS string) string {
+	ns, name := splitNSName(ref, defaultNS)
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm); err != nil {
+		return ""
+	}
+	return cm.Data[key]
 }
 
 func splitNSName(ref, defaultNS string) (ns, name string) {

@@ -9,7 +9,7 @@ replicas: 2                # master-standby:2 副本,只有 leader 收流量(单
 # CART 有本地 radix 缓存,active-active 会分裂缓存 → 命中率下降;单 active 保持一份热缓存。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.10
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.11
   port: 8081
   appTcp: "127.0.0.1:8071"
 
@@ -20,16 +20,21 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# CART 配置 ConfigMap(config.yaml):**chart 建初值**(server 块 + 初始 workers),autoconfig 更新
-# (等价手动改 CM;Helm 3 三方合并:模板不变时 upgrade 不覆盖 autoconfig 写的 config.yaml)。没 autoconfig 时手动编辑。
+# CART 配置 ConfigMap(config.yaml):chart 建**唯一底稿**(server/cache/health),autoconfig 只重填 workers 段。
+# 这就是 CART 的 base——per-model 的 port/cache 等直接改这里(每个模型一个 cart release)。不再有单独的 baseConfigRef。
 configMapName: cart-config
 
-# 初始 config.yaml(server 块 + workers)。standalone(无 autoconfig)时在此写死 workers;
-# 有 autoconfig 时它会用 ModelRoute.cart.baseConfigRef 重写整个 config.yaml。
+# 底稿 config.yaml(server/cache/health + 占位 workers)。autoconfig 保留这部分、只替换 workers:;
+# standalone(无 autoconfig)时可在此直接写死 workers。
 baseConfig: |
   server:
     host: "0.0.0.0"
     port: 8071
+  cache:
+    threshold: 0.3
+  health:
+    endpoint: "/health"
+    interval_secs: 10
   workers: []
 
 # launch_service 要求 ulimit -n ≥ 65535
@@ -37,7 +42,7 @@ ulimitNofile: 65535
 
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.10
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.11
   process: "cache-aware-router"
 
 service:

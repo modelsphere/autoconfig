@@ -57,22 +57,13 @@ spec:
               cart:
                 description: Cart:可选;有 = autoconfig 管这个 CART,无 = openresty 直连后端。
                 properties:
-                  baseConfigRef:
-                    description: BaseConfigRef:CART config.yaml 的静态底稿(不含 workers);省略用内置默认。
-                    properties:
-                      key:
-                        type: string
-                      name:
-                        type: string
-                    required:
-                    - key
-                    - name
-                    type: object
                   maxLoad:
                     description: MaxLoad:每 worker 的 max_load,默认 20。
                     type: integer
                   outputConfigMap:
-                    description: OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
+                    description: |-
+                      OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
+                      底稿(server/cache/health)由 chart 的 values.baseConfig 建在此 ConfigMap 里;autoconfig 只重填 workers 段。
                     type: string
                   port:
                     description: Port:CART 端口。省略则从 EndpointSlice/containerPort 自动推导(单端口)。

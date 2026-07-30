@@ -4,12 +4,12 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖同目录文件:modelroutes.yaml(CRD)、controller.yaml(controller 部署)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.10 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.11 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.10}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.11}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -84,17 +84,12 @@ kind: Service
 metadata: { name: openresty-svc }
 spec: { selector: { app: openresty }, ports: [{ port: 18083, targetPort: 18083 }] }
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata: { name: base-cart }
-data: { config.base.yaml: "server: { host: \"0.0.0.0\", port: 6700 }" }
----
 apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata: { name: glm }
 spec:
   discovery: { service: glm-leader, port: 8050 }
-  cart: { service: cart-glm, port: 8071, outputConfigMap: $NS/cart-config, baseConfigRef: { name: base-cart, key: config.base.yaml }, maxLoad: 20 }
+  cart: { service: cart-glm, port: 8071, outputConfigMap: $NS/cart-config, maxLoad: 20 }
   openresty:
     route: glm
     listen: 18083

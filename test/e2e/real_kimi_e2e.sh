@@ -4,12 +4,12 @@
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.10 bash real_kimi_e2e.sh [--keep]
+#   IMG_TAG=0.3.11 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-kimi}                      # 与 kimi LWS 同 ns(discovery 同 ns)
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.10}
+TAG=${IMG_TAG:-0.3.11}
 CHARTS=${CHARTS:-$HERE/charts}
 KIMI_SVC=${KIMI_SVC:-kimi-k26-leader}
 MODEL=${MODEL:-kimi-k2.6}
@@ -32,7 +32,7 @@ cleanup(){ [ "$KEEP" = 1 ] && { echo "(--keep:保留 autoconfig 栈 + kimi)"; re
   say cleanup
   helm -n "$NS" uninstall openresty cart monitor 2>/dev/null
   kubectl -n "$NS" delete mr glm-kimi 2>/dev/null
-  kubectl -n "$NS" delete cm base-cart openresty-conf cart-config monitor-conf 2>/dev/null
+  kubectl -n "$NS" delete cm openresty-conf cart-config monitor-conf 2>/dev/null
   kubectl -n "$CTRL_NS" delete -f "$HERE/controller.yaml" --wait=false 2>/dev/null
   echo "(kimi LWS 保留,不动)"
 }
@@ -51,18 +51,8 @@ sed "s#image: $AC:.*#image: $AC:$TAG#" "$HERE/controller.yaml" | kubectl apply -
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s || { bad "controller 未就绪"; exit 1; }
 ok "controller 就绪"
 
-# ---------- 2) base-cart + helm 装 3 组件 ----------
-say "base-cart + helm install openresty/cart/monitor(kimi ns)"
-kubectl -n "$NS" apply -f - <<YAML
-apiVersion: v1
-kind: ConfigMap
-metadata: { name: base-cart }
-data:
-  config.base.yaml: |
-    server: { host: "0.0.0.0", port: 8071 }
-    cache: { threshold: 0.3 }
-    health: { endpoint: "/health", interval_secs: 10 }
-YAML
+# ---------- 2) helm 装 3 组件(cart chart 建 cart-config 底稿,autoconfig 只填 workers)----------
+say "helm install openresty/cart/monitor(kimi ns)"
 helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" \
   --set fullnameOverride=openresty --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" \
   --set reload.image="$ACR" >/dev/null && ok "openresty chart" || bad "openresty chart 装失败"
@@ -81,7 +71,7 @@ kind: ModelRoute
 metadata: { name: glm-kimi }
 spec:
   discovery: { service: $KIMI_SVC, port: 8050 }
-  cart: { service: cart, port: 8071, outputConfigMap: $NS/cart-config, baseConfigRef: { name: base-cart, key: config.base.yaml }, maxLoad: 20 }
+  cart: { service: cart, port: 8071, outputConfigMap: $NS/cart-config, maxLoad: 20 }
   openresty:
     route: kimi
     listen: $LISTEN

@@ -16,8 +16,7 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
   metadata: { name: glm-5.1-fp8, namespace: glm }
   spec:
     discovery: { service: glm-leader, port: 8050 }   # 或 selector
-    cart: { service: cart-glm, port: 8071, outputConfigMap: glm/cart-config,
-            baseConfigRef: { name: base-cart, key: config.base.yaml }, maxLoad: 20 }
+    cart: { service: cart-glm, outputConfigMap: glm/cart-config, maxLoad: 20 }
     openresty:
       route: glm
       listen: 18083

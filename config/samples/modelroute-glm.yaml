@@ -10,11 +10,10 @@ spec:
     service: glm/glm-leader          # ns/name:glm ns 的 leader Service(EndpointSlice 只选 leader)
     # port 省略 → 从 EndpointSlice 自动取(单端口);多端口/selector 才需显式 port: 8050
   cart:                              # 可选;省略 = openresty 直连后端
-    service: cart/cart-glm           # ns/name:cart ns 的 CART pod
+    service: cart/cart-glm           # ns/name:cart ns 的 CART pod(发现它 → openresty cart peer + monitor router)
     # port 省略 → 自动取(CART 端口)
-    outputConfigMap: cart/cart-config
-    baseConfigRef: { name: base-cart, key: config.base.yaml }
-    maxLoad: 20
+    outputConfigMap: cart/cart-config  # autoconfig 只重填此 CM 的 workers 段;底稿(server/cache/health)由 cart chart 建
+    maxLoad: 20                      # 每 worker 的 max_load(默认 20)
   openresty:
     route: glm
     listen: 18083

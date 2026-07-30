@@ -43,8 +43,7 @@ func TestReconcileGLM(t *testing.T) {
 		Spec: routingv1.ModelRouteSpec{
 			Discovery: routingv1.Discovery{Service: "glm-leader", Port: 8050},
 			Cart: &routingv1.CartSpec{
-				Service: "cart-glm", Port: 8071, OutputConfigMap: "glm/cart-config",
-				BaseConfigRef: &routingv1.ConfigMapKeyRef{Name: "base-cart", Key: "config.base.yaml"}, MaxLoad: 20,
+				Service: "cart-glm", Port: 8071, OutputConfigMap: "glm/cart-config", MaxLoad: 20,
 			},
 			Openresty: routingv1.OpenrestySpec{
 				Route: "glm", Listen: 18083, OutputConfigMap: "openresty/openresty-conf",
@@ -59,9 +58,10 @@ func TestReconcileGLM(t *testing.T) {
 			},
 		},
 	}
+	// chart 预建的 cart-config:底稿(server port 6700)+ 占位 workers;autoconfig 剥掉 workers 段重填
 	base := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "base-cart", Namespace: "glm"},
-		Data:       map[string]string{"config.base.yaml": "server: { host: \"0.0.0.0\", port: 6700 }"},
+		ObjectMeta: metav1.ObjectMeta{Name: "cart-config", Namespace: "glm"},
+		Data:       map[string]string{"config.yaml": "server: { host: \"0.0.0.0\", port: 6700 }\nworkers: []"},
 	}
 	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(rb, base).WithStatusSubresource(&routingv1.ModelRoute{}).Build()

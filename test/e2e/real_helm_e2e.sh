@@ -3,12 +3,12 @@
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:modelroutes.yaml(CRD)、controller.yaml、charts/{openresty,cart,monitor}。
-#   IMG_TAG=0.3.10 bash real_helm_e2e.sh [--keep]
+#   IMG_TAG=0.3.11 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-helm}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.10}
+TAG=${IMG_TAG:-0.3.11}
 CHARTS=${CHARTS:-$HERE/charts}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
@@ -40,8 +40,8 @@ sed "s#image: $AC:.*#image: $AC:$TAG#" "$HERE/controller.yaml" | kubectl apply -
 kubectl -n "$CTRL_NS" rollout status deploy/autoconfig-controller --timeout=150s || { bad "controller 未就绪"; kubectl -n "$CTRL_NS" get pods; exit 1; }
 ok "controller 就绪"
 
-# ---------- 2) ns + mock 后端(2) + base-cart ----------
-say "mock 后端(2)+ base-cart"
+# ---------- 2) ns + mock 后端(2)(cart 底稿由 cart chart 建,不需 base-cart)----------
+say "mock 后端(2)"
 kubectl create ns "$NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n "$NS" apply -f - <<YAML
 apiVersion: apps/v1
@@ -53,15 +53,6 @@ apiVersion: v1
 kind: Service
 metadata: { name: be-svc }
 spec: { selector: { app: be }, ports: [{ port: 8050, targetPort: 8050 }] }
----
-apiVersion: v1
-kind: ConfigMap
-metadata: { name: base-cart }
-data:
-  config.base.yaml: |
-    server: { host: "0.0.0.0", port: 8071 }
-    cache: { threshold: 0.3 }
-    health: { endpoint: "/health", interval_secs: 10 }
 YAML
 kubectl -n "$NS" rollout status deploy/be --timeout=120s
 
@@ -89,7 +80,7 @@ kind: ModelRoute
 metadata: { name: glm }
 spec:
   discovery: { service: be-svc, port: 8050 }
-  cart: { service: cart, port: 8071, outputConfigMap: $NS/cart-config, baseConfigRef: { name: base-cart, key: config.base.yaml }, maxLoad: 20 }
+  cart: { service: cart, port: 8071, outputConfigMap: $NS/cart-config, maxLoad: 20 }
   openresty:
     route: glm
     listen: 18083
