@@ -4,7 +4,7 @@
 //
 // failover:
 //   - 计划内(SIGTERM:删 pod/滚动/驱逐):捕获信号 → 取消 context → ReleaseOnCancel 主动释放 Lease
-//     + 摘掉自己 active 标签 → standby ~1-2s(RetryPeriod)接管,近乎无缝。
+//   - 摘掉自己 active 标签 → standby ~1-2s(RetryPeriod)接管,近乎无缝。
 //   - 硬崩(节点宕/kill -9):无从释放,standby 等 Lease 过期(~LeaseDuration)接管。
 package hagate
 
@@ -30,9 +30,9 @@ import (
 
 // Config 是 hagate 的运行参数。
 type Config struct {
-	Lease, Namespace, Identity string
-	HTTPAddr, AppTCP           string
-	LabelKey, LabelVal         string
+	Lease, Namespace, Identity                string
+	HTTPAddr, AppTCP                          string
+	LabelKey, LabelVal                        string
 	LeaseDuration, RenewDeadline, RetryPeriod time.Duration
 }
 
@@ -74,23 +74,25 @@ func Run(c Config) error {
 		cancel()
 	}()
 
-	// 标签协调:desired = leader 且(未配 appTCP 或端口可连);与当前标签不符就 patch。
+	// 标签协调(level-triggered):每轮读 pod 【实际】标签,与 desired(leader 且 appTCP 可连)不符就纠正。
+	// 不用内部 have 猜 —— 标签被外部弄掉(手删/别的东西改)也能自愈,不会「以为 active 其实没标签→零端点断流」。
 	go func() {
-		have := false
 		for {
 			want := leader.Load() && (c.AppTCP == "" || dialOK(c.AppTCP))
-			if want != have {
+			actual, err := podHasLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal)
+			if err != nil {
+				log.Printf("read pod label: %v", err)
+			} else if actual != want {
 				if err := setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, want); err != nil {
 					log.Printf("set label %s=%v: %v", c.LabelKey, want, err)
 				} else {
-					have = want
-					log.Printf("pod %s active=%v", c.Identity, want)
+					log.Printf("pod %s active=%v (reconciled, actual was %v)", c.Identity, want, actual)
 				}
 			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(1 * time.Second):
+			case <-time.After(2 * time.Second):
 			}
 		}
 	}()
@@ -119,6 +121,17 @@ func Run(c Config) error {
 		}
 		time.Sleep(1 * time.Second)
 	}
+}
+
+// podHasLabel 读 pod 当前是否带 key=val 的标签(level-triggered 协调用)。
+func podHasLabel(cs kubernetes.Interface, ns, pod, key, val string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p, err := cs.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return p.Labels[key] == val, nil
 }
 
 // setPodLabel 用 merge-patch 加/删自己 pod 的一个 label(删=置 null)。

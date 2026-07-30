@@ -5,7 +5,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -116,15 +116,14 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// 3) openresty:按 peers 组(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
 	peersByTarget := map[string][]config.Peer{"backend": backends, "cart": cartPeers}
-	// 后端单实例并发(供 cart 动态并发用):backend 组的 maxConcurrency,没配则用 values.default_max
+	// 后端单实例并发(供 cart 动态并发用):backend 组的 maxConcurrency。
+	// CEL 校验保证「maxConcurrencyFromBackend → backend.maxConcurrency>0」,故不需 default_max 兜底;
+	// 万一为 0(校验被绕过),cart 并发=0 → 运行时 openresty 用 conf 里的 default_max 兜。
 	backendPerInstance := 0
 	for _, s := range rb.Spec.Openresty.Peers {
 		if s.Use == "backend" && s.MaxConcurrency > 0 {
 			backendPerInstance = s.MaxConcurrency
 		}
-	}
-	if backendPerInstance == 0 {
-		backendPerInstance = atoiOr(rb.Spec.Openresty.Values["default_max"], 0)
 	}
 	var sources []config.RouteSource
 	for _, s := range rb.Spec.Openresty.Peers {
@@ -314,14 +313,6 @@ func (r *ModelRouteReconciler) readConfigMapKey(ctx context.Context, ref, key, d
 	return cm.Data[key]
 }
 
-// atoiOr 解析字符串为 int,失败/空则返回 def。
-func atoiOr(s string, def int) int {
-	if v, err := strconv.Atoi(s); err == nil {
-		return v
-	}
-	return def
-}
-
 func splitNSName(ref, defaultNS string) (ns, name string) {
 	if i := strings.Index(ref, "/"); i >= 0 {
 		return ref[:i], ref[i+1:]
@@ -345,7 +336,9 @@ func discoveryTarget(service, selector string, port int, includeNotReady bool, d
 func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&routingv1.ModelRoute{}).
-		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice)).
+		// OnlyMetadata:cache 只存 EndpointSlice 元数据(label/ns,mapFunc 只需这些),不存 endpoints 列表 → 省内存;
+		// 实际端点发现走 clientset live List(不经 cache)。
+		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice), builder.OnlyMetadata).
 		Complete(r)
 }
 

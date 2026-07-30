@@ -4,10 +4,25 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
+	"strconv"
+	"strings"
 	"text/template"
 
 	"autoconfig/internal/config"
 )
+
+// luaVal 把 values 的字符串安全渲染成 lua 字面量:数字/布尔/nil 原样出,其余当字符串加引号 + 转义
+// (防止值里含 , } 换行 " 破坏 conf 或注入)。
+func luaVal(s string) string {
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return s
+	}
+	if s == "true" || s == "false" || s == "nil" {
+		return s
+	}
+	s = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", " ", "\r", " ").Replace(s)
+	return `"` + s + `"`
+}
 
 // defaultRouteTmpl 内置路由模板(route.tmpl 编进二进制,controller 无需挂载模板文件)。
 //
@@ -24,7 +39,7 @@ type RouteData struct {
 }
 
 func RenderRoute(d RouteData) (string, error) {
-	tmpl, err := template.New("route").Parse(defaultRouteTmpl)
+	tmpl, err := template.New("route").Funcs(template.FuncMap{"luaVal": luaVal}).Parse(defaultRouteTmpl)
 	if err != nil {
 		return "", fmt.Errorf("parse template: %w", err)
 	}

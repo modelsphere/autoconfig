@@ -23,7 +23,7 @@ server {
 {{- end}}
                 },
 {{- range $k, $v := .Extra}}
-                {{$k}} = {{$v}},
+                {{$k}} = {{luaVal $v}},
 {{- end}}
             }
         end)
