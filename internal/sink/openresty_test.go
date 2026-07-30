@@ -28,7 +28,7 @@ func TestResolveSourcesAndRenderRoute(t *testing.T) {
 	wantBe1 := `{ "10.1.0.1", 8050, "glm-backends-0" },`
 	wantBe2 := `{ "10.1.0.2", 8050, "glm-backends-1" },`
 	// Extra 任意 key(含 openresty 以后新加的)都渲染,无需改代码
-	for _, w := range []string{wantCart, wantBe1, wantBe2, "listen 18083", "ttft_limit_ms = 60000,", "zz_new_tunable = 9,"} {
+	for _, w := range []string{wantCart, wantBe1, wantBe2, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000,", "zz_new_tunable = 9,"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("rendered conf missing %q\n---\n%s", w, conf)
 		}

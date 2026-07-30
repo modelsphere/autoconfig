@@ -11,7 +11,7 @@ adminPort: 8090                # baked 的固定 admin/health 口(session_base.c
 # openresty 的路由态(active_conns/adaptive-cc/health-timer)是 pod 内共享内存,不能 active-active。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.19
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.20
   port: 8081
   # appTcp 盯固定 admin 口(不随动态路由端口变);nginx 一起 8090 就在 → 探得到才是真活着
   appTcp: "127.0.0.1:8090"
@@ -32,14 +32,14 @@ initialRoutes: {}          # 初始 session_route_<route>.conf(文件名: 内容
 # reload sidecar:同一个 autoconfig-reload 镜像,watch conf.d/routes 变化 → SIGHUP nginx master。
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.19
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.20
   process: "nginx: master"
 
 service:
   type: ClusterIP
-  ports:               # 与各 ModelRoute.openresty.listen 对应(按需增删)
-    - { name: glm, port: 18083 }
-    - { name: k25, port: 18080 }
+  ports:               # 路径路由 D″:单外部口 8080(dispatch,按 /<route>/ 分发)+ 8090(health/probe)。
+    - { name: dispatch, port: 8080 }   # ← 外部入口:客户端/ai-cloud 打 8080/<route>/v1/…(加模型不用改这里)
+    - { name: health,   port: 8090 }
 
 resources:
   requests: { cpu: 100m, memory: 128Mi }

@@ -59,8 +59,10 @@ type NginxSpec struct {
 	// 想用简单标识(字母数字/下划线)或 name 含 -/. 时,显式给个短 route。
 	// +optional
 	Route string `json:"route,omitempty"`
-	// Listen:server 监听端口。
-	Listen int `json:"listen"`
+	// Listen:【路径路由 D″ 下已废弃】per-model server 不再监听 TCP 端口,改监听 unix socket
+	// (名 = route),由镜像 baked 的 8080 dispatch 按 /<route>/ 分发;monitor 探 8080/<route>。保留字段仅向后兼容,忽略。
+	// +optional
+	Listen int `json:"listen,omitempty"`
 	// Peers:有序 peer 组(如 cart 优先 + backend 兜底)。
 	// +kubebuilder:validation:MinItems=1
 	Peers []RoutePeer `json:"peers"`

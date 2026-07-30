@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 验证 0.3.19 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
+# 验证 0.3.20 三改动,用现成的真 vllm(e2e-test/vllm-mock-vllm-svc,opt-125m,跨 ns 发现,不动 GPU):
 #   Q5 sources→peers、Q4 values 任意 key、Q1 monitor nginx 每端口(port=openresty.listen、name=model)
 #   + backend maxConcurrency、+ 真推理 openresty→CART→vllm。
-# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.19)。用法:bash verify_v12_vllm.sh
+# 复用 kimi ns 里已装的 openresty/cart/monitor(controller 已 0.3.20)。用法:bash verify_v12_vllm.sh
 set -uo pipefail
 NS=${NS:-kimi}
 BACKEND_SVC=${BACKEND_SVC:-e2e-test/vllm-mock-vllm-svc}
@@ -23,10 +23,9 @@ spec:
   discovery: { service: $BACKEND_SVC }        # 跨 ns,port 自动=8000
   cart: { service: cart, outputConfigMap: $NS/cart-config, maxLoad: 20 }
   nginx:
-    route: opt
-    listen: $LISTEN
+    route: opt                                 # = 外部路径 key + unix socket 名;外部走 8080/opt/
     outputConfigMap: $NS/openresty-conf
-    service: openresty                         # nginx 入口 Service → monitor nginx 行(端口用 listen $LISTEN)
+    service: openresty                         # nginx 入口 Service → monitor nginx 行(探 8080/opt)
     values: { ttft_limit_ms: "60000", zz_custom_tunable: "7" }   # 任意 key:自定义的也渲染
     peers:
       - { use: cart,    priority: 1, maxConcurrencyFromBackend: true }   # 动态=后端并发 × 后端数
@@ -54,13 +53,13 @@ echo "=== Q1 monitor nginx 每端口(monitor-conf)==="
 for i in $(seq 1 30); do kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.opt\.monitor\.conf}' 2>/dev/null | grep -q '^nginx:' && break; sleep 4; done
 MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.opt\.monitor\.conf}')
 echo "--- opt.monitor.conf ---"; echo "$MON"
-echo "$MON" | grep -qE "^nginx: $MODEL_LABEL-0 \| http://.+:$LISTEN\$" && ok "nginx:name=model、port=openresty.listen($LISTEN)" || bad "nginx 行不对"
+echo "$MON" | grep -qE "^nginx: $MODEL_LABEL-0 \| http://.+:8080/opt\$" && ok "nginx:name=model、port=8080/opt(dispatch 路径)" || bad "nginx 行不对"
 echo "$MON" | grep -qE "^service: opt-0 \| http://.+:8000 \| $MODEL_LABEL \| A100\$" && ok "service:port 自动=8000(EndpointSlice)+ gpu_type 自动=A100(节点 GFD label 推导)" || bad "service 行不对(port/gpu_type)"
 
 echo "=== 真推理 openresty:$LISTEN → CART → vllm-mock(opt-125m)==="
 # 等挂载传播 + reload
 sleep 8
-RESP=$(kubectl -n "$NS" exec -i deploy/monitor -- python3 - "$MODEL" "http://openresty:$LISTEN" "$AUTH_KEY" <<'PYEOF'
+RESP=$(kubectl -n "$NS" exec -i deploy/monitor -- python3 - "$MODEL" "http://openresty:8080/opt" "$AUTH_KEY" <<'PYEOF'
 import sys,urllib.request,json
 model,base,key=sys.argv[1],sys.argv[2],sys.argv[3]
 req={"model":model,"prompt":"Hello, world","max_tokens":8,"temperature":0}

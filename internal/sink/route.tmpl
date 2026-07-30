@@ -1,6 +1,7 @@
 {{- /* autoconfig openresty 路由模板:每条 route 生成整个 session_route_<route>.conf。
-     Route(短名,用于 dict/register)、Listen(端口)、Extra(任意调优项,原样渲染进 lua 返回表)、
-     Peers(发现结果)。骨架对齐真实 session_route_glm.conf。 */ -}}
+     路径路由(D″):server 只监听 unix socket(名 = Route = 外部路径 key),由镜像自带的 8080 dispatch
+     按 /<Route>/ 派生 socket 分发;不再监听 per-model TCP 端口(Listen 已废弃)。
+     Route(短名,用于 dict/register/socket 名)、Extra(任意调优项)、Peers(发现结果)。 */ -}}
 # {{.Route}} 路由(autoconfig 模板生成,勿手改;改模板或 ModelRoute)
 lua_shared_dict active_conns_{{.Route}} 4m;
 lua_shared_dict cluster_avg_{{.Route}}  16k;
@@ -10,7 +11,7 @@ lua_shared_dict bodylog_ctl_{{.Route}}  1m;
 lua_shared_dict cch_ctl_{{.Route}}      1m;
 
 server {
-    listen {{.Listen}};
+    listen unix:/usr/local/openresty/nginx/sock/{{.Route}}.sock;   # 路径路由:dispatch(8080)按 /{{.Route}}/ 分发到此 socket
     server_name _;
     set $route "{{.Route}}";
 

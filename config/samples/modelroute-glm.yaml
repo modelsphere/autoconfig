@@ -14,11 +14,11 @@ spec:
     # port 省略 → 自动取(CART 端口)
     outputConfigMap: glm/cart-glm-config  # 本模型专属 = cart chart 的 <fullname>-config(cart-glm → cart-glm-config);autoconfig 只重填 workers 段
     maxLoad: 20                      # 每 worker 的 max_load(默认 20)
-  nginx:                             # nginx(openresty)路由
-    # route 省略 = metadata.name(glm-5.1);= conf 文件名 session_route_<route>.conf + openresty dict 名
-    listen: 18083
+  nginx:                             # nginx(openresty)路由 —— 路径路由(D″):外部经单口 8080/<route>/ 访问
+    # route 省略 = metadata.name(glm-5.1);= conf 文件名 + openresty dict 名 + 【外部路径 key + unix socket 名】
+    # listen 已废弃:per-model server 只监听 unix socket(名=route),镜像 baked 的 8080 dispatch 按 /<route>/ 分发
     outputConfigMap: openresty/openresty-conf   # 【共享】一个 nginx 服务所有模型;每模型一个 key(session_route_glm-5.1.conf)
-    service: openresty/openresty     # 可选:nginx 入口 Service(ns/name)→ monitor 的 nginx: 行(端口用上面的 listen)+ 入口 pod 扩缩事件驱动
+    service: openresty/openresty     # 可选:nginx 入口 Service(ns/name)→ monitor 的 nginx: 行(探 8080/<route>)+ 入口 pod 扩缩事件驱动
     values:                          # 任意调优项,原样渲染进 lua(nginx 加新项无需改代码;数字不加引号)
       ttft_limit_ms: "60000"
       default_max:   "120"           # 没配 maxConcurrency 的 peer 默认并发
@@ -45,8 +45,7 @@ spec:
     # selector 路径按【本 ModelRoute 的 ns】(kimi)发现,不支持 ns/name;port 也可省略(从 containerPort 自动取)
     selector: "leaderworkerset.sigs.k8s.io/name=kimi-k26,leaderworkerset.sigs.k8s.io/worker-index=0"
   nginx:
-    # route 省略 = metadata.name(kimi-k2.6)→ session_route_kimi-k2.6.conf
-    listen: 18082
+    # route 省略 = metadata.name(kimi-k2.6)→ session_route_kimi-k2.6.conf + socket kimi-k2.6.sock;外部走 8080/kimi-k2.6/
     outputConfigMap: openresty/openresty-conf
     peers:
       - { use: backend }

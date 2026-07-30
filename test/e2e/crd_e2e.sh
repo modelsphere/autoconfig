@@ -4,13 +4,13 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖:autoconfig helm chart(默认 $HERE/charts/autoconfig,含 CRD+RBAC+controller)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.19 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.20 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.19}
+IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.20}
 MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
@@ -105,7 +105,6 @@ spec:
   cart: { service: cart-glm, port: 8071, outputConfigMap: $NS/cart-config, maxLoad: 20 }
   nginx:
     route: glm
-    listen: 18083
     outputConfigMap: $NS/openresty-conf
     service: openresty-svc                 # nginx 入口 Service → monitor nginx 行 + 事件驱动
     values: { ttft_limit_ms: "60000" }
@@ -138,7 +137,7 @@ OR=$(kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_gl
 echo "--- openresty session_route_glm.conf ---"; echo "$OR"
 echo "$OR" | grep -qE '8071, "cart-0", 1, 180' && ok "CART peer priority-1 maxConc-180" || bad "无 CART 优先 peer"
 [ "$(echo "$OR" | grep -c '8050, "backend-')" = 2 ] && ok "后端兜底 peer = 2" || bad "后端 peer != 2"
-echo "$OR" | grep -q 'listen 18083' && ok "listen 18083" || bad "无 listen 18083"
+echo "$OR" | grep -q 'listen unix:/usr/local/openresty/nginx/sock/glm.sock' && ok "listen unix socket(路径路由)" || bad "无 socket listen"
 # 顺序:CART 在后端之前
 cl=$(echo "$OR" | grep -n 'cart-0' | head -1 | cut -d: -f1); bl=$(echo "$OR" | grep -n 'backend-0' | head -1 | cut -d: -f1)
 [ -n "$cl" ] && [ -n "$bl" ] && [ "$cl" -lt "$bl" ] && ok "CART 排在后端之前" || bad "CART/后端顺序不对"
@@ -147,7 +146,7 @@ MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm\.monitor\.con
 echo "--- monitor glm.monitor.conf ---"; echo "$MON"
 [ "$(echo "$MON" | grep -c '^service: glm-')" = 2 ] && ok "monitor service 行 = 2(每后端一行)" || bad "monitor service 行 != 2"
 echo "$MON" | grep -q '| glm | H100' && ok "monitor model/gpu_type 正确" || bad "monitor model/gpu_type 不对"
-echo "$MON" | grep -qE '^nginx: glm-0 \| http://.+:18083$' && ok "monitor nginx 行(name=model,port=listen)" || bad "无 monitor nginx 行"
+echo "$MON" | grep -qE '^nginx: glm-0 \| http://.+:8080/glm$' && ok "monitor nginx 行(name=model,8080/glm 路径)" || bad "无 monitor nginx 行"
 echo "$MON" | grep -qE '^router: glm-router-0 \| http://.+:8071/workers$' && ok "monitor router 行(CART /workers)" || bad "无 monitor router 行"
 
 # ---------- 4) scale 跟随 ----------

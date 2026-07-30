@@ -111,7 +111,7 @@ func TestReconcileGLM(t *testing.T) {
 	conf := orCM.Data["session_route_glm.conf"]
 	wantCart := `{ "10.9.0.1", 8071, "cart-0", 1, 200 },` // cart 动态并发 = 后端 100 × 2 后端 = 200
 	wantBe := `{ "10.1.0.1", 8050, "backend-0", 0, 100 },` // 后端 maxConcurrency 100
-	for _, w := range []string{wantCart, wantBe, "listen 18083", "ttft_limit_ms = 60000"} {
+	for _, w := range []string{wantCart, wantBe, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("openresty conf missing %q\n%s", w, conf)
 		}

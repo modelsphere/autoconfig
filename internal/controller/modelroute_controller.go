@@ -35,6 +35,9 @@ const (
 	finalizer = "routing.gpucluster.io/cleanup"
 	// 重新发现的轮询周期(informer 事件之外的兜底 resync)。
 	resyncEvery = 10 * time.Second
+	// dispatchPort:openresty 镜像里 baked 的路径路由 dispatch 端口(单外部口)。monitor 的 nginx 行
+	// 探这个口 + /<route> 路径(路径路由 D″);不再是 per-model 的 spec.nginx.listen。
+	dispatchPort = 8080
 )
 
 // ModelRouteReconciler 调谐 ModelRoute。
@@ -163,7 +166,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// nginx: 行 —— 复用 spec.nginx 的入口 Service/selector(默认开;spec.monitor.nginx:false 关;没配 service/selector 则跳过)
 		if (m.Nginx == nil || *m.Nginx) && (rb.Spec.Nginx.Service != "" || rb.Spec.Nginx.Selector != "") {
 			// 端口用【本模型的 nginx.listen】→ monitor 每个 nginx 端口代表一个模型(每模型独立 key,不 dedup)
-			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(rb.Spec.Nginx.Service, rb.Spec.Nginx.Selector, rb.Spec.Nginx.Listen, false, rb.Namespace))
+			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(rb.Spec.Nginx.Service, rb.Spec.Nginx.Selector, dispatchPort, false, rb.Namespace))
 			if err != nil {
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil
@@ -180,7 +183,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if gpuType == "" {
 			gpuType = discovery.GPUType(ctx, r.Clientset, backendTarget)
 		}
-		monConf := sink.RenderMonitor(rb.Name, m.Model, gpuType, nginxName, backends, nginxPeers, routerPeers)
+		monConf := sink.RenderMonitor(rb.Name, m.Model, gpuType, nginxName, route, backends, nginxPeers, routerPeers)
 		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
 			map[string]string{monitorKey(rb.Name): monConf}); err != nil {
 			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), m.OutputConfigMap, err)
