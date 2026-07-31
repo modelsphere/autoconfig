@@ -101,6 +101,8 @@ echo "$CART" | grep -q "http://$LEADER_IP:8050" && ok "CART workers = kimi leade
 OR=$(kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_kimi\.conf}')
 echo "$OR" | grep -qE '"cart-0", 1, 180' && ok "openresty CART 优先 peer" || bad "openresty 无 CART peer"
 echo "$OR" | grep -q "$LEADER_IP\", 8050, \"backend-0\"" && ok "openresty 后端兜底=kimi leader" || bad "openresty 后端 peer 不对"
+# 等 nginx 行出现:它依赖 openresty hagate 标 leader(entry Service 有端点),比 service/router 慢
+for i in $(seq 1 45); do kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm-kimi\.monitor\.conf}' 2>/dev/null | grep -qE '^nginx:' && break; sleep 4; done
 MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm-kimi\.monitor\.conf}')
 echo "--- monitor glm-kimi.monitor.conf ---"; echo "$MON"
 echo "$MON" | grep -qE "^service: glm-kimi-0 \| http://$LEADER_IP:8050 \| $MODEL \| A100$" && ok "monitor service=kimi leader" || bad "monitor service 不对"

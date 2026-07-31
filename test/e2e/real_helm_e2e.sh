@@ -125,7 +125,8 @@ kubectl -n "$NS" exec deploy/openresty -c openresty -- sh -c 'cat /usr/local/ope
 kubectl -n "$NS" exec deploy/openresty -c openresty -- /usr/local/openresty/bin/openresty -t >/tmp/ortest 2>&1 && ok "openresty -t 通过(reload 生效的配置合法)" || { bad "openresty -t 失败"; cat /tmp/ortest; }
 
 # monitor:mount 的 glm.monitor.conf 有 service+nginx+router;monitor 加载无解析错误
-for i in $(seq 1 30); do kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc/monitor/conf.d/glm.monitor.conf 2>/dev/null' | grep -q '^router:' && break; sleep 4; done
+# 等 nginx+router 都出现:nginx 行依赖 openresty hagate 标 leader(entry Service 有端点),比 router 慢,不能只等 router
+for i in $(seq 1 45); do M=$(kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc/monitor/conf.d/glm.monitor.conf 2>/dev/null'); echo "$M" | grep -qE '^nginx:' && echo "$M" | grep -qE '^router:' && break; sleep 4; done
 MM=$(kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc/monitor/conf.d/glm.monitor.conf 2>/dev/null')
 echo "--- monitor pod 内 glm.monitor.conf ---"; echo "$MM"
 [ "$(echo "$MM" | grep -c '^service: glm-')" -ge 2 ] && ok "monitor 消费 service 行(每后端一行)" || bad "monitor service 行不对"
