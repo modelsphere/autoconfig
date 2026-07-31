@@ -20,6 +20,17 @@ spec:
       {{- if .Values.reload.enabled }}
       shareProcessNamespace: true
       {{- end }}
+      {{- if .Values.waitForWorkers }}
+      initContainers:
+        # 等 autoconfig 把真 workers(url: http://...)写进 config.yaml 再启 cart —— CART 拒绝空 workers 会崩溃循环。
+        # 停在 Init 而非 CrashLoop;workers 就绪(或 ~10min 超时兜底)后放行。用 cart 镜像自身(已在,免额外拉)。
+        - name: wait-workers
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          command: ["sh", "-c", "for i in $(seq 1 300); do grep -qE 'url:[[:space:]]*http' /workspace/configs/config.yaml 2>/dev/null && { echo 'workers ready'; exit 0; }; echo \"[$i] 等 autoconfig 写 workers...\"; sleep 2; done; echo 'timeout, 仍放行'; exit 0"]
+          volumeMounts:
+            - name: cfg
+              mountPath: /workspace/configs
+      {{- end }}
       containers:
         - name: cart
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

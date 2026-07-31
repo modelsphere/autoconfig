@@ -5,6 +5,11 @@ image:
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(单 active 保缓存 + 计数正确)
 
+# waitForWorkers:加个 initContainer 等 autoconfig 把真 workers 写进 config.yaml 再启 cart。
+# CART 拒绝空 workers → 会退出崩溃循环(CrashLoopBackOff),直到 autoconfig 写 workers 才恢复。
+# 有了它:pod 停在 Init(等依赖)而非 CrashLoop,workers 就绪后一次性干净启动。设 false 关(如手填了 workers)。
+waitForWorkers: true
+
 # master-standby(主备):ha-gate sidecar 选举,只有 leader 通过 readiness → 只有它进 Service。
 # CART 有本地 radix 缓存,active-active 会分裂缓存 → 命中率下降;单 active 保持一份热缓存。
 ha:
