@@ -4,7 +4,7 @@
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
-#   openresty chart 已迁到 llm-openresty 仓 helm/openresty/ —— 跑前把它拷进 charts/openresty(cart/monitor 仍在本仓 deploy/helm/)。
+#   openresty chart 已迁到 llm-openresty 仓 k8s/helm/openresty/ —— 跑前把它拷进 charts/openresty(cart/monitor 仍在本仓 deploy/helm/)。
 #   IMG_TAG=0.3.22 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

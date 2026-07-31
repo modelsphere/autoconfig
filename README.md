@@ -44,7 +44,7 @@
 ## 消费方接入
 
 autoconfig 只负责把配置**写进已有的 ConfigMap**（不创建 chart、不创建 ConfigMap）；消费方把对应 ConfigMap 挂进自己的 pod。
-cart / monitor 两套 chart 在 `deploy/helm/{cart,monitor}/`；**openresty chart 已迁到 `llm-openresty` 仓的 `helm/openresty/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
+cart / monitor 两套 chart 在 `deploy/helm/{cart,monitor}/`；**openresty chart 已迁到 `llm-openresty` 仓的 `k8s/helm/openresty/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
 
 **openresty 侧 · 路径路由**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
 运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——**单一对外端口、零映射表**。per-model
