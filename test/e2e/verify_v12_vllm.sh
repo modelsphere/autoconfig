@@ -53,7 +53,7 @@ echo "=== Q1 monitor nginx 每端口(monitor-conf)==="
 for i in $(seq 1 30); do kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.opt\.monitor\.conf}' 2>/dev/null | grep -q '^nginx:' && break; sleep 4; done
 MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.opt\.monitor\.conf}')
 echo "--- opt.monitor.conf ---"; echo "$MON"
-echo "$MON" | grep -qE "^nginx: $MODEL_LABEL-0 \| http://.+:8080/opt\$" && ok "nginx:name=model、port=8080/opt(dispatch 路径)" || bad "nginx 行不对"
+echo "$MON" | grep -qE "^nginx: $MODEL_LABEL-nginx-0 \| http://.+:8080/opt\$" && ok "nginx:name=model、port=8080/opt(dispatch 路径)" || bad "nginx 行不对"
 echo "$MON" | grep -qE "^service: opt-0 \| http://.+:8000 \| $MODEL_LABEL \| A100\$" && ok "service:port 自动=8000(EndpointSlice)+ gpu_type 自动=A100(节点 GFD label 推导)" || bad "service 行不对(port/gpu_type)"
 
 echo "=== 真推理 openresty:$LISTEN → CART → vllm-mock(opt-125m)==="

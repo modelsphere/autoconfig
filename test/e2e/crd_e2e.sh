@@ -147,7 +147,7 @@ MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm\.monitor\.con
 echo "--- monitor glm.monitor.conf ---"; echo "$MON"
 [ "$(echo "$MON" | grep -c '^service: glm-')" = 2 ] && ok "monitor service 行 = 2(每后端一行)" || bad "monitor service 行 != 2"
 echo "$MON" | grep -q '| glm | H100' && ok "monitor model/gpu_type 正确" || bad "monitor model/gpu_type 不对"
-echo "$MON" | grep -qE '^nginx: glm-0 \| http://.+:8080/glm$' && ok "monitor nginx 行(name=model,8080/glm 路径)" || bad "无 monitor nginx 行"
+echo "$MON" | grep -qE '^nginx: glm-nginx-0 \| http://.+:8080/glm$' && ok "monitor nginx 行(name=model,8080/glm 路径)" || bad "无 monitor nginx 行"
 echo "$MON" | grep -qE '^router: glm-router-0 \| http://.+:8071/workers$' && ok "monitor router 行(CART /workers)" || bad "无 monitor router 行"
 
 # ---------- 4) scale 跟随 ----------

@@ -15,7 +15,7 @@ func TestRenderMonitor(t *testing.T) {
 	for _, w := range []string{
 		"service: kimi-k2.6-0 | http://10.1.0.1:8050 | kimi-k2.6 | H100",
 		"service: kimi-k2.6-1 | http://10.1.0.2:8050 | kimi-k2.6 | H100",
-		"nginx: openresty-0 | http://10.2.0.1:18080/kimi-k2.6",
+		"nginx: openresty-nginx-0 | http://10.2.0.1:18080/kimi-k2.6",
 		"router: kimi-k2.6-router-0 | http://10.3.0.1:8071/workers",
 	} {
 		if !strings.Contains(out, w) {
