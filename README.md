@@ -30,10 +30,10 @@
 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。一条 ModelRoute 可同时驱动：
 
 - **CART 的 workers**（写 cart-config，专属 → ownerRef 级联 GC）；`cart` 段可选，省略 = nginx 直连后端。
-- **nginx 的 peers**（`spec.nginx`，写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。`route` 省略 = `metadata.name`。
+- **nginx 的 peers**（`spec.nginx`，写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。`route` 省略 = `metadata.name`；它同时是 **外部路径 key `/<route>/`** 与 per-model unix socket 名（见下「消费方接入 · openresty 侧」的路径路由）。
 - **monitor 的三类行**（`spec.monitor`，可选；每模型一个 key）：
   - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；`model` 省略 = `metadata.name`；`gpu_type` 省略 = 从后端节点的 `nvidia.com/gpu.product`（GFD）自动推导；
-  - `nginx: <svc>-<i> | http://ip:port` —— **复用 `spec.nginx.service/selector`** 探测 nginx 入口（配了就默认开，`spec.monitor.nginx: false` 关）；
+  - `nginx: <svc>-<i> | http://ip:8080/<route>` —— **复用 `spec.nginx.service/selector`** 探测 nginx 入口（端口取 Service 的 `dispatch` 命名端口 8080，路径 = 本模型 `route`；配了就默认开，`spec.monitor.nginx: false` 关）；
   - `router: <name>-router-<i> | http://ip:port/workers` —— **复用 `spec.cart`** 发现的 CART pod（有 `spec.cart` 时默认开，`spec.monitor.router: false` 关）。
   - monitor 自身每 60s 热加载 monitor.conf、**无需 reload sidecar**（区别于 openresty/CART）；消费方把该 ConfigMap 挂进 monitor pod 即可。
 
@@ -42,14 +42,21 @@
 autoconfig 只负责把配置**写进已有的 ConfigMap**（不创建 chart、不创建 ConfigMap）；消费方把对应 ConfigMap 挂进自己的 pod。
 三套 chart 在 `deploy/helm/{openresty,cart,monitor}/`（各自建初始 ConfigMap + reload/hagate sidecar + Service 门控）。
 
-**openresty 侧**：ConfigMap 整卷挂会覆盖整个目录，而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把
+**openresty 侧 · 路径路由（D″）**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
+运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——**单一对外端口、零映射表**。per-model
+server 只 `listen unix:.../<route>.sock`（不再占 TCP 端口），故 `spec.nginx.route` = 外部路径 key = socket 名；
+autoconfig 生成的 `session_route_<route>.conf` 里就是这个 socket listen。dispatch 把打 8080 的真实客户端 IP 经
+`X-Real-IP` 透传，per-model `set_real_ip_from unix:` 还原 `$remote_addr` → `allow 127.0.0.1` 的调参端点仍只对 in-pod 本地开放。
+
+ConfigMap 整卷挂会覆盖整个目录，而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把
 **session_route*.conf 移到子目录 `conf.d/routes/`**，ConfigMap 只挂到那里；`lua/` + `router_locations.inc` + `nginx.conf`
-仍烤镜像。`nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/routes/*.conf;`（lua_package_path 不变）。
++ **8080 dispatch（在 `session_base.conf`）** 仍烤镜像。`nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/routes/*.conf;`（lua_package_path 不变）。
+reload sidecar 另带 `--sock-dir`：reload 前删掉「无 conf 引用」的孤儿 `.sock`（模型删除后 nginx 不会自动 unlink 残留 socket）。
 
 **reload sidecar**：消费方 pod 加一个容器，镜像 `autoconfig-reload`，+ `shareProcessNamespace: true` + 把输出 ConfigMap
 **整卷挂**（非 subPath——subPath 不随 ConfigMap 更新）：
 ```yaml
-args: ["--watch","/watch","--process","nginx: master"]   # 或 "cache-aware-router"
+args: ["--watch","/watch","--process","nginx: master","--sock-dir","/usr/local/openresty/nginx/sock"]   # CART 侧：--process cache-aware-router，无 --sock-dir
 ```
 
 ## 用法
