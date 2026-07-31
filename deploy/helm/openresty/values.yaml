@@ -1,6 +1,6 @@
 image:
   repository: harbor.4pd.io/hardcore-tech/llm-openresty
-  tag: "0.3.2-dispatch"     # 路径路由 D2 就绪:8080 dispatch + per-model unix socket
+  tag: "0.3.4-dispatch"     # 路径路由 D2 就绪:8080 dispatch + per-model unix socket(含 query 透传 + unix-socket real_ip 修复)
   pullPolicy: IfNotPresent
 
 replicas: 2                # master-standby:2 副本,只有 leader 收流量(见 ha)
