@@ -103,7 +103,7 @@ echo "$OR" | grep -q "$LEADER_IP\", 8050, \"backend-0\"" && ok "openresty 后端
 MON=$(kubectl -n "$NS" get cm monitor-conf -o jsonpath='{.data.glm-kimi\.monitor\.conf}')
 echo "--- monitor glm-kimi.monitor.conf ---"; echo "$MON"
 echo "$MON" | grep -qE "^service: glm-kimi-0 \| http://$LEADER_IP:8050 \| $MODEL \| A100$" && ok "monitor service=kimi leader" || bad "monitor service 不对"
-echo "$MON" | grep -qE '^nginx: kimi-k2.6-0 \| http://.+:18080$' && ok "monitor nginx 行" || bad "monitor 无 nginx 行"
+echo "$MON" | grep -qE '^nginx: kimi-k2.6-0 \| http://.+:8080/kimi$' && ok "monitor nginx 行" || bad "monitor 无 nginx 行"
 echo "$MON" | grep -qE '^router: glm-kimi-router-0 \|.+/workers$' && ok "monitor router 行" || bad "monitor 无 router 行"
 
 # ---------- 5) 真消费:发一条 /v1/chat/completions 经 openresty→CART→kimi ----------

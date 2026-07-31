@@ -128,7 +128,7 @@ for i in $(seq 1 30); do kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc
 MM=$(kubectl -n "$NS" exec deploy/monitor -- sh -c 'cat /etc/monitor/conf.d/glm.monitor.conf 2>/dev/null')
 echo "--- monitor pod 内 glm.monitor.conf ---"; echo "$MM"
 [ "$(echo "$MM" | grep -c '^service: glm-')" -ge 2 ] && ok "monitor 消费 service 行(每后端一行)" || bad "monitor service 行不对"
-echo "$MM" | grep -qE '^nginx: glm-5.1-fp8-0 \| http://.+:18083$' && ok "monitor 消费 nginx 行(name=model,port=listen)" || bad "monitor 无 nginx 行"
+echo "$MM" | grep -qE '^nginx: glm-5.1-fp8-0 \| http://.+:8080/glm$' && ok "monitor 消费 nginx 行(name=model,8080/route 路径)" || bad "monitor 无 nginx 行"
 echo "$MM" | grep -qE '^router: glm-router-0 \| http://.+:8071/workers$' && ok "monitor 消费 router 行(CART /workers)" || bad "monitor 无 router 行"
 kubectl -n "$NS" logs deploy/monitor --tail=200 2>/dev/null | grep -qiE 'Traceback|ValueError|line [0-9]+:' && bad "monitor 日志有配置解析错误" || ok "monitor 加载 conf.d 无解析错误"
 
