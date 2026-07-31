@@ -54,10 +54,12 @@ type RoutePeer struct {
 
 // NginxSpec:本模型的 nginx(openresty)路由 —— 渲染 peers 到 session_route_<route>.conf。
 type NginxSpec struct {
-	// Route:路由短名(openresty dict/register 用,= conf 文件名 session_route_<route>.conf)。
-	// 省略 = 用 metadata.name。⚠️ 会做 openresty lua_shared_dict 名(active_conns_<route> 等),
-	// 想用简单标识(字母数字/下划线)或 name 含 -/. 时,显式给个短 route。
+	// Route:路由短名(= conf 文件名 session_route_<route>.conf + openresty dict 名 + unix socket 名 <route>.sock
+	// + 外部路径 key /<route>/)。省略 = 用 metadata.name(k8s 名恒小写,天然合规)。
+	// **字符集必须 ⊆ [a-z0-9._-]**:它要做 dispatch 的路径捕获正则 `^/(?<rkey>[a-z0-9._-]+)/`,含大写/其它字符
+	// → dispatch 派生不到 <route>.sock → 该模型经 8080 永远打不通。故加 Pattern 强校验。
 	// +optional
+	// +kubebuilder:validation:Pattern=`^[a-z0-9._-]+$`
 	Route string `json:"route,omitempty"`
 	// Listen:【路径路由 D″ 下已废弃】per-model server 不再监听 TCP 端口,改监听 unix socket
 	// (名 = route),由镜像 baked 的 8080 dispatch 按 /<route>/ 分发;monitor 探 8080/<route>。保留字段仅向后兼容,忽略。

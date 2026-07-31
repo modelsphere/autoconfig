@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -13,9 +14,39 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// listenSockRe 抓 conf 里 `listen unix:/path/<name>.sock;` 的 socket 路径。
+var listenSockRe = regexp.MustCompile(`listen\s+unix:(\S+\.sock)`)
+
+// cleanupOrphanSockets 扫 confDir 全部 *.conf 收集当前在用的 <name>.sock,删 sockDir 里不在其中的 .sock。
+// 模型删除后其 conf 从 ConfigMap 消失,但 nginx reload 不会 unlink 老 worker 已建的 socket 文件 → 残留。
+// 只删「无任何 conf 引用」的,故绝不会误删在用 socket。
+func cleanupOrphanSockets(sockDir, confDir string) {
+	active := map[string]bool{}
+	confs, _ := filepath.Glob(filepath.Join(confDir, "*.conf"))
+	for _, c := range confs {
+		b, err := os.ReadFile(c)
+		if err != nil {
+			return // 读不全宁可不删(避免误判成孤儿)
+		}
+		for _, m := range listenSockRe.FindAllStringSubmatch(string(b), -1) {
+			active[filepath.Base(m[1])] = true
+		}
+	}
+	socks, _ := filepath.Glob(filepath.Join(sockDir, "*.sock"))
+	for _, s := range socks {
+		if !active[filepath.Base(s)] {
+			if err := os.Remove(s); err == nil {
+				log.Printf("[reload] removed orphan socket %s (no conf references it)", s)
+			}
+		}
+	}
+}
+
 // Run watches watchPath (its dir, since ConfigMap updates swap the ..data symlink) and, on change,
 // SIGHUPs the process whose argv[0] matches procMatch (see findPID). Blocks. Needs shareProcessNamespace.
-func Run(watchPath, procMatch string) error {
+// sockDir(可选,路径路由 D″ 用):reload 前删掉「无对应 conf 的孤儿 <name>.sock」——模型删除后 nginx
+// reload 不会 unlink 残留 unix socket 文件,dispatch 打它会 502 且文件长期堆积。为空则不做清理。
+func Run(watchPath, procMatch, sockDir string) error {
 	if watchPath == "" || procMatch == "" {
 		return fmt.Errorf("reload mode needs --watch and --process")
 	}
@@ -35,6 +66,9 @@ func Run(watchPath, procMatch string) error {
 
 	var timer *time.Timer
 	trigger := func() {
+		if sockDir != "" {
+			cleanupOrphanSockets(sockDir, dir) // reload 前清孤儿 socket(见 sockDir 注释)
+		}
 		pid := findPID(procMatch)
 		if pid <= 0 {
 			log.Printf("[reload] process %q not found (skip SIGHUP)", procMatch)

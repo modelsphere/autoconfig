@@ -32,6 +32,8 @@ spec:
           volumeMounts:
             - name: routes                                                    # autoconfig 的路由 conf(整卷挂)
               mountPath: /usr/local/openresty/nginx/conf/conf.d/routes
+            - name: route-sock                                                # 路径路由 dispatch 的 unix socket(与 reload 共享,供清孤儿)
+              mountPath: /usr/local/openresty/nginx/sock
           {{- if .Values.probes.enabled }}
           startupProbe:                     # 慢启动预算:admin 口 /healthz 起来前不判 live/ready(最多 ~60s)
             httpGet: { path: /healthz, port: {{ .Values.adminPort }} }
@@ -50,10 +52,13 @@ spec:
         {{- if .Values.reload.enabled }}
         - name: reload
           image: {{ .Values.reload.image }}
-          args: ["--watch", "/watch", "--process", {{ .Values.reload.process | quote }}]
+          # --sock-dir:reload 前清「无 conf 引用的孤儿 <name>.sock」(路径路由 D″;删模型后残留 socket)
+          args: ["--watch", "/watch", "--process", {{ .Values.reload.process | quote }}, "--sock-dir", "/usr/local/openresty/nginx/sock"]
           volumeMounts:
             - name: routes
               mountPath: /watch
+            - name: route-sock                                                # 与 openresty 共享 socket 目录
+              mountPath: /usr/local/openresty/nginx/sock
         {{- end }}
         {{- if .Values.ha.enabled }}
         - name: hagate                       # master-standby:只有 leader 给自己打 ha-active 标签 → 只有它进 Service
@@ -70,6 +75,8 @@ spec:
         - name: routes
           configMap:
             name: {{ .Values.configMapName }}
+        - name: route-sock                     # 路径路由 dispatch unix socket(emptyDir,per-pod;openresty 建、reload 清孤儿)
+          emptyDir: {}
       {{- if or .Values.affinity .Values.ha.enabled }}
       affinity:
         {{- if .Values.affinity }}

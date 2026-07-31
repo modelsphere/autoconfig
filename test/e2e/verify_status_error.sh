@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 验证:发现失败(多端口 Service 未显式配 port)时,原因写进 ModelRoute status(DiscoverError),
 # kubectl describe/get 看得到——而非只进 controller 日志。前提:controller 已升到目标 tag。
-# 依赖:autoconfig helm chart($HERE/charts/autoconfig)。用法:IMG_TAG=0.3.20 bash verify_status_error.sh
+# 依赖:autoconfig helm chart($HERE/charts/autoconfig)。用法:IMG_TAG=0.3.21 bash verify_status_error.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TAG=${IMG_TAG:-0.3.20}
+TAG=${IMG_TAG:-0.3.21}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC=harbor.4pd.io/hardcore-tech/autoconfig
 AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
