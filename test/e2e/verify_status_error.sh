@@ -37,7 +37,7 @@ kind: ModelRoute
 metadata: { name: mp }
 spec:
   discovery: { service: be-multi }            # ← 多端口且不写 port → 应报 DiscoverError
-  nginx: { route: mp, listen: 18080, outputConfigMap: $NS/openresty-conf, peers: [{ use: backend }] }
+  nginx: { route: mp, outputConfigMap: $NS/openresty-conf, peers: [{ use: backend }] }
 YAML
 kubectl -n "$NS" rollout status deploy/be --timeout=60s | tail -1
 

@@ -31,7 +31,6 @@ spec:
   discovery: { service: kimi/kimi-k26-leader }     # ← ns/name 跨 ns;无 port(自动推导)
   nginx:
     route: xnskimi
-    listen: 18080
     outputConfigMap: $NS/openresty-conf
     peers: [{ use: backend, priority: 0 }]
 YAML
