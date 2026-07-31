@@ -1,5 +1,5 @@
 {{- /* autoconfig openresty 路由模板:每条 route 生成整个 session_route_<route>.conf。
-     路径路由(D″):server 只监听 unix socket(名 = Route = 外部路径 key),由镜像自带的 8080 dispatch
+     路径路由:server 只监听 unix socket(名 = Route = 外部路径 key),由镜像自带的 8080 dispatch
      按 /<Route>/ 派生 socket 分发;不监听 per-model TCP 端口。
      Route(短名,用于 dict/register/socket 名)、Extra(任意调优项)、Peers(发现结果)。 */ -}}
 # {{.Route}} 路由(autoconfig 模板生成,勿手改;改模板或 ModelRoute)

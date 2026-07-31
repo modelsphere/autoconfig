@@ -36,7 +36,7 @@ const (
 	// 重新发现的轮询周期(informer 事件之外的兜底 resync)。
 	resyncEvery = 10 * time.Second
 	// dispatchPortName:openresty chart Service 里路径路由 dispatch 端口的【名字】。monitor 的 nginx 行
-	// 要探 dispatch 口 + /<route> 路径(路径路由 D″),autoconfig 按此名从 openresty Service 取端口号
+	// 要探 dispatch 口 + /<route> 路径(路径路由),autoconfig 按此名从 openresty Service 取端口号
 	//(端口数字只存在于 chart Service,autoconfig 不硬编码)。per-model 路由 conf 只监听 unix socket、不涉端口。
 	dispatchPortName = "dispatch"
 )

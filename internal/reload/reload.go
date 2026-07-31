@@ -44,7 +44,7 @@ func cleanupOrphanSockets(sockDir, confDir string) {
 
 // Run watches watchPath (its dir, since ConfigMap updates swap the ..data symlink) and, on change,
 // SIGHUPs the process whose argv[0] matches procMatch (see findPID). Blocks. Needs shareProcessNamespace.
-// sockDir(可选,路径路由 D″ 用):reload 前删掉「无对应 conf 的孤儿 <name>.sock」——模型删除后 nginx
+// sockDir(可选,路径路由用):reload 前删掉「无对应 conf 的孤儿 <name>.sock」——模型删除后 nginx
 // reload 不会 unlink 残留 unix socket 文件,dispatch 打它会 502 且文件长期堆积。为空则不做清理。
 func Run(watchPath, procMatch, sockDir string) error {
 	if watchPath == "" || procMatch == "" {

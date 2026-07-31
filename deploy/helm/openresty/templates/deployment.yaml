@@ -52,7 +52,7 @@ spec:
         {{- if .Values.reload.enabled }}
         - name: reload
           image: {{ .Values.reload.image }}
-          # --sock-dir:reload 前清「无 conf 引用的孤儿 <name>.sock」(路径路由 D″;删模型后残留 socket)
+          # --sock-dir:reload 前清「无 conf 引用的孤儿 <name>.sock」(路径路由;删模型后残留 socket)
           args: ["--watch", "/watch", "--process", {{ .Values.reload.process | quote }}, "--sock-dir", "/usr/local/openresty/nginx/sock"]
           volumeMounts:
             - name: routes

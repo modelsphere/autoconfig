@@ -56,9 +56,9 @@ func TestReconcileGLM(t *testing.T) {
 				Route: "glm", OutputConfigMap: "openresty/openresty-conf",
 				Values: map[string]string{"ttft_limit_ms": "60000"},
 				Peers: []routingv1.RoutePeer{
-					{Use: "cart", Priority: 1, MaxConcurrencyFromBackend: true}, // 动态 = 后端并发 × 后端数
-					{Use: "backend", Priority: 0, MaxConcurrency: 100},          // 单实例 100,2 个后端 → cart=200
-					{Use: "backend-svc", Priority: -1},                          // 后端 Service VIP 静态兜底(最低优先级)
+					{Use: "cart", Priority: 3, MaxConcurrencyFromBackend: true}, // 动态 = 后端并发 × 后端数
+					{Use: "backend", Priority: 2, MaxConcurrency: 100},          // 单实例 100,2 个后端 → cart=200
+					{Use: "backend-svc", Priority: 1},                           // 后端 Service VIP 静态兜底(最低优先级)
 				},
 			},
 			Monitor: &routingv1.MonitorSpec{
@@ -119,15 +119,15 @@ func TestReconcileGLM(t *testing.T) {
 		t.Fatalf("get openresty-conf: %v", err)
 	}
 	conf := orCM.Data["session_route_glm.conf"]
-	wantCart := `{ "10.96.0.71", 8071, "cart-0", 1, 200 },`        // cart 走 CART Service 的 ClusterIP(VIP);动态并发 = 后端 100 × 2 = 200
-	wantBe := `{ "10.1.0.1", 8050, "backend-0", 0, 100 },`         // 后端 pod IP,maxConcurrency 100
-	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", -1 },` // 后端 Service VIP 静态兜底,priority -1
+	wantCart := `{ "10.96.0.71", 8071, "cart-0", 3, 200 },`       // cart 走 CART Service 的 ClusterIP(VIP);动态并发 = 后端 100 × 2 = 200
+	wantBe := `{ "10.1.0.1", 8050, "backend-0", 2, 100 },`        // 后端 pod IP,maxConcurrency 100
+	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", 1 },` // 后端 Service VIP 静态兜底,priority 1(最低)
 	for _, w := range []string{wantCart, wantBe, wantFallback, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("openresty conf missing %q\n%s", w, conf)
 		}
 	}
-	// 顺序:cart(prio1)→ backend(prio0)→ backend-svc(prio-1)
+	// 顺序:cart(prio3)→ backend(prio2)→ backend-svc(prio1)
 	if !(strings.Index(conf, wantCart) < strings.Index(conf, wantBe) && strings.Index(conf, wantBe) < strings.Index(conf, wantFallback)) {
 		t.Errorf("peer 顺序应为 cart → backend → backend-svc 兜底\n%s", conf)
 	}

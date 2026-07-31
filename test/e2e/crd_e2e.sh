@@ -108,7 +108,7 @@ spec:
     outputConfigMap: $NS/openresty-conf
     service: openresty-svc                 # nginx 入口 Service → monitor nginx 行 + 事件驱动
     values: { ttft_limit_ms: "60000" }
-    peers: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }, { use: backend-svc, priority: -1 }]
+    peers: [{ use: cart, priority: 3, maxConcurrency: 180 }, { use: backend, priority: 2 }, { use: backend-svc, priority: 1 }]
   monitor:
     outputConfigMap: $NS/monitor-conf
     model: glm
@@ -135,9 +135,9 @@ echo "$CART" | grep -q 'max_load: 20' && ok "max_load 20" || bad "无 max_load 2
 
 OR=$(kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.data.session_route_glm\.conf}' 2>/dev/null)
 echo "--- openresty session_route_glm.conf ---"; echo "$OR"
-echo "$OR" | grep -qE '8071, "cart-0", 1, 180' && ok "CART peer priority-1 maxConc-180(走 CART Service ClusterIP)" || bad "无 CART 优先 peer"
+echo "$OR" | grep -qE '8071, "cart-0", 3, 180' && ok "CART peer priority-3 maxConc-180(走 CART Service ClusterIP)" || bad "无 CART 优先 peer"
 [ "$(echo "$OR" | grep -cE '8050, "backend-[0-9]')" = 2 ] && ok "后端 pod peer = 2" || bad "后端 peer != 2"
-echo "$OR" | grep -qE '8050, "backend-svc-0", -1' && ok "backend-svc 静态兜底 peer(priority -1,后端 Service VIP)" || bad "无 backend-svc 兜底 peer"
+echo "$OR" | grep -qE '8050, "backend-svc-0", 1' && ok "backend-svc 静态兜底 peer(priority 1 最低,后端 Service VIP)" || bad "无 backend-svc 兜底 peer"
 echo "$OR" | grep -q 'listen unix:/usr/local/openresty/nginx/sock/glm.sock' && ok "listen unix socket(路径路由)" || bad "无 socket listen"
 # 顺序:CART 在后端之前
 cl=$(echo "$OR" | grep -n 'cart-0' | head -1 | cut -d: -f1); bl=$(echo "$OR" | grep -n 'backend-0' | head -1 | cut -d: -f1)

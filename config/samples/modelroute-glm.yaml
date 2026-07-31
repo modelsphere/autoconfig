@@ -15,7 +15,7 @@ spec:
     # port 省略 → 取 Service 的 frontend 端口(单端口自动;VIP 兜底同理)
     outputConfigMap: glm/cart-glm-config  # 本模型专属 = cart chart 的 <fullname>-config(cart-glm → cart-glm-config);autoconfig 只重填 workers 段
     maxLoad: 20                      # 每 worker 的 max_load(默认 20)
-  nginx:                             # nginx(openresty)路由 —— 路径路由(D″):外部经单口 8080/<route>/ 访问
+  nginx:                             # nginx(openresty)路由 —— 路径路由:外部经单口 8080/<route>/ 访问
     # route 省略 = metadata.name(glm-5.1);= conf 文件名 + openresty dict 名 + 【外部路径 key + unix socket 名】
     # listen 已废弃:per-model server 只监听 unix socket(名=route),镜像 baked 的 8080 dispatch 按 /<route>/ 分发
     outputConfigMap: openresty/openresty-conf   # 【共享】一个 nginx 服务所有模型;每模型一个 key(session_route_glm-5.1.conf)
@@ -24,9 +24,9 @@ spec:
       ttft_limit_ms: "60000"
       default_max:   "120"           # 没配 maxConcurrency 的 peer 默认并发
     peers:                           # 有序 peer 组(数字大=优先;高优层全 banned 才级联到低层):CART → 后端 pod → VIP 兜底
-      - { use: cart,        priority: 1,  maxConcurrencyFromBackend: true } # CART(ClusterIP);动态并发=后端单实例 × 后端数
-      - { use: backend,     priority: 0,  maxConcurrency: 120 }             # 后端 pod IP(亲和/least_conn 主力);单实例并发 120
-      - { use: backend-svc, priority: -1 }                                 # 后端 Service ClusterIP【静态兜底】:operator 宕+rollout
+      - { use: cart,        priority: 3,  maxConcurrencyFromBackend: true } # CART(ClusterIP);动态并发=后端单实例 × 后端数
+      - { use: backend,     priority: 2,  maxConcurrency: 120 }             # 后端 pod IP(亲和/least_conn 主力);单实例并发 120
+      - { use: backend-svc, priority: 1 }                                  # 后端 Service ClusterIP【静态兜底】:operator 宕+rollout
                                                                            #   致 pod-IP 层全死时级联到 VIP(kube-proxy 维护)→ 降级不全断
   # (backend-svc 需 discovery.service;selector 模式无 VIP 会被自动跳过)
   monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
