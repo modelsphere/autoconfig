@@ -173,7 +173,13 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if s.Use == "cart" && s.MaxConcurrencyFromBackend {
 			mc = backendPerInstance * len(backends) // CART 总容量 = 后端单实例并发 × 后端数(随扩缩自动变)
 		}
-		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc})
+		// 健康探测路径:cart 层默认 /health(其 /v1/models 是缓存端点、worker 全挂也返 200,不能当健康信号);
+		// 其余层默认空=用 route 的 /v1/models。显式 probePath 覆盖(含把 cart 设回 /v1/models)。
+		probePath := s.ProbePath
+		if probePath == "" && s.Use == "cart" {
+			probePath = "/health"
+		}
+		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc, ProbePath: probePath})
 	}
 	route := nginxRoute(&rb)
 	conf, err := sink.RenderRoute(sink.RouteData{

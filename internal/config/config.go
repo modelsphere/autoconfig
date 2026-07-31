@@ -3,17 +3,20 @@ package config
 
 import "fmt"
 
-// Peer is one backend endpoint. Positional openresty form: {ip, port, name[, priority[, maxConcurrency]]}.
+// Peer is one backend endpoint. Positional openresty form: {ip, port, name[, priority[, maxConcurrency]]},
+// 外加可选命名字段 probe = "<健康探测路径>"(见 ProbePath)。
 type Peer struct {
 	IP             string
 	Port           int
 	Name           string
-	Priority       int // openresty only; 0 = default
-	MaxConcurrency int // openresty only; 0 = use route default
-	MaxLoad        int // cart only; 0 = sink default
+	Priority       int    // openresty only; 0 = default
+	MaxConcurrency int    // openresty only; 0 = use route default
+	MaxLoad        int    // cart only; 0 = sink default
+	ProbePath      string // openresty only; 空=用 route 默认(/v1/models)。cart peer 默认 "/health"
 }
 
-// LuaTuple renders the positional lua peer form: "ip", port, "name"[, priority[, maxConcurrency]].
+// LuaTuple renders the positional lua peer form: "ip", port, "name"[, priority[, maxConcurrency]],
+// 再拼可选命名字段 , probe = "<path>"(命名字段不占位置,不影响前面的位置元组)。
 // priority/maxConcurrency 只在非零时才输出(与 openresty peers 的位置约定一致);
 // maxConcurrency 非零必须先补 priority 占位(第 4 位),否则位置错位。
 func (p Peer) LuaTuple() string {
@@ -23,6 +26,9 @@ func (p Peer) LuaTuple() string {
 		if p.MaxConcurrency != 0 {
 			s += fmt.Sprintf(", %d", p.MaxConcurrency)
 		}
+	}
+	if p.ProbePath != "" {
+		s += fmt.Sprintf(", probe = %q", p.ProbePath)
 	}
 	return s
 }
@@ -44,4 +50,5 @@ type RouteSource struct {
 	Target         string
 	Priority       int
 	MaxConcurrency int
+	ProbePath      string // 该层健康探测路径覆盖;空=不覆盖(用 route 默认 /v1/models)。cart 层默认 "/health"
 }

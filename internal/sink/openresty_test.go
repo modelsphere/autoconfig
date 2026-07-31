@@ -15,8 +15,8 @@ func TestResolveSourcesAndRenderRoute(t *testing.T) {
 		"glm-backends": {{IP: "10.1.0.1", Port: 8050}, {IP: "10.1.0.2", Port: 8050}},
 	}
 	peers := ResolveSources(peersByTarget, []config.RouteSource{
-		{Target: "cart-glm", Priority: 1, MaxConcurrency: 180}, // CART 优先
-		{Target: "glm-backends", Priority: 0},                  // 后端兜底
+		{Target: "cart-glm", Priority: 1, MaxConcurrency: 180, ProbePath: "/health"}, // CART 优先,探 /health(worker-aware)
+		{Target: "glm-backends", Priority: 0},                                        // 后端兜底,不带 probe → 探 /v1/models
 	}, "")
 
 	conf, err := RenderRoute(RouteData{Route: "glm", Peers: peers,
@@ -24,9 +24,13 @@ func TestResolveSourcesAndRenderRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderRoute: %v", err)
 	}
-	wantCart := `{ "10.0.0.1", 8071, "cart-glm-0", 1, 180 },`
+	// cart peer 带命名字段 probe = "/health";后端 peer 不带(用 route 默认 /v1/models)
+	wantCart := `{ "10.0.0.1", 8071, "cart-glm-0", 1, 180, probe = "/health" },`
 	wantBe1 := `{ "10.1.0.1", 8050, "glm-backends-0" },`
 	wantBe2 := `{ "10.1.0.2", 8050, "glm-backends-1" },`
+	if strings.Contains(conf, `"glm-backends-0", `) { // 后端不该出现任何 probe/priority 尾巴
+		t.Errorf("backend peer should stay bare (no probe/priority)\n%s", conf)
+	}
 	// Extra 任意 key(含 openresty 以后新加的)都渲染,无需改代码
 	for _, w := range []string{wantCart, wantBe1, wantBe2, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000,", "zz_new_tunable = 9,"} {
 		if !strings.Contains(conf, w) {

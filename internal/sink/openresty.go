@@ -66,6 +66,9 @@ func ResolveSources(peersByTarget map[string][]config.Peer, sources []config.Rou
 			if src.MaxConcurrency != 0 {
 				p.MaxConcurrency = src.MaxConcurrency
 			}
+			if src.ProbePath != "" {
+				p.ProbePath = src.ProbePath
+			}
 			all = append(all, p)
 		}
 	}

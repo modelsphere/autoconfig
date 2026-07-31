@@ -119,9 +119,11 @@ func TestReconcileGLM(t *testing.T) {
 		t.Fatalf("get openresty-conf: %v", err)
 	}
 	conf := orCM.Data["session_route_glm.conf"]
-	wantCart := `{ "10.96.0.71", 8071, "cart-0", 3, 200 },`       // cart 走 CART Service 的 ClusterIP(VIP);动态并发 = 后端 100 × 2 = 200
-	wantBe := `{ "10.1.0.1", 8050, "backend-0", 2, 100 },`        // 后端 pod IP,maxConcurrency 100
-	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", 1 },` // 后端 Service VIP 静态兜底,priority 1(最低)
+	// cart 走 CART Service 的 ClusterIP(VIP);动态并发 = 后端 100 × 2 = 200;探针默认 /health(worker-aware,
+	// 因 cart 的 /v1/models 是缓存端点、worker 全挂也返 200,不能当健康信号 → 否则 cart 永不 ban、兜底被 mask)。
+	wantCart := `{ "10.96.0.71", 8071, "cart-0", 3, 200, probe = "/health" },`
+	wantBe := `{ "10.1.0.1", 8050, "backend-0", 2, 100 },`        // 后端 pod IP,maxConcurrency 100,不带 probe → 探 /v1/models
+	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", 1 },` // 后端 Service VIP 静态兜底,priority 1(最低),探 /v1/models
 	for _, w := range []string{wantCart, wantBe, wantFallback, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("openresty conf missing %q\n%s", w, conf)

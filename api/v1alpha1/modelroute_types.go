@@ -52,6 +52,12 @@ type RoutePeer struct {
 	// 后端单实例并发取 use:backend 组的 maxConcurrency —— CEL 校验强制此时它必须 > 0(见 ModelRouteSpec)。
 	// +optional
 	MaxConcurrencyFromBackend bool `json:"maxConcurrencyFromBackend,omitempty"`
+	// ProbePath:该层 openresty 健康探测路径覆盖(GET <path> 状态行含 200=健康,否则 ban)。
+	// 省略时:use:cart 默认 "/health"(cache_aware_router 的 /v1/models 是缓存端点、worker 全挂也返 200
+	// 不能当健康信号;/health 是 worker-aware 的),其余层默认空=用 route 的 health_probe_path(/v1/models)。
+	// 显式设值(含对 cart 设为 "/v1/models")覆盖默认。
+	// +optional
+	ProbePath string `json:"probePath,omitempty"`
 }
 
 // NginxSpec:本模型的 nginx(openresty)路由 —— 渲染 peers 到 session_route_<route>.conf。
