@@ -9,7 +9,7 @@
 
 ## 工作原理
 
-![autoconfig 架构：controller 按 Service 发现后端端点 → 写 openresty / CART / monitor 三个 ConfigMap，消费方里 reload sidecar 收 SIGHUP 热重载](docs/architecture.png)
+![autoconfig 架构：controller 按 Service 发现后端端点 → 写 openresty / CART / monitor 三个 ConfigMap；openresty/CART 里 reload sidecar 收 SIGHUP 热重载，monitor 自身每 60s 热加载](docs/architecture.png)
 
 三个独立二进制 / 镜像，各司其职：
 
@@ -22,7 +22,7 @@
 **master-standby（hagate）细节**：leader 选举用 Lease `<name>-ha`；计划内下线（SIGTERM）主动释放 Lease + 摘标签
 → standby ~1-2s 接管；硬崩则等 Lease 过期接管。标签协调是 **level-triggered**——每 2s 读 pod 实际标签与「该不该 active
 （是 leader 且本地 app 端口可连）」比对，不符就纠正，**标签被外部弄掉也能自愈**。openresty/cart 默认开
-（`replicas: 2` + `ha.enabled: true`）；monitor 默认关（`replicas: 1`，采集/告警是自主循环，不靠 Service 门控）。
+（`replicas: 2` + `ha.enabled: true`）；**monitor 不做 HA**（单例 `replicas: 1` + Recreate，采集/告警是自主循环、readiness 门控挡不住，故 monitor chart 无 hagate）。
 
 ## 输入：ModelRoute CRD
 
@@ -44,7 +44,7 @@
 ## 消费方接入
 
 autoconfig 只负责把配置**写进已有的 ConfigMap**（不创建 chart、不创建 ConfigMap）；消费方把对应 ConfigMap 挂进自己的 pod。
-cart / monitor 两套 chart 在 `deploy/helm/{cart,monitor}/`；**openresty chart 已迁到 `llm-openresty` 仓的 `k8s/helm/openresty/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
+cart chart 在 `deploy/helm/cart/`；**openresty / monitor chart 已分别迁到 `llm-openresty` 仓 `k8s/helm/openresty/` 与 `llm-monitor` 仓 `k8s/helm/monitor/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
 
 **openresty 侧 · 路径路由**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
 运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——**单一对外端口、零映射表**。per-model
@@ -105,8 +105,8 @@ docker 已 login harbor）。该 runner 只 go1.17.6 且够不到外网，故用
 - **CRD controller**（现版）：k8s-cpu-20 + **mock 后端**已验——发现分桶、**写出的 cart-config/openresty-conf/monitor-conf
   内容正确**、status、scale 跟随、fail-safe、删除清理（finalizer/ownerRef）、`make install`/`make deploy`。即验到「autoconfig
   写对 ConfigMap」为止。
-- **真 openresty + 真 CART + 真 monitor 端到端接入**（经 helm chart，真 reload/serve、master-standby failover）：见
-  `test/e2e/real_helm_e2e.sh`、`ha_failover_check.sh`；真后端（kimi LWS / vllm）见 `real_kimi_e2e.sh` / `verify_v12_vllm.sh`。
+- **真 openresty + 真 CART + 真 monitor 端到端接入**（经 helm chart，真 reload/serve、master-standby failover）：
+  `test/e2e/real_helm_e2e.sh` **已跑通 ALL PASS**（k8s-cpu-20：真 reload 热更、路径路由 unix socket、`openresty -t`、scale 跟随、monitor service/nginx/router 行；live pod 验 openresty `terminationGracePeriodSeconds`/`preStop`）；另见 `ha_failover_check.sh`，真后端（kimi LWS / vllm）见 `real_kimi_e2e.sh` / `verify_v12_vllm.sh`。
 
 ## 开发布局（kubebuilder / operator-sdk v4）
 

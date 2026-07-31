@@ -3,7 +3,7 @@
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
-#   openresty chart 已迁到 llm-openresty 仓 k8s/helm/openresty/ —— 跑前把它拷进 charts/openresty(cart/monitor 仍在本仓 deploy/helm/)。
+#   openresty / monitor chart 已迁到 llm-openresty / llm-monitor 仓的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor}(cart 仍在本仓 deploy/helm/)。
 #   IMG_TAG=0.3.22 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -67,7 +67,8 @@ helm -n "$NS" upgrade --install cart "$CHARTS/cart" \
   --set reload.image="$ACR" >/dev/null && ok "cart chart installed" || bad "cart chart 装失败"
 helm -n "$NS" upgrade --install monitor "$CHARTS/monitor" \
   --set fullnameOverride=monitor --set image.repository="${MON_IMG%:*}" --set image.tag="${MON_IMG##*:}" \
-  >/dev/null && ok "monitor chart installed" || bad "monitor chart 装失败"
+  --set mysql.enabled=false --set store.backend=file --set rbac.create=false --set accessMode=ssh --set service.type=ClusterIP \
+  >/dev/null && ok "monitor chart installed" || bad "monitor chart 装失败"   # chart 默认 mysql+k8s;e2e 用旧 MON_IMG + 测试集群 → 覆成 file/ssh/无mysql
 # chart 建的 ConfigMap 就位
 waiteq openresty-conf "openresty-conf 已建" kubectl -n "$NS" get cm openresty-conf -o jsonpath='{.metadata.name}'
 waiteq cart-config    "cart-config 已建"    kubectl -n "$NS" get cm cart-config    -o jsonpath='{.metadata.name}'
