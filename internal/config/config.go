@@ -33,8 +33,9 @@ type Target struct {
 	Namespace       string
 	Service         string // Service 名 → 走 EndpointSlice 发现(原生就绪/终止语义)
 	Selector        string // pod label selector → 走 pod 发现(兜底:没建 Service 的单机/单卡)
-	Port            int
-	IncludeNotReady bool // default false = only Ready endpoints
+	Port            int    // 显式端口;0 = 自动(PortName 非空按名取,否则唯一端口推导)
+	PortName        string // 可选:按 Service 端口名取端口(多端口 Service 消歧,如 openresty 的 "dispatch");Port>0 时忽略
+	IncludeNotReady bool   // default false = only Ready endpoints
 }
 
 // RouteSource = 一条 openresty route 的一个 peer 来源:某 target 的发现结果 + priority/maxConcurrency 覆盖。

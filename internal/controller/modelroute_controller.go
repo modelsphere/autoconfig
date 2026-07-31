@@ -35,9 +35,10 @@ const (
 	finalizer = "routing.gpucluster.io/cleanup"
 	// 重新发现的轮询周期(informer 事件之外的兜底 resync)。
 	resyncEvery = 10 * time.Second
-	// dispatchPort:openresty 镜像里 baked 的路径路由 dispatch 端口(单外部口)。monitor 的 nginx 行
-	// 探这个口 + /<route> 路径(路径路由 D″);不再是 per-model 的 spec.nginx.listen。
-	dispatchPort = 8080
+	// dispatchPortName:openresty chart Service 里路径路由 dispatch 端口的【名字】。monitor 的 nginx 行
+	// 要探 dispatch 口 + /<route> 路径(路径路由 D″),autoconfig 按此名从 openresty Service 取端口号
+	//(端口数字只存在于 chart Service,autoconfig 不硬编码)。per-model 路由 conf 只监听 unix socket、不涉端口。
+	dispatchPortName = "dispatch"
 )
 
 // ModelRouteReconciler 调谐 ModelRoute。
@@ -166,7 +167,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// nginx: 行 —— 复用 spec.nginx 的入口 Service/selector(默认开;spec.monitor.nginx:false 关;没配 service/selector 则跳过)
 		if (m.Nginx == nil || *m.Nginx) && (rb.Spec.Nginx.Service != "" || rb.Spec.Nginx.Selector != "") {
 			// 端口用【本模型的 nginx.listen】→ monitor 每个 nginx 端口代表一个模型(每模型独立 key,不 dedup)
-			nginxPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(rb.Spec.Nginx.Service, rb.Spec.Nginx.Selector, dispatchPort, false, rb.Namespace))
+			nginxTarget := discoveryTarget(rb.Spec.Nginx.Service, rb.Spec.Nginx.Selector, 0, false, rb.Namespace)
+			nginxTarget.PortName = dispatchPortName // 按名从 openresty Service 取 dispatch 端口(号在 chart)
+			nginxPeers, err = discovery.Discover(ctx, r.Clientset, nginxTarget)
 			if err != nil {
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil

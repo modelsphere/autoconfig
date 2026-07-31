@@ -110,8 +110,12 @@ func discoverEndpointSlices(ctx context.Context, cs kubernetes.Interface, t conf
 		return nil, err
 	}
 	port := t.Port
-	if port == 0 { // 未显式配 → 从 EndpointSlice 的端口推导
-		port, err = derivePortFromSlices(slices.Items)
+	if port == 0 {
+		if t.PortName != "" { // 按名取(多端口 Service 消歧,如 openresty 的 dispatch/health)
+			port, err = portByName(slices.Items, t.PortName)
+		} else { // 从 EndpointSlice 的端口推导(唯一端口)
+			port, err = derivePortFromSlices(slices.Items)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("service %s/%s: %w", t.Namespace, t.Service, err)
 		}
@@ -200,6 +204,18 @@ func derivePortFromPods(items []corev1.Pod) (int, error) {
 		}
 	}
 	return uniquePort(set, "pod containerPort")
+}
+
+// portByName 从 EndpointSlice 里取名为 name 的端口(Service 端口名会镜像到 EndpointSlice)。
+func portByName(items []discoveryv1.EndpointSlice, name string) (int, error) {
+	for i := range items {
+		for _, p := range items[i].Ports {
+			if p.Name != nil && *p.Name == name && p.Port != nil && *p.Port > 0 {
+				return int(*p.Port), nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("EndpointSlice 无名为 %q 的端口", name)
 }
 
 func uniquePort(set map[int32]bool, src string) (int, error) {
