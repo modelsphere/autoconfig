@@ -10,7 +10,7 @@ import (
 // RenderMonitor 渲染一个模型在 monitor.conf 里的块(与现有 monitor.conf 约定一致):
 //
 //	service: <mrName>-<i> | http://ip:port | <model> | <gpu_type>   —— 后端(每实例一行)
-//	nginx:   <nginxName>-<i> | http://ip:<port>/<route>             —— openresty 入口(路径路由 D″:port=8080 dispatch、
+//	nginx:   <nginxName>-<i> | http://ip:<port>/<route>             —— openresty 入口(路径路由:port=8080 dispatch、
 //	                                                                   带 /<route> 路径;monitor 探 /<route>/_active_conns 等,per-model 探活/503 照旧)
 //	router:  <mrName>-router-<i> | http://ip:port/workers            —— CART(Router tab;url 为 /workers 端点)
 //

@@ -158,11 +158,14 @@ spec:
                           description: Priority:openresty peer 优先级(CART 优先=1,后端兜底=0)。
                           type: integer
                         use:
-                          description: Use:"cart"(引用本模型的 CART pod)或 "backend"(引用 discovery
-                            的后端桶)。
+                          description: |-
+                            Use:"cart"(CART 上游,走 CART Service 的 ClusterIP)、"backend"(discovery 的后端桶,pod IP)、
+                            或 "backend-svc"(后端 Service 的 ClusterIP VIP,作最低优先级【静态兜底】——operator 宕+rollout 时
+                            pod-IP 层全死也不全断,降级走 kube-proxy;需 discovery.service,selector 模式无 VIP 会被跳过)。
                           enum:
                           - cart
                           - backend
+                          - backend-svc
                           type: string
                       required:
                       - use

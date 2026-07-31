@@ -20,7 +20,7 @@ func main() {
 
 	watch := flag.String("watch", envOr("PS_WATCH", ""), "file/dir to watch")
 	proc := flag.String("process", envOr("PS_PROCESS", ""), "process cmdline substring to SIGHUP")
-	sockDir := flag.String("sock-dir", envOr("PS_SOCK_DIR", ""), "可选:reload 前清此目录里无 conf 引用的孤儿 *.sock(路径路由 D″)")
+	sockDir := flag.String("sock-dir", envOr("PS_SOCK_DIR", ""), "可选:reload 前清此目录里无 conf 引用的孤儿 *.sock(路径路由)")
 	flag.Parse()
 
 	if err := reload.Run(*watch, *proc, *sockDir); err != nil {
