@@ -1,7 +1,0 @@
-apiVersion: v2
-name: monitor
-description: llm-monitor(k8s)——services 由 autoconfig 从 ModelRoute 写入,monitor 每 60s 自热加载 monitor.conf(无 sidecar)
-type: application
-version: 0.1.1
-appVersion: "0.1.0"
-keywords: [monitor, autoconfig]

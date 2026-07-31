@@ -4,7 +4,7 @@
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
-#   openresty chart 已迁到 llm-openresty 仓 k8s/helm/openresty/ —— 跑前把它拷进 charts/openresty(cart/monitor 仍在本仓 deploy/helm/)。
+#   openresty / monitor chart 已迁到 llm-openresty / llm-monitor 仓的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor}(cart 仍在本仓 deploy/helm/)。
 #   IMG_TAG=0.3.22 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -62,7 +62,8 @@ helm -n "$NS" upgrade --install cart "$CHARTS/cart" \
   --set reload.image="$ACR" >/dev/null && ok "cart chart" || bad "cart chart 装失败"
 helm -n "$NS" upgrade --install monitor "$CHARTS/monitor" \
   --set fullnameOverride=monitor --set image.repository="${MON_IMG%:*}" --set image.tag="${MON_IMG##*:}" \
-  >/dev/null && ok "monitor chart" || bad "monitor chart 装失败"
+  --set mysql.enabled=false --set store.backend=file --set rbac.create=false --set accessMode=ssh --set service.type=ClusterIP \
+  >/dev/null && ok "monitor chart" || bad "monitor chart 装失败"   # chart 默认 mysql+k8s;e2e 覆成 file/ssh/无mysql
 
 # ---------- 3) ModelRoute:discovery = 真 kimi leader ----------
 say "apply ModelRoute(discovery=$KIMI_SVC:8050,真 kimi 后端)"
