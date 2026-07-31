@@ -38,8 +38,10 @@ type CartSpec struct {
 
 // RoutePeer:openresty 一条 route 的一组 peer 来源(cart 组 / backend 组)。
 type RoutePeer struct {
-	// Use:"cart"(引用本模型的 CART pod)或 "backend"(引用 discovery 的后端桶)。
-	// +kubebuilder:validation:Enum=cart;backend
+	// Use:"cart"(CART 上游,走 CART Service 的 ClusterIP)、"backend"(discovery 的后端桶,pod IP)、
+	// 或 "backend-svc"(后端 Service 的 ClusterIP VIP,作最低优先级【静态兜底】——operator 宕+rollout 时
+	// pod-IP 层全死也不全断,降级走 kube-proxy;需 discovery.service,selector 模式无 VIP 会被跳过)。
+	// +kubebuilder:validation:Enum=cart;backend;backend-svc
 	Use string `json:"use"`
 	// Priority:openresty peer 优先级(CART 优先=1,后端兜底=0)。
 	Priority int `json:"priority,omitempty"`

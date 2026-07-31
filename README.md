@@ -31,6 +31,10 @@
 
 - **CART 的 workers**（写 cart-config，专属 → ownerRef 级联 GC）；`cart` 段可选，省略 = nginx 直连后端。
 - **nginx 的 peers**（`spec.nginx`，写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。`route` 省略 = `metadata.name`；它同时是 **外部路径 key `/<route>/`** 与 per-model unix socket 名（见下「消费方接入 · openresty 侧」的路径路由）。
+  peers 是有序分层（数字大=优先，高优层全 banned 才级联到低层），三种 `use`：
+  - `cart`（priority 1）—— CART 上游，走 **CART Service 的 ClusterIP（VIP，非 pod IP）**：CART 是 master-standby，VIP 恒指 active leader → CART failover/rollout 对 openresty 透明，autoconfig 无需重写。
+  - `backend`（priority 0）—— 后端 **pod IP**（session 亲和 / least_conn / per-peer 健康的主力层）。
+  - `backend-svc`（priority -1，可选兜底）—— 后端 **Service 的 ClusterIP（VIP）静态兜底**。意义：**autoconfig 本身宕 + 后端 rollout** 时，pod-IP 层是死 IP 且没人重写 → 若无兜底会全断；VIP 由 kube-proxy 维护、不依赖 autoconfig 存活，pod-IP 层全 banned 后 openresty 级联到它 → **降级（走 kube-proxy、无亲和）但不全断**。需 `discovery.service`（selector 模式无 VIP，自动跳过）。
 - **monitor 的三类行**（`spec.monitor`，可选；每模型一个 key）：
   - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；`model` 省略 = `metadata.name`；`gpu_type` 省略 = 从后端节点的 `nvidia.com/gpu.product`（GFD）自动推导；
   - `nginx: <svc>-<i> | http://ip:8080/<route>` —— **复用 `spec.nginx.service/selector`** 探测 nginx 入口（端口取 Service 的 `dispatch` 命名端口 8080，路径 = 本模型 `route`；配了就默认开，`spec.monitor.nginx: false` 关）；

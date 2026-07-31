@@ -4,12 +4,55 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"autoconfig/internal/config"
 )
+
+func svcObj(name, ns, clusterIP string, ports ...int32) *corev1.Service {
+	var sp []corev1.ServicePort
+	for _, p := range ports {
+		sp = append(sp, corev1.ServicePort{Port: p})
+	}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       corev1.ServiceSpec{ClusterIP: clusterIP, Ports: sp},
+	}
+}
+
+// ServiceClusterIP:返回 Service 的 ClusterIP(VIP)单 peer;headless/无 VIP 报错;端口按 frontend 取/校验。
+func TestServiceClusterIP(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		svcObj("cart-glm", "glm", "10.96.0.71", 8071),
+		svcObj("headless", "glm", corev1.ClusterIPNone, 8050),
+		svcObj("multi", "glm", "10.96.0.9", 8071, 9090),
+	)
+	ctx := context.Background()
+	// 单端口:自动取 frontend 端口
+	peers, err := ServiceClusterIP(ctx, cs, config.Target{Namespace: "glm", Service: "cart-glm"})
+	if err != nil || len(peers) != 1 || peers[0].IP != "10.96.0.71" || peers[0].Port != 8071 {
+		t.Fatalf("single-port: got %v err %v", peers, err)
+	}
+	// headless(ClusterIP=None)→ 报错(没有可兜底的 VIP)
+	if _, err := ServiceClusterIP(ctx, cs, config.Target{Namespace: "glm", Service: "headless"}); err == nil {
+		t.Errorf("headless 应报错(无 ClusterIP)")
+	}
+	// 多端口未指定 port → 报错(要求显式)
+	if _, err := ServiceClusterIP(ctx, cs, config.Target{Namespace: "glm", Service: "multi"}); err == nil {
+		t.Errorf("多端口未指定 port 应报错")
+	}
+	// 多端口 + hint 命中 frontend → OK
+	if peers, err := ServiceClusterIP(ctx, cs, config.Target{Namespace: "glm", Service: "multi", Port: 9090}); err != nil || peers[0].Port != 9090 {
+		t.Fatalf("multi-port hint: got %v err %v", peers, err)
+	}
+	// hint 不是 frontend 端口(误传 targetPort)→ 报错
+	if _, err := ServiceClusterIP(ctx, cs, config.Target{Namespace: "glm", Service: "cart-glm", Port: 6700}); err == nil {
+		t.Errorf("非 frontend 端口应报错")
+	}
+}
 
 func boolp(b bool) *bool { return &b }
 
@@ -26,8 +69,8 @@ func TestDiscoverEndpointSlices(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		slice("glm-leader-1", "glm-leader",
 			discoveryv1.Endpoint{Addresses: []string{"10.1.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: boolp(true)}},
-			discoveryv1.Endpoint{Addresses: []string{"10.1.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: boolp(false)}},         // 未就绪
-			discoveryv1.Endpoint{Addresses: []string{"10.1.0.3"}, Conditions: discoveryv1.EndpointConditions{}},                             // Ready=nil → 就绪
+			discoveryv1.Endpoint{Addresses: []string{"10.1.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: boolp(false)}},                                                 // 未就绪
+			discoveryv1.Endpoint{Addresses: []string{"10.1.0.3"}, Conditions: discoveryv1.EndpointConditions{}},                                                                    // Ready=nil → 就绪
 			discoveryv1.Endpoint{Addresses: []string{"10.1.0.4"}, Conditions: discoveryv1.EndpointConditions{Ready: boolp(false), Serving: boolp(true), Terminating: boolp(true)}}, // 排空中 → 排除
 		),
 		slice("glm-leader-2", "glm-leader", // 分片 2(sharding)聚合

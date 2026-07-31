@@ -20,6 +20,13 @@ import (
 
 func boolp(b bool) *bool { return &b }
 
+func svcClusterIP(name, ns, clusterIP string, port int32) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       corev1.ServiceSpec{ClusterIP: clusterIP, Ports: []corev1.ServicePort{{Port: port}}},
+	}
+}
+
 func epslice(name, svc, ns string, ips ...string) *discoveryv1.EndpointSlice {
 	var eps []discoveryv1.Endpoint
 	for _, ip := range ips {
@@ -51,6 +58,7 @@ func TestReconcileGLM(t *testing.T) {
 				Peers: []routingv1.RoutePeer{
 					{Use: "cart", Priority: 1, MaxConcurrencyFromBackend: true}, // 动态 = 后端并发 × 后端数
 					{Use: "backend", Priority: 0, MaxConcurrency: 100},          // 单实例 100,2 个后端 → cart=200
+					{Use: "backend-svc", Priority: -1},                          // 后端 Service VIP 静态兜底(最低优先级)
 				},
 			},
 			Monitor: &routingv1.MonitorSpec{
@@ -71,6 +79,8 @@ func TestReconcileGLM(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset(
 		epslice("glm-leader-1", "glm-leader", "glm", "10.1.0.1", "10.1.0.2"),
 		epslice("cart-glm-1", "cart-glm", "glm", "10.9.0.1"),
+		svcClusterIP("cart-glm", "glm", "10.96.0.71", 8071),   // cart peer 走这个 VIP(非 pod IP)
+		svcClusterIP("glm-leader", "glm", "10.96.0.50", 8050), // backend-svc 兜底走后端 Service VIP
 	)
 	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
 	nn := types.NamespacedName{Namespace: "glm", Name: "glm-5.1-fp8"}
@@ -109,15 +119,17 @@ func TestReconcileGLM(t *testing.T) {
 		t.Fatalf("get openresty-conf: %v", err)
 	}
 	conf := orCM.Data["session_route_glm.conf"]
-	wantCart := `{ "10.9.0.1", 8071, "cart-0", 1, 200 },` // cart 动态并发 = 后端 100 × 2 后端 = 200
-	wantBe := `{ "10.1.0.1", 8050, "backend-0", 0, 100 },` // 后端 maxConcurrency 100
-	for _, w := range []string{wantCart, wantBe, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000"} {
+	wantCart := `{ "10.96.0.71", 8071, "cart-0", 1, 200 },`        // cart 走 CART Service 的 ClusterIP(VIP);动态并发 = 后端 100 × 2 = 200
+	wantBe := `{ "10.1.0.1", 8050, "backend-0", 0, 100 },`         // 后端 pod IP,maxConcurrency 100
+	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", -1 },` // 后端 Service VIP 静态兜底,priority -1
+	for _, w := range []string{wantCart, wantBe, wantFallback, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("openresty conf missing %q\n%s", w, conf)
 		}
 	}
-	if strings.Index(conf, wantCart) > strings.Index(conf, wantBe) {
-		t.Errorf("CART peer 应在后端 peer 之前\n%s", conf)
+	// 顺序:cart(prio1)→ backend(prio0)→ backend-svc(prio-1)
+	if !(strings.Index(conf, wantCart) < strings.Index(conf, wantBe) && strings.Index(conf, wantBe) < strings.Index(conf, wantFallback)) {
+		t.Errorf("peer 顺序应为 cart → backend → backend-svc 兜底\n%s", conf)
 	}
 
 	// monitor:共享 ConfigMap 里本模型一个 key,每后端一行 service

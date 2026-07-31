@@ -54,6 +54,7 @@ type ModelRouteReconciler struct {
 // +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
@@ -116,15 +117,41 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
 			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), 0, c.OutputConfigMap, err)
 		}
-		cartPeers, err = discovery.Discover(ctx, r.Clientset, discoveryTarget(c.Service, c.Selector, c.Port, false, rb.Namespace))
+		// CART 作为 openresty 的 priority-1 单一上游:走 CART Service 的 ClusterIP(VIP)而非 pod IP。
+		// CART 是 hagate master-standby(Service selector 带 active 标签 → VIP 恒指当前 leader);用 VIP →
+		// CART rollout / failover 对 openresty 透明(VIP 不变、kube-proxy 维护),autoconfig 无需重写/reload。
+		// 没配 service(仅 selector)时退回 pod IP 发现(拿不到 VIP)。
+		cartTarget := discoveryTarget(c.Service, c.Selector, c.Port, false, rb.Namespace)
+		if cartTarget.Service != "" {
+			cartPeers, err = discovery.ServiceClusterIP(ctx, r.Clientset, cartTarget)
+		} else {
+			cartPeers, err = discovery.Discover(ctx, r.Clientset, cartTarget)
+		}
 		if err != nil {
 			r.setStatus(ctx, req.NamespacedName, len(backends), 0, false, "DiscoverError", fmt.Sprintf("discover cart: %v", err))
 			return ctrl.Result{RequeueAfter: resyncEvery}, nil
 		}
 	}
 
-	// 3) nginx:按 peers 组(cart 优先 + backend 兜底)拼 peers → 模板生成整条 conf
+	// 3) nginx:按 peers 组(cart 优先 + backend + backend-svc 兜底)拼 peers → 模板生成整条 conf
 	peersByTarget := map[string][]config.Peer{"backend": backends, "cart": cartPeers}
+
+	// backend-svc:后端 Service 的 ClusterIP(VIP)作最低优先级【静态兜底】peer(见 sample:use:backend-svc,priority:-1)。
+	// 意义:autoconfig(operator)宕 + 后端 rollout 时,openresty 里 pod-IP 层是死 IP 且没人重写 → 若无兜底则全断;
+	// VIP 由 kube-proxy 维护、operator 不参与,pod-IP 层全 banned 后 openresty 级联到它 → 降级(无亲和)但不全断。
+	// 仅当有 peer 引用 backend-svc、且后端走 Service 发现(selector 无 VIP)时解析;解析不到就跳过(不阻塞路由)。
+	if usesBackendSvc(rb.Spec.Nginx.Peers) {
+		if svc := rb.Spec.Discovery.Service; svc != "" {
+			svcPeers, serr := discovery.ServiceClusterIP(ctx, r.Clientset, discoveryTarget(svc, "", rb.Spec.Discovery.Port, false, rb.Namespace))
+			if serr != nil {
+				log.Error(serr, "解析 backend-svc ClusterIP 兜底失败,跳过兜底 peer")
+			} else {
+				peersByTarget["backend-svc"] = svcPeers
+			}
+		} else {
+			log.Info("peers 引用 backend-svc 但 discovery 用 selector(无 ClusterIP)——跳过兜底 peer")
+		}
+	}
 	// 后端单实例并发(供 cart 动态并发用):backend 组的 maxConcurrency。
 	// CEL 校验保证「maxConcurrencyFromBackend → backend.maxConcurrency>0」,故不需 default_max 兜底;
 	// 万一为 0(校验被绕过),cart 并发=0 → 运行时 nginx 用 conf 里的 default_max 兜。
@@ -138,6 +165,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	for _, s := range rb.Spec.Nginx.Peers {
 		if s.Use == "cart" && rb.Spec.Cart == nil {
 			continue // 声明了 cart 来源但没配 cart,跳过
+		}
+		if s.Use == "backend-svc" && len(peersByTarget["backend-svc"]) == 0 {
+			continue // 兜底 VIP 没解析到(selector 模式 / 解析失败),跳过
 		}
 		mc := s.MaxConcurrency
 		if s.Use == "cart" && s.MaxConcurrencyFromBackend {
@@ -347,6 +377,16 @@ func splitNSName(ref, defaultNS string) (ns, name string) {
 
 // discoveryTarget 构造发现 Target。service 支持 "ns/name"(跨 ns 发现,让 ModelRoute 可放别的 ns),
 // 裸名默认用 ModelRoute 的 ns。selector 路径不支持 ns/name(用默认 ns)。
+// usesBackendSvc 判断 peers 里有没有引用 backend-svc(后端 Service VIP 兜底)来源。
+func usesBackendSvc(peers []routingv1.RoutePeer) bool {
+	for _, p := range peers {
+		if p.Use == "backend-svc" {
+			return true
+		}
+	}
+	return false
+}
+
 func discoveryTarget(service, selector string, port int, includeNotReady bool, defaultNS string) config.Target {
 	ns := defaultNS
 	if service != "" {

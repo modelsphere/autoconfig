@@ -55,12 +55,12 @@ func TestResolveSourcesSingleTarget(t *testing.T) {
 // luaVal:数字/布尔原样,字符串加引号+转义(防注入)。
 func TestLuaVal(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"60000", "60000"},          // 数字
-		{"0.3", "0.3"},              // 小数
-		{"true", "true"},            // 布尔
-		{"hello", `"hello"`},        // 字符串加引号
-		{"1, evil=2", `"1, evil=2"`},// 含逗号 → 引号包住,注入不了
-		{`a"b`, `"a\"b"`},           // 引号转义
+		{"60000", "60000"},           // 数字
+		{"0.3", "0.3"},               // 小数
+		{"true", "true"},             // 布尔
+		{"hello", `"hello"`},         // 字符串加引号
+		{"1, evil=2", `"1, evil=2"`}, // 含逗号 → 引号包住,注入不了
+		{`a"b`, `"a\"b"`},            // 引号转义
 	}
 	for _, c := range cases {
 		if got := luaVal(c.in); got != c.want {
