@@ -135,11 +135,6 @@ spec:
               nginx:
                 description: Nginx:nginx(openresty)路由。
                 properties:
-                  listen:
-                    description: |-
-                      Listen:【路径路由 D″ 下已废弃】per-model server 不再监听 TCP 端口,改监听 unix socket
-                      (名 = route),由镜像 baked 的 8080 dispatch 按 /<route>/ 分发;monitor 探 8080/<route>。保留字段仅向后兼容,忽略。
-                    type: integer
                   outputConfigMap:
                     description: OutputConfigMap:输出 ConfigMap("ns/name",多路由共享,每路由一个
                       key)。
@@ -187,7 +182,7 @@ spec:
                   service:
                     description: |-
                       Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
-                      端口用本模型的 listen(每端口 = 一个模型)。与 selector 二选一(都配则 service 优先)。
+                      端口取 Service 的 dispatch 命名端口(8080,路径路由统一入口)。与 selector 二选一(都配则 service 优先)。
                     type: string
                   values:
                     additionalProperties:

@@ -61,10 +61,6 @@ type NginxSpec struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^[a-z0-9._-]+$`
 	Route string `json:"route,omitempty"`
-	// Listen:【路径路由 D″ 下已废弃】per-model server 不再监听 TCP 端口,改监听 unix socket
-	// (名 = route),由镜像 baked 的 8080 dispatch 按 /<route>/ 分发;monitor 探 8080/<route>。保留字段仅向后兼容,忽略。
-	// +optional
-	Listen int `json:"listen,omitempty"`
 	// Peers:有序 peer 组(如 cart 优先 + backend 兜底)。
 	// +kubebuilder:validation:MinItems=1
 	Peers []RoutePeer `json:"peers"`
@@ -74,7 +70,7 @@ type NginxSpec struct {
 	// 常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
 	Values map[string]string `json:"values,omitempty"`
 	// Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
-	// 端口用本模型的 listen(每端口 = 一个模型)。与 selector 二选一(都配则 service 优先)。
+	// 端口取 Service 的 dispatch 命名端口(8080,路径路由统一入口)。与 selector 二选一(都配则 service 优先)。
 	Service string `json:"service,omitempty"`
 	// Selector:可选;nginx 入口的 pod label 发现(没建 Service 时的兜底)。
 	Selector string `json:"selector,omitempty"`

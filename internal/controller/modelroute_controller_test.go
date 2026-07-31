@@ -46,7 +46,7 @@ func TestReconcileGLM(t *testing.T) {
 				Service: "cart-glm", Port: 8071, OutputConfigMap: "glm/cart-config", MaxLoad: 20,
 			},
 			Nginx: routingv1.NginxSpec{
-				Route: "glm", Listen: 18083, OutputConfigMap: "openresty/openresty-conf",
+				Route: "glm", OutputConfigMap: "openresty/openresty-conf",
 				Values: map[string]string{"ttft_limit_ms": "60000"},
 				Peers: []routingv1.RoutePeer{
 					{Use: "cart", Priority: 1, MaxConcurrencyFromBackend: true}, // 动态 = 后端并发 × 后端数

@@ -19,7 +19,7 @@ func TestResolveSourcesAndRenderRoute(t *testing.T) {
 		{Target: "glm-backends", Priority: 0},                  // 后端兜底
 	}, "")
 
-	conf, err := RenderRoute(RouteData{Route: "glm", Listen: 18083, Peers: peers,
+	conf, err := RenderRoute(RouteData{Route: "glm", Peers: peers,
 		Extra: map[string]string{"ttft_limit_ms": "60000", "zz_new_tunable": "9"}}) // 任意 key 原样渲染
 	if err != nil {
 		t.Fatalf("RenderRoute: %v", err)
@@ -43,7 +43,7 @@ func TestResolveSourcesSingleTarget(t *testing.T) {
 	peers := ResolveSources(map[string][]config.Peer{
 		"glm-backends": {{IP: "10.1.0.1", Port: 8050}},
 	}, nil, "glm-backends")
-	conf, err := RenderRoute(RouteData{Route: "glm", Listen: 18083, Peers: peers})
+	conf, err := RenderRoute(RouteData{Route: "glm", Peers: peers})
 	if err != nil {
 		t.Fatalf("RenderRoute: %v", err)
 	}

@@ -147,10 +147,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	route := nginxRoute(&rb)
 	conf, err := sink.RenderRoute(sink.RouteData{
-		Route:  route,
-		Listen: rb.Spec.Nginx.Listen,
-		Extra:  rb.Spec.Nginx.Values, // 任意调优项,原样渲染
-		Peers:  sink.ResolveSources(peersByTarget, sources, "backend"),
+		Route: route,
+		Extra: rb.Spec.Nginx.Values, // 任意调优项,原样渲染
+		Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render route: %w", err)

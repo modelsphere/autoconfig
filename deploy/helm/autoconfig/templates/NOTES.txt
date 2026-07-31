@@ -19,7 +19,6 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
     cart: { service: cart-glm, outputConfigMap: glm/cart-config, maxLoad: 20 }
     openresty:
       route: glm
-      listen: 18083
       outputConfigMap: openresty/openresty-conf
       sources: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
   EOF

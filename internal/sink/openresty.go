@@ -29,13 +29,12 @@ func luaVal(s string) string {
 //go:embed route.tmpl
 var defaultRouteTmpl string
 
-// RouteData 喂给 route.tmpl。Route/Listen 是结构;Extra 是任意调优项(原样渲染进 lua 返回表,
-// text/template range map 按 key 排序 → 确定性);Peers 是发现结果。
+// RouteData 喂给 route.tmpl。Route 是结构(= socket 名/dict 名/路径 key);Extra 是任意调优项
+// (原样渲染进 lua 返回表,text/template range map 按 key 排序 → 确定性);Peers 是发现结果。
 type RouteData struct {
-	Route  string
-	Listen int
-	Extra  map[string]string
-	Peers  []config.Peer
+	Route string
+	Extra map[string]string
+	Peers []config.Peer
 }
 
 func RenderRoute(d RouteData) (string, error) {
