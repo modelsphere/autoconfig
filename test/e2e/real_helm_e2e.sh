@@ -3,6 +3,7 @@
 # 三个组件都用本仓 deploy/helm/{openresty,cart,monitor} chart 部署(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
+#   openresty chart 已迁到 llm-openresty 仓 helm/openresty/ —— 跑前把它拷进 charts/openresty(cart/monitor 仍在本仓 deploy/helm/)。
 #   IMG_TAG=0.3.22 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -83,7 +84,6 @@ spec:
   cart: { service: cart, port: 8071, outputConfigMap: $NS/cart-config, maxLoad: 20 }
   nginx:
     route: glm
-    listen: 18083
     outputConfigMap: $NS/openresty-conf
     service: openresty                     # nginx 入口(openresty chart Service)→ monitor nginx 行
     peers: [{ use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 }]
@@ -119,8 +119,8 @@ echo "$ORCONF" | grep -qE '8071, "cart-0", 1, 180' && ok "openresty-conf 含 CAR
 [ "$(echo "$ORCONF" | grep -c '8050, "backend-')" -ge 2 ] && ok "openresty-conf 含后端兜底 peer" || bad "openresty-conf 后端 peer 不对"
 kubectl -n "$NS" exec deploy/openresty -c openresty -- pgrep -f 'nginx: master' >/dev/null 2>&1 && ok "openresty nginx master 运行中" || bad "openresty master 未运行"
 # 等挂载传播,route conf 出现在 conf.d/routes 且 openresty -t 通过(真加载)
-for i in $(seq 1 30); do kubectl -n "$NS" exec deploy/openresty -c openresty -- sh -c 'cat /usr/local/openresty/nginx/conf/conf.d/routes/session_route_glm.conf 2>/dev/null' | grep -q 'listen 18083' && break; sleep 4; done
-kubectl -n "$NS" exec deploy/openresty -c openresty -- sh -c 'cat /usr/local/openresty/nginx/conf/conf.d/routes/session_route_glm.conf 2>/dev/null' | grep -q 'listen 18083' && ok "openresty pod 挂到 route conf(listen 18083)" || bad "openresty pod 未挂到 route conf"
+for i in $(seq 1 30); do kubectl -n "$NS" exec deploy/openresty -c openresty -- sh -c 'cat /usr/local/openresty/nginx/conf/conf.d/routes/session_route_glm.conf 2>/dev/null' | grep -q 'listen unix:/usr/local/openresty/nginx/sock/glm.sock' && break; sleep 4; done
+kubectl -n "$NS" exec deploy/openresty -c openresty -- sh -c 'cat /usr/local/openresty/nginx/conf/conf.d/routes/session_route_glm.conf 2>/dev/null' | grep -q 'listen unix:/usr/local/openresty/nginx/sock/glm.sock' && ok "openresty pod 挂到 route conf(listen unix:/usr/local/openresty/nginx/sock/glm.sock)" || bad "openresty pod 未挂到 route conf"
 kubectl -n "$NS" exec deploy/openresty -c openresty -- /usr/local/openresty/bin/openresty -t >/tmp/ortest 2>&1 && ok "openresty -t 通过(reload 生效的配置合法)" || { bad "openresty -t 失败"; cat /tmp/ortest; }
 
 # monitor:mount 的 glm.monitor.conf 有 service+nginx+router;monitor 加载无解析错误

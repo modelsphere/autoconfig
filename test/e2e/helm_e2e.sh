@@ -55,7 +55,6 @@ spec:
   discovery: { service: be-svc, port: 8050 }
   nginx:
     route: demo
-    listen: 18099
     outputConfigMap: $TNS/openresty-conf
     peers: [{ use: backend }]
 YAML
@@ -64,7 +63,7 @@ waiteq 2 "rb.status.backends" kubectl -n "$TNS" get mr demo -o jsonpath='{.statu
 waiteq true "rb.status.ready" kubectl -n "$TNS" get mr demo -o jsonpath='{.status.ready}'
 OR=$(kubectl -n "$TNS" get cm openresty-conf -o jsonpath='{.data.session_route_demo\.conf}' 2>/dev/null)
 [ "$(echo "$OR" | grep -c '8050, "backend-')" = 2 ] && ok "openresty peers = 2 后端" || bad "openresty peers != 2"
-echo "$OR" | grep -q 'listen 18099' && ok "listen 18099" || bad "无 listen 18099"
+echo "$OR" | grep -q 'listen unix:/usr/local/openresty/nginx/sock/demo.sock' && ok "listen unix:/usr/local/openresty/nginx/sock/demo.sock" || bad "无 listen unix:/usr/local/openresty/nginx/sock/demo.sock"
 
 say "helm uninstall(验证 CRD 因 resource-policy:keep 保留)"
 helm uninstall autoconfig -n "$NS" && ok "uninstall" || bad "uninstall"
