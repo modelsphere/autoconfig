@@ -4,8 +4,8 @@ image:
   tag: ""              # 缺省用 Chart.appVersion
   pullPolicy: Always   # tag 会被 CI overwrite,Always 避免用到节点旧缓存
 
-replicas: 1            # >1 时 leader 选举保证只有一个在干活(HA)
-leaderElection: true
+replicas: 2            # 主备 HA:leader 选举保证只有一个在 reconcile,另一个热备,leader 挂了秒接管
+leaderElection: true   # 默认开;replicas>1 时生效(单副本时无害)
 
 resources:
   requests: { cpu: 50m, memory: 64Mi }

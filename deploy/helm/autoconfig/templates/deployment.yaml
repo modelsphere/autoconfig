@@ -39,4 +39,14 @@ spec:
       {{- end }}
       {{- with .Values.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
+      {{- else }}
+      # 主备默认软反亲和:两副本尽量分散到不同节点(节点挂不会两个一起没);单节点集群不阻塞调度。
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "autoconfig.selectorLabels" . | nindent 20 }}
       {{- end }}
