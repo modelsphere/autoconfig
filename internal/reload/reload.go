@@ -2,11 +2,13 @@
 package reload
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,9 +19,45 @@ import (
 // listenSockRe 抓 conf 里 `listen unix:/path/<name>.sock;` 的 socket 路径。
 var listenSockRe = regexp.MustCompile(`listen\s+unix:(\S+\.sock)`)
 
-// cleanupOrphanSockets 扫 confDir 全部 *.conf 收集当前在用的 <name>.sock,删 sockDir 里不在其中的 .sock。
+// soAcceptCon: /proc/net/unix Flags 列里 listening socket 的标志位(SO_ACCEPTCON)。
+const soAcceptCon = 0x10000
+
+// hasListener 判断某 unix socket 路径当前是否有进程 bind+listen(读内核 /proc/net/unix,只读无副作用)。
+// 行格式: Num RefCount Protocol Flags Type St Inode [Path];listening = Flags&0x10000!=0 且 Path 匹配。
+// 读不到 /proc/net/unix(非 linux / 权限)→ 保守返回 true(视为在用,不删),宁可漏删不误删。
+// 声明为 var 便于单测注入(cleanupOrphanSockets 的 reap 逻辑可脱离真 socket / linux 测)。
+var hasListener = func(sockPath string) bool {
+	f, err := os.Open("/proc/net/unix")
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	target := filepath.Clean(sockPath)
+	sc := bufio.NewScanner(f)
+	sc.Scan() // 跳过表头
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 8 {
+			continue // 无 Path 列 = 未命名 socket,不是我们要找的
+		}
+		flags, err := strconv.ParseUint(fields[3], 16, 32)
+		if err != nil || flags&soAcceptCon == 0 {
+			continue // 非 listening
+		}
+		if filepath.Clean(fields[7]) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupOrphanSockets 删 sockDir 里既「无 conf 引用」又「当前无进程 listen」的死 socket 文件。
 // 模型删除后其 conf 从 ConfigMap 消失,但 nginx reload 不会 unlink 老 worker 已建的 socket 文件 → 残留。
-// 只删「无任何 conf 引用」的,故绝不会误删在用 socket。
+// 两个条件都要:
+//   - 无 conf 引用:排除「正常模型的 socket」(它被 conf listen)。
+//   - 无 listener:排除「手动创建/外部进程正在用」及「刚删模型但老 worker 还在 drain listen」的 socket
+//     → 绝不误删任何在用 socket。刚删模型的 socket 本轮因老 worker 还 listen 而暂留,老 worker 退出后
+//       下一轮 cleanup(下次 conf 变化)再 reap;此时 conf key 已删、dispatch 不再路由到它,无 502 风险。
 func cleanupOrphanSockets(sockDir, confDir string) {
 	active := map[string]bool{}
 	confs, _ := filepath.Glob(filepath.Join(confDir, "*.conf"))
@@ -34,10 +72,14 @@ func cleanupOrphanSockets(sockDir, confDir string) {
 	}
 	socks, _ := filepath.Glob(filepath.Join(sockDir, "*.sock"))
 	for _, s := range socks {
-		if !active[filepath.Base(s)] {
-			if err := os.Remove(s); err == nil {
-				log.Printf("[reload] removed orphan socket %s (no conf references it)", s)
-			}
+		if active[filepath.Base(s)] {
+			continue // conf 还引用 → 在用,保留
+		}
+		if hasListener(s) {
+			continue // 无 conf 引用但仍有进程 listen(手动 socket / 老 worker 未退)→ 保留,下轮再 reap
+		}
+		if err := os.Remove(s); err == nil {
+			log.Printf("[reload] removed orphan socket %s (no conf ref & no listener)", s)
 		}
 	}
 }
