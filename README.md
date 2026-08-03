@@ -135,31 +135,58 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 
 ## 消费方接入
 
-autoconfig 只负责把配置**写进已有的 ConfigMap**（不创建 chart、不创建 ConfigMap）；消费方把对应 ConfigMap 挂进自己的 pod。
-cache_aware_router(CART)chart 在仓顶层 `cache_aware_router/`；**openresty / monitor chart 已分别迁到 `llm-openresty` 仓 `k8s/helm/openresty/` 与 `llm-monitor` 仓 `k8s/helm/monitor/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
+autoconfig 只负责把配置**写进已有的 ConfigMap**（不创建 chart、不创建 ConfigMap）；消费方各自 chart 建初始
+ConfigMap + reload/hagate sidecar + Service 门控，并把对应 ConfigMap 挂进自己的 pod。引用的 `autoconfig-reload` /
+`autoconfig-hagate` sidecar 镜像由本仓构建（harbor 跨仓引用）。三个消费方一览：
 
-**openresty 侧 · 路径路由**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
-运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——**单一对外端口、零映射表**。per-model
-server 只 `listen unix:.../<route>.sock`（不再占 TCP 端口），故 `spec.nginx.route` = 外部路径 key = socket 名；
-autoconfig 生成的 `session_route_<route>.conf` 里就是这个 socket listen。dispatch 把打 8080 的真实客户端 IP 经
-`X-Real-IP` 透传，per-model `set_real_ip_from unix:` 还原 `$remote_addr` → `allow 127.0.0.1` 的调参端点仍只对 in-pod 本地开放。
+| 消费方 | chart 位置 | autoconfig 写的 ConfigMap → 挂载文件 | reload sidecar |
+|---|---|---|---|
+| **openresty** | `llm-openresty` 仓 `k8s/helm/openresty/` | `openresty-conf` → `conf.d/routes/session_route_<route>.conf` | ✅ `--process "nginx: master"` + `--sock-dir` |
+| **cart** | 本仓 `deploy/helm/cart/` | `cart-config` → `configs/config.yaml`（只重填 `workers` 段） | ✅ `--process cache-aware-router` |
+| **monitor** | `llm-monitor` 仓 `k8s/helm/monitor/` | `monitor-conf` → `conf.d/<model>.monitor.conf` | ❌ 自身每 60s 热加载 |
 
-ConfigMap 整卷挂会覆盖整个目录，而 `.conf` 和 `lua/` 同在 `conf.d/`。所以把
-**session_route*.conf 移到子目录 `conf.d/routes/`**，ConfigMap 只挂到那里；`lua/` + `router_locations.inc` + `nginx.conf`
-+ **8080 dispatch（在 `session_base.conf`）** 仍烤镜像。`nginx.conf` 把 `include conf.d/*.conf;` 改成 `include conf.d/routes/*.conf;`（lua_package_path 不变）。
-reload sidecar 另带 `--sock-dir`：reload 前删掉「无 conf 引用」的孤儿 `.sock`（模型删除后 nginx 不会自动 unlink 残留 socket）。
+### openresty
 
-**reload sidecar**：消费方 pod 加一个容器，镜像 `autoconfig-reload`，+ `shareProcessNamespace: true` + 把输出 ConfigMap
-**整卷挂**（非 subPath——subPath 不随 ConfigMap 更新）：
+- **ConfigMap 交付（为什么挂子目录）**：ConfigMap 整卷挂会覆盖整个目录，而 `.conf` 和 `lua/` 同在 `conf.d/`。
+  所以把 `session_route*.conf` 移到子目录 **`conf.d/routes/`**，ConfigMap（`openresty-conf`）只挂到那里；
+  `lua/` + `router_locations.inc` + `nginx.conf` + **8080 dispatch（`session_base.conf`）** 仍烤镜像。
+  `nginx.conf` 的 include 从 `conf.d/*.conf` 改成 `conf.d/routes/*.conf`（`lua_package_path` 不变）。
+- **路径路由（单一对外端口）**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
+  运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——单一对外端口、零映射表。
+  per-model server 只 `listen unix:.../<route>.sock`（不占 TCP 端口），故 `spec.nginx.route` = 外部路径 key
+  = socket 名；autoconfig 生成的 `session_route_<route>.conf` 里就是这个 socket listen。dispatch 把打 8080 的
+  真实客户端 IP 经 `X-Real-IP` 透传，per-model `set_real_ip_from unix:` 还原 `$remote_addr` →
+  `allow 127.0.0.1` 的调参端点仍只对 in-pod 本地开放。
+- **reload sidecar**：`--process "nginx: master"` + **`--sock-dir`**（reload 前删掉「无 conf 引用」的孤儿 `.sock`——
+  模型删除后 nginx 不会自动 unlink 残留 socket）。
+
+### cart
+
+- **ConfigMap 交付**：整卷挂 `cart-config` → cart 启动 `-c configs/config.yaml`。底稿（`server`/`cache`/`health`）
+  由 chart 的 `values.baseConfig` 建在此 ConfigMap，autoconfig 只重填 `workers` 段。
+- **reload sidecar**：`--process cache-aware-router`（无 `--sock-dir`）。
+
+### monitor
+
+- **ConfigMap 交付**：整卷挂 `monitor-conf` → `conf.d/<model>.monitor.conf`（多模型共享，每模型一个 key）。
+- **无 reload sidecar**：monitor 自身每 60s 热加载 monitor.conf，不需要 SIGHUP（区别于 openresty/cart）。
+
+### reload sidecar（openresty / cart 通用）
+
+消费方 pod 加一个容器，镜像 `autoconfig-reload` + `shareProcessNamespace: true`（才能给主进程发 SIGHUP）+ 把输出
+ConfigMap **整卷挂**（非 subPath——subPath 不随 ConfigMap 更新同步）到 `--watch` 目录：
 ```yaml
-args: ["--watch","/watch","--process","nginx: master","--sock-dir","/usr/local/openresty/nginx/sock"]   # CART 侧：--process cache-aware-router，无 --sock-dir
+# openresty
+args: ["--watch","/watch","--process","nginx: master","--sock-dir","/usr/local/openresty/nginx/sock"]
+# cart
+args: ["--watch","/watch","--process","cache-aware-router"]
 ```
 
 ## 用法
 
 **Helm 部署 controller（推荐）** —— chart 在 `deploy/helm/autoconfig/`（含 CRD + SA/RBAC + Deployment）：
 ```bash
-helm upgrade --install autoconfig deploy/helm/autoconfig -n autoconfig --create-namespace
+helm upgrade --install autoconfig deploy/helm/autoconfig -n llm-route --create-namespace
 kubectl apply -f config/samples/modelroute-glm.yaml
 kubectl get mr -A                                   # NAME/BACKENDS/CART/READY/AGE
 ```
