@@ -79,16 +79,16 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 
 | 字段 | 类型 | 默认/约束 | 含义与配置 |
 |---|---|---|---|
-| `service` | string | 与 `selector` **恰选一** | EndpointSlice 发现（推荐）；支持 `ns/name` 跨 ns（裸名默认同 ModelRoute 的 ns）→ ModelRoute 可放中心 ns |
-| `selector` | string | 与 `service` **恰选一** | pod label 发现（没建 Service 的单机/单卡兜底） |
-| `port` | int | 省略自动推导 | 后端端口；service 路径从 EndpointSlice 取、selector 路径从 containerPort 取（仅单端口可推） |
+| `service` | string | 与 `selector` **二选一** | EndpointSlice 发现（推荐）；支持 `ns/name` 跨 ns（裸名默认同 ModelRoute 的 ns）→ ModelRoute 可放中心 ns |
+| `selector` | string | 与 `service` **二选一** | pod label 发现（没建 Service 的单机/单卡兜底） |
+| `port` | int | 可选，省略自动推导 | 后端端口；service 路径从 EndpointSlice 取、selector 路径从 containerPort 取（仅单端口可推） |
 | `includeNotReady` | bool | `false` | 默认只取 Ready 端点（排空中端点自动排除）；`true` = 含未 Ready |
 
 **`spec.cart`** —— 省略整段 = 无 CART
 
 | 字段 | 类型 | 默认/约束 | 含义与配置 |
 |---|---|---|---|
-| `service` / `selector` | string | **恰选一** | CART pod 发现（供 openresty 的 cart source）；`service` 支持 `ns/name` |
+| `service` / `selector` | string | **二选一** | CART pod 发现（供 openresty 的 cart source）；`service` 支持 `ns/name` |
 | `port` | int | 省略推导 | CART 端口（EndpointSlice/containerPort 单端口自动推） |
 | `outputConfigMap` | string | ✅ | 写 CART `config.yaml` 的目标 `ns/name`；底稿（server/cache/health）由 chart 的 `values.baseConfig` 建在此 CM，autoconfig 只重填 `workers` 段 |
 | `maxLoad` | int | `20` | 每 worker 的 `max_load` |
@@ -136,7 +136,7 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 ## 消费方接入
 
 autoconfig 只负责把配置**写进已有的 ConfigMap**（不创建 chart、不创建 ConfigMap）；消费方把对应 ConfigMap 挂进自己的 pod。
-cart chart 在 `deploy/helm/cart/`；**openresty / monitor chart 已分别迁到 `llm-openresty` 仓 `k8s/helm/openresty/` 与 `llm-monitor` 仓 `k8s/helm/monitor/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
+cache_aware_router(CART)chart 在仓顶层 `cache_aware_router/`；**openresty / monitor chart 已分别迁到 `llm-openresty` 仓 `k8s/helm/openresty/` 与 `llm-monitor` 仓 `k8s/helm/monitor/`**（消费方 chart 跟各自组件同仓）。各 chart 自建初始 ConfigMap + reload/hagate sidecar + Service 门控；引用的 `autoconfig-reload` / `autoconfig-hagate` sidecar 镜像仍由本仓构建（harbor 跨仓引用）。
 
 **openresty 侧 · 路径路由**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
 运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——**单一对外端口、零映射表**。per-model

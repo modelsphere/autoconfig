@@ -1,21 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "cart.fullname" . }}
-  labels: {{- include "cart.labels" . | nindent 4 }}
+  name: {{ include "cache_aware_router.fullname" . }}
+  labels: {{- include "cache_aware_router.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicas }}
   selector:
-    matchLabels: {{- include "cart.selectorLabels" . | nindent 6 }}
+    matchLabels: {{- include "cache_aware_router.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      labels: {{- include "cart.selectorLabels" . | nindent 8 }}
+      labels: {{- include "cache_aware_router.selectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       {{- if .Values.ha.enabled }}
-      serviceAccountName: {{ include "cart.fullname" . }}   # ha-gate 用它管 Lease
+      serviceAccountName: {{ include "cache_aware_router.fullname" . }}   # ha-gate 用它管 Lease
       {{- end }}
       {{- if .Values.reload.enabled }}
       shareProcessNamespace: true
@@ -67,7 +67,7 @@ spec:
         {{- if .Values.ha.enabled }}
         - name: hagate                  # master-standby:只有 leader 给自己打 cart-active 标签 → 只有它进 Service
           image: {{ .Values.ha.image }}
-          args: ["--lease", "{{ include "cart.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}, "--label-key", "{{ include "cart.name" . }}-active"]
+          args: ["--lease", "{{ include "cache_aware_router.fullname" . }}-ha", "--http", ":{{ .Values.ha.port }}", "--app-tcp", {{ .Values.ha.appTcp | quote }}, "--label-key", "{{ include "cache_aware_router.name" . }}-active"]
           env:
             - { name: POD_NAME,      valueFrom: { fieldRef: { fieldPath: metadata.name } } }
             - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
@@ -78,7 +78,7 @@ spec:
       volumes:
         - name: cfg
           configMap:
-            name: {{ include "cart.configMapName" . }}   # chart 建初值,autoconfig 更新
+            name: {{ include "cache_aware_router.configMapName" . }}   # chart 建初值,autoconfig 更新
       {{- if or .Values.affinity .Values.ha.enabled }}
       affinity:
         {{- if .Values.affinity }}
@@ -90,7 +90,7 @@ spec:
               podAffinityTerm:
                 topologyKey: kubernetes.io/hostname
                 labelSelector:
-                  matchLabels: {{- include "cart.selectorLabels" . | nindent 20 }}
+                  matchLabels: {{- include "cache_aware_router.selectorLabels" . | nindent 20 }}
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

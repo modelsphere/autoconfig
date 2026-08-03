@@ -39,7 +39,7 @@ kubectl -n "$NS" rollout status deploy/be --timeout=120s >/dev/null
 helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" --set fullnameOverride=openresty \
   --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" --set reload.image="$ACR" --set ha.image="$AH" \
   --set resources.requests.cpu=200m --set resources.requests.memory=256Mi --set resources.limits.cpu=2 --set resources.limits.memory=2Gi >/dev/null
-helm -n "$NS" upgrade --install cart "$CHARTS/cart" --set fullnameOverride=cart \
+helm -n "$NS" upgrade --install cart "$CHARTS/cache_aware_router" --set fullnameOverride=cart \
   --set image.repository="${CART_IMG%:*}" --set image.tag="${CART_IMG##*:}" --set reload.image="$ACR" --set ha.image="$AH" >/dev/null
 helm -n "$NS" upgrade --install monitor "$CHARTS/monitor" --set fullnameOverride=monitor \
   --set image.repository="${MON_IMG%:*}" --set image.tag="${MON_IMG##*:}" --set service.nodePort="" \

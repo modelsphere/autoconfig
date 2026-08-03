@@ -18,7 +18,7 @@ leaderpod(){ kubectl -n "$NS" get lease "$1" -o jsonpath='{.spec.holderIdentity}
 say "helm upgrade openresty/cart → 0.3.22(HA:replicas2 + ha-gate)"
 helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" --set fullnameOverride=openresty \
   --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" --set reload.image="$ACR" >/dev/null && ok "openresty upgraded" || bad "openresty upgrade 失败"
-helm -n "$NS" upgrade --install cart "$CHARTS/cart" --set fullnameOverride=cart \
+helm -n "$NS" upgrade --install cart "$CHARTS/cache_aware_router" --set fullnameOverride=cart \
   --set image.repository="${CART_IMG%:*}" --set image.tag="${CART_IMG##*:}" --set reload.image="$ACR" >/dev/null && ok "cart upgraded" || bad "cart upgrade 失败"
 
 say "等 rollout(2 副本)"

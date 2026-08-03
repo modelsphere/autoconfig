@@ -36,7 +36,7 @@ helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" \
   >/dev/null && ok "openresty installed" || bad "openresty install"
 
 say "3) cart"
-helm -n "$NS" upgrade --install cart "$CHARTS/cart" \
+helm -n "$NS" upgrade --install cart "$CHARTS/cache_aware_router" \
   --set fullnameOverride=cart --set image.repository="${CART_IMG%:*}" --set image.tag="${CART_IMG##*:}" \
   --set reload.image="$ACR" --set ha.image="$AH" >/dev/null && ok "cart installed" || bad "cart install"
 

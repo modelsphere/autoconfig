@@ -3,8 +3,8 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "cart.fullname" . }}-ha
-  labels: {{- include "cart.labels" . | nindent 4 }}
+  name: {{ include "cache_aware_router.fullname" . }}-ha
+  labels: {{- include "cache_aware_router.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -16,13 +16,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "cart.fullname" . }}-ha
-  labels: {{- include "cart.labels" . | nindent 4 }}
+  name: {{ include "cache_aware_router.fullname" . }}-ha
+  labels: {{- include "cache_aware_router.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "cart.fullname" . }}
+    name: {{ include "cache_aware_router.fullname" . }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "cart.fullname" . }}-ha
+  name: {{ include "cache_aware_router.fullname" . }}-ha
 {{- end }}

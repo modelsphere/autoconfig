@@ -62,7 +62,7 @@ say "helm install openresty / cart / monitor"
 helm -n "$NS" upgrade --install openresty "$CHARTS/openresty" \
   --set fullnameOverride=openresty --set image.repository="${OR_IMG%:*}" --set image.tag="${OR_IMG##*:}" \
   --set reload.image="$ACR" >/dev/null && ok "openresty chart installed" || bad "openresty chart 装失败"
-helm -n "$NS" upgrade --install cart "$CHARTS/cart" \
+helm -n "$NS" upgrade --install cart "$CHARTS/cache_aware_router" \
   --set fullnameOverride=cart --set image.repository="${CART_IMG%:*}" --set image.tag="${CART_IMG##*:}" \
   --set reload.image="$ACR" >/dev/null && ok "cart chart installed" || bad "cart chart 装失败"
 helm -n "$NS" upgrade --install monitor "$CHARTS/monitor" \
