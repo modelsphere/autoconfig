@@ -124,7 +124,8 @@ func TestReconcileGLM(t *testing.T) {
 	wantCart := `{ "10.96.0.71", 8071, "cart-0", 3, 200, probe = "/health" },`
 	wantBe := `{ "10.1.0.1", 8050, "backend-0", 2, 100 },`        // 后端 pod IP,maxConcurrency 100,不带 probe → 探 /v1/models
 	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", 1 },` // 后端 Service VIP 静态兜底,priority 1(最低),探 /v1/models
-	for _, w := range []string{wantCart, wantBe, wantFallback, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000"} {
+	// 有 backend-svc VIP 兜底层 → 自动注入跨层 retry(高优层 5xx 单请求即刻兜到低优 VIP)
+	for _, w := range []string{wantCart, wantBe, wantFallback, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000", "cross_tier_fallback = true", "max_more_tries = 3"} {
 		if !strings.Contains(conf, w) {
 			t.Errorf("openresty conf missing %q\n%s", w, conf)
 		}

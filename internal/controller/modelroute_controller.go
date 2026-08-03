@@ -182,9 +182,15 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc, ProbePath: probePath})
 	}
 	route := nginxRoute(&rb)
+	// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
+	// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
+	extra := rb.Spec.Nginx.Values
+	if usesBackendSvc(rb.Spec.Nginx.Peers) {
+		extra = withDefaults(extra, map[string]string{"cross_tier_fallback": "true", "max_more_tries": "3"})
+	}
 	conf, err := sink.RenderRoute(sink.RouteData{
 		Route: route,
-		Extra: rb.Spec.Nginx.Values, // 任意调优项,原样渲染
+		Extra: extra, // 任意调优项,原样渲染
 		Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
 	})
 	if err != nil {
@@ -391,6 +397,20 @@ func usesBackendSvc(peers []routingv1.RoutePeer) bool {
 		}
 	}
 	return false
+}
+
+// withDefaults 返回 base 的副本并补上 defaults 里 base 未设的 key(用户在 base 显式设的值优先,不覆盖)。
+func withDefaults(base, defaults map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range defaults {
+		if _, ok := out[k]; !ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func discoveryTarget(service, selector string, port int, includeNotReady bool, defaultNS string) config.Target {
