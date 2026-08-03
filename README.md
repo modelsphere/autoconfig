@@ -142,7 +142,7 @@ ConfigMap + reload/hagate sidecar + Service 门控，并把对应 ConfigMap 挂�
 | 消费方 | chart 位置 | autoconfig 写的 ConfigMap → 挂载文件 | reload sidecar |
 |---|---|---|---|
 | **openresty** | `llm-openresty` 仓 `k8s/helm/openresty/` | `openresty-conf` → `conf.d/routes/session_route_<route>.conf` | ✅ `--process "nginx: master"` + `--sock-dir` |
-| **cart**（cache_aware_router） | `cache_aware_router/` | `cart-config` → `configs/config.yaml`（只重填 `workers` 段） | ✅ `--process cache-aware-router` |
+| **cart**（cache_aware_router） | `cache_aware_router/k8s/helm/cache_aware_router/` | `cart-config` → `configs/config.yaml`（只重填 `workers` 段） | ✅ `--process cache-aware-router` |
 | **monitor** | `llm-monitor` 仓 `k8s/helm/monitor/` | `monitor-conf` → `conf.d/<model>.monitor.conf` | ❌ 自身每 60s 热加载 |
 
 ### openresty

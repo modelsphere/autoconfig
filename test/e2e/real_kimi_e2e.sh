@@ -3,8 +3,8 @@
 # 前置:kimi ns 里 kimi-k26 LWS + kimi-k26-leader Service 已就绪(leader /v1/models=200)。
 # 验证:autoconfig 发现 kimi leader→CART workers/openresty peers/monitor service+nginx+router→
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
-# 依赖同目录:charts/{autoconfig,openresty,cart,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
-#   openresty / monitor chart 已迁到 llm-openresty / llm-monitor 仓的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor}(cart 仍在本仓 deploy/helm/)。
+# 依赖同目录:charts/{autoconfig,openresty,cache_aware_router,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
+#   openresty / monitor chart 已迁到 llm-openresty / llm-monitor 仓的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor}(cache_aware_router chart 在本仓 cache_aware_router/k8s/helm/cache_aware_router/)。
 #   IMG_TAG=0.3.22 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
