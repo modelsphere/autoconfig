@@ -14,7 +14,7 @@ waitForWorkers: true
 # CART 有本地 radix 缓存,active-active 会分裂缓存 → 命中率下降;单 active 保持一份热缓存。
 ha:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.24
+  image: harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.25
   port: 8081
   appTcp: "127.0.0.1:8071"
 
@@ -49,7 +49,7 @@ ulimitNofile: 65535
 
 reload:
   enabled: true
-  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.24
+  image: harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.25
   process: "cache-aware-router"
 
 service:

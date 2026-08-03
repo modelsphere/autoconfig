@@ -15,9 +15,9 @@
 
 | 组件 | 镜像 | 角色 |
 |---|---|---|
-| **controller** | `autoconfig:0.3.24`（`cmd/`） | 唯一发现逻辑 + RBAC 一处；watch ModelRoute + EndpointSlice + Pod → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
-| **reload sidecar** | `autoconfig-reload:0.3.24`（`cmd/reload`） | 跑在消费方 pod 里，watch 挂载的 ConfigMap 文件，变化就 `kill -HUP` 主进程（靠 `shareProcessNamespace`）。CART / openresty 收 SIGHUP 优雅重载。 |
-| **hagate sidecar** | `autoconfig-hagate:0.3.24`（`cmd/hagate`） | 消费方 **master-standby**：2 副本都保持 Ready，但只有持 Lease 的 leader 给自己 pod 打 `<name>-active=true` 标签；Service selector 带这个标签 → **只有 leader 进 endpoints**。用标签而非 readiness 门控，standby 不会永久 NotReady 卡住滚动。 |
+| **controller** | `autoconfig:0.3.25`（`cmd/`） | 唯一发现逻辑 + RBAC 一处；watch ModelRoute + EndpointSlice + Pod → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
+| **reload sidecar** | `autoconfig-reload:0.3.25`（`cmd/reload`） | 跑在消费方 pod 里，watch 挂载的 ConfigMap 文件，变化就 `kill -HUP` 主进程（靠 `shareProcessNamespace`）。CART / openresty 收 SIGHUP 优雅重载。 |
+| **hagate sidecar** | `autoconfig-hagate:0.3.25`（`cmd/hagate`） | 消费方 **master-standby**：2 副本都保持 Ready，但只有持 Lease 的 leader 给自己 pod 打 `<name>-active=true` 标签；Service selector 带这个标签 → **只有 leader 进 endpoints**。用标签而非 readiness 门控，standby 不会永久 NotReady 卡住滚动。 |
 
 （controller 自身、hagate master-standby、reload 热重载三种机制详见下节。）
 
@@ -242,8 +242,8 @@ docker build -f Dockerfile.hagate -t harbor.4pd.io/hardcore-tech/autoconfig-haga
   make test                  # 生成 + fmt + vet + go test
   ```
   工具用 `go run ...@version`（见 Makefile），不装二进制、不入库。
-- **部署两条路都可**：
-  -生产用 **Helm**（`deploy/helm/autoconfig`）；
+- **部署两条路都可**：  
+  - 生产用 **Helm**（`deploy/helm/autoconfig`）；
   - kustomize 用 `make deploy`（`config/default`）。
   - 两者的 CRD/RBAC 同源（都来自 `config/` 的生成物）。
 
