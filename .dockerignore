@@ -1,4 +1,4 @@
-# 只把 build 需要的送进 build context:源码 + vendor/。排掉本机产物和 git。
+# 只把 build 需要的送进 build context:源码 + go.mod/go.sum(builder go mod download 拉依赖)。排掉本机产物和 git。
 .git
 /autoconfig
 autoconfig.exe

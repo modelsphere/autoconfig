@@ -3,8 +3,8 @@
 # 参考同组 llm-openresty/chat-engine 惯例:org 共享 `public-buildx` runner —— docker daemon 已内置
 # harbor 鉴权,CI 里不需要 docker login、也不需要配 HARBOR_ 变量,直接 docker build + docker push。
 #
-# 镜像多阶段 build:builder = harbor.4pd.io/library/golang:1.23.3-alpine3.20,依赖已 vendor(vendor/ 入库),
-# `go build -mod=vendor` 不联网 —— public-buildx runner 只有 go1.17.6 且够不到外网/docker.io 也能 build。
+# 镜像多阶段 build(照 llm-openresty/Dockerfile.bodylog):builder = golang:1.23.3-alpine3.20,依赖走国内 goproxy
+# (mirrors.tencent.com/go —— public-buildx runner 实测可达,见 llm-openresty CI #416384),不再 vendor(go.sum+GOSUMDB=off 可复现)。
 #
 # 触发:仅打 git tag。产物 harbor.4pd.io/hardcore-tech/autoconfig:<tag> (+ :latest)。
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。

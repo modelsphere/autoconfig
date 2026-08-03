@@ -142,7 +142,7 @@ ConfigMap + reload/hagate sidecar + Service 门控，并把对应 ConfigMap 挂�
 | 消费方 | chart 位置 | autoconfig 写的 ConfigMap → 挂载文件 | reload sidecar |
 |---|---|---|---|
 | **openresty** | `llm-openresty` 仓 `k8s/helm/openresty/` | `openresty-conf` → `conf.d/routes/session_route_<route>.conf` | ✅ `--process "nginx: master"` + `--sock-dir` |
-| **cart** | 本仓 `deploy/helm/cart/` | `cart-config` → `configs/config.yaml`（只重填 `workers` 段） | ✅ `--process cache-aware-router` |
+| **cart**（cache_aware_router） | `cache_aware_router/` | `cart-config` → `configs/config.yaml`（只重填 `workers` 段） | ✅ `--process cache-aware-router` |
 | **monitor** | `llm-monitor` 仓 `k8s/helm/monitor/` | `monitor-conf` → `conf.d/<model>.monitor.conf` | ❌ 自身每 60s 热加载 |
 
 ### openresty
@@ -151,10 +151,12 @@ ConfigMap + reload/hagate sidecar + Service 门控，并把对应 ConfigMap 挂�
   所以把 `session_route*.conf` 移到子目录 **`conf.d/routes/`**，ConfigMap（`openresty-conf`）只挂到那里；
   `lua/` + `router_locations.inc` + `nginx.conf` + **8080 dispatch（`session_base.conf`）** 仍烤镜像。
   `nginx.conf` 的 include 从 `conf.d/*.conf` 改成 `conf.d/routes/*.conf`（`lua_package_path` 不变）。
-- **路径路由（单一对外端口）**：镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
+- **路径路由（单一对外端口）**：
+  - 镜像 baked 一个 `listen 8080` 的 dispatch server，按请求路径首段 `/<route>/`
   运行时派生到 per-model server 的 unix socket（`<prefix>/sock/<route>.sock`）——单一对外端口、零映射表。
-  per-model server 只 `listen unix:.../<route>.sock`（不占 TCP 端口），故 `spec.nginx.route` = 外部路径 key
-  = socket 名；autoconfig 生成的 `session_route_<route>.conf` 里就是这个 socket listen。dispatch 把打 8080 的
+  - per-model server 只 `listen unix:.../<route>.sock`（不占 TCP 端口），故 `spec.nginx.route` = 外部路径 key
+  = socket 名；autoconfig 生成的 `session_route_<route>.conf` 里就是这个 socket listen。
+  - dispatch 把打 8080 的
   真实客户端 IP 经 `X-Real-IP` 透传，per-model `set_real_ip_from unix:` 还原 `$remote_addr` →
   `allow 127.0.0.1` 的调参端点仍只对 in-pod 本地开放。
 - **reload sidecar**：`--process "nginx: master"` + **`--sock-dir`**（reload 前删掉「无 conf 引用」的孤儿 `.sock`——
@@ -164,17 +166,17 @@ ConfigMap + reload/hagate sidecar + Service 门控，并把对应 ConfigMap 挂�
 
 - **ConfigMap 交付**：整卷挂 `cart-config` → cart 启动 `-c configs/config.yaml`。底稿（`server`/`cache`/`health`）
   由 chart 的 `values.baseConfig` 建在此 ConfigMap，autoconfig 只重填 `workers` 段。
-- **reload sidecar**：`--process cache-aware-router`（无 `--sock-dir`）。
+- **reload sidecar**：`--process cache-aware-router`。
 
 ### monitor
 
 - **ConfigMap 交付**：整卷挂 `monitor-conf` → `conf.d/<model>.monitor.conf`（多模型共享，每模型一个 key）。
 - **无 reload sidecar**：monitor 自身每 60s 热加载 monitor.conf，不需要 SIGHUP（区别于 openresty/cart）。
 
-### reload sidecar（openresty / cart 通用）
+### reload sidecar 接入（openresty / cart 通用）
 
-消费方 pod 加一个容器，镜像 `autoconfig-reload` + `shareProcessNamespace: true`（才能给主进程发 SIGHUP）+ 把输出
-ConfigMap **整卷挂**（非 subPath——subPath 不随 ConfigMap 更新同步）到 `--watch` 目录：
+机制见上「reload —— 配置热重载」。接入 = 消费方 pod 加一个 `autoconfig-reload` 容器
+（`shareProcessNamespace: true` 才能发 SIGHUP + 输出 ConfigMap **整卷挂**到 `--watch`），args：
 ```yaml
 # openresty
 args: ["--watch","/watch","--process","nginx: master","--sock-dir","/usr/local/openresty/nginx/sock"]
@@ -208,16 +210,18 @@ namespace/CRD 删除。正确：`kubectl delete mr --all -A` → `helm uninstall
 
 ## 构建（三个镜像）
 
-多阶段 build，依赖已 vendor（`vendor/` 入库），全程离线——不联网、不预置二进制：
+多阶段 build（照 `llm-openresty/Dockerfile.bodylog`）：golang builder 从**国内 goproxy**（默认 `mirrors.tencent.com/go`，
+`GOPROXY` 是 `ARG` 可 `--build-arg` 换 aliyun 等）拉依赖，**不再 vendor**；`go.sum` 入库 + `GOSUMDB=off` 保证可复现，`GOTOOLCHAIN=local` 防联网拉工具链：
 ```bash
 docker build              -t harbor.4pd.io/hardcore-tech/autoconfig:<tag>        .   # controller(cmd/)
 docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-reload:<tag> .   # reload sidecar
 docker build -f Dockerfile.hagate -t harbor.4pd.io/hardcore-tech/autoconfig-hagate:<tag> .   # hagate sidecar
 ```
 
-**CI（`.gitlab-ci.yml`）：打 git tag 自动 build+push 三个镜像**（各 `:<tag>` + `:latest`；`public-buildx` runner，
-docker 已 login harbor）。该 runner 只 go1.17.6 且够不到外网，故用 vendor 离线 + golang builder 从 harbor 拉。
-改依赖后 `go mod vendor` 重新入库。本地快速验证：`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor ./cmd/...`。
+**CI（`.gitlab-ci.yml`）：打 git tag 自动 build+push 三个镜像**（`public-buildx` runner，docker 已 login harbor；
+该 runner 到国内 goproxy `mirrors.tencent.com/go` 可达——同 runner 上 `llm-openresty` CI #416384 build:bodylog 实测通过）。
+
+本地快速验证：`GOPROXY=https://mirrors.tencent.com/go/,direct GOSUMDB=off go build ./cmd/...`。
 
 ## 验证状态（别混淆两层）
 
@@ -237,9 +241,11 @@ docker 已 login harbor）。该 runner 只 go1.17.6 且够不到外网，故用
   make generate manifests    # controller-gen 生成 deepcopy + config/crd/bases + config/rbac/role.yaml,并同步 CRD 到 helm/crds
   make test                  # 生成 + fmt + vet + go test
   ```
-  工具用 `go run ...@version`（见 Makefile），不装二进制、不进 vendor/CI。
-- **部署两条路都可**：生产用 **Helm**（`deploy/helm/autoconfig`）；kustomize 用 `make deploy`（`config/default`）。
-  两者的 CRD/RBAC 同源（都来自 `config/` 的生成物）。
+  工具用 `go run ...@version`（见 Makefile），不装二进制、不入库。
+- **部署两条路都可**：
+  -生产用 **Helm**（`deploy/helm/autoconfig`）；
+  - kustomize 用 `make deploy`（`config/default`）。
+  - 两者的 CRD/RBAC 同源（都来自 `config/` 的生成物）。
 
 ## 注意（踩坑）
 

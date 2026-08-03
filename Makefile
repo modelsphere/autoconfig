@@ -36,17 +36,17 @@ generate: ## 生成 deepcopy(zz_generated.deepcopy.go)。
 .PHONY: fmt
 fmt: ; go fmt ./...
 .PHONY: vet
-vet: ; go vet -mod=vendor ./...
+vet: ; go vet ./...
 .PHONY: test
 test: manifests generate fmt vet ## 生成 + 静态检查 + 单测。
-	go test -mod=vendor ./...
+	go test ./...
 
-##@ 构建(离线 vendored;与 CI 的 docker build 同源)
+##@ 构建(module 模式,依赖走 goproxy;与 CI 的 docker build 同源)。本机 goproxy 不通时设 GOPROXY=https://mirrors.tencent.com/go/,direct
 
 .PHONY: build
 build: ## 交叉编译两个二进制到 bin/。
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o bin/autoconfig ./cmd
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o bin/reload ./cmd/reload
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/autoconfig ./cmd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/reload ./cmd/reload
 
 .PHONY: docker-build
 docker-build: ## 构建 controller + reload 两个镜像。
