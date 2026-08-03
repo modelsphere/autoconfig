@@ -15,31 +15,123 @@
 
 | 组件 | 镜像 | 角色 |
 |---|---|---|
-| **controller** | `autoconfig`（`cmd/`） | 唯一发现逻辑 + RBAC 一处；watch ModelRoute + EndpointSlice + Pod → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
-| **reload sidecar** | `autoconfig-reload`（`cmd/reload`） | 跑在消费方 pod 里，watch 挂载的 ConfigMap 文件，变化就 `kill -HUP` 主进程（靠 `shareProcessNamespace`）。CART / openresty 收 SIGHUP 优雅重载。 |
-| **hagate sidecar** | `autoconfig-hagate`（`cmd/hagate`） | 消费方 **master-standby**：2 副本都保持 Ready，但只有持 Lease 的 leader 给自己 pod 打 `<name>-active=true` 标签；Service selector 带这个标签 → **只有 leader 进 endpoints**。用标签而非 readiness 门控，standby 不会永久 NotReady 卡住滚动。 |
+| **controller** | `autoconfig:0.3.23`（`cmd/`） | 唯一发现逻辑 + RBAC 一处；watch ModelRoute + EndpointSlice + Pod → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
+| **reload sidecar** | `autoconfig-reload:0.3.23`（`cmd/reload`） | 跑在消费方 pod 里，watch 挂载的 ConfigMap 文件，变化就 `kill -HUP` 主进程（靠 `shareProcessNamespace`）。CART / openresty 收 SIGHUP 优雅重载。 |
+| **hagate sidecar** | `autoconfig-hagate:0.3.23`（`cmd/hagate`） | 消费方 **master-standby**：2 副本都保持 Ready，但只有持 Lease 的 leader 给自己 pod 打 `<name>-active=true` 标签；Service selector 带这个标签 → **只有 leader 进 endpoints**。用标签而非 readiness 门控，standby 不会永久 NotReady 卡住滚动。 |
 
-**master-standby（hagate）细节**：leader 选举用 Lease `<name>-ha`；计划内下线（SIGTERM）主动释放 Lease + 摘标签
-→ standby ~1-2s 接管；硬崩则等 Lease 过期接管。标签协调是 **level-triggered**——每 2s 读 pod 实际标签与「该不该 active
-（是 leader 且本地 app 端口可连）」比对，不符就纠正，**标签被外部弄掉也能自愈**。openresty/cart 默认开
-（`replicas: 2` + `ha.enabled: true`）；**monitor 不做 HA**（单例 `replicas: 1` + Recreate，采集/告警是自主循环、readiness 门控挡不住，故 monitor chart 无 hagate）。
+（controller 自身、hagate master-standby、reload 热重载三种机制详见下节。）
 
-## 输入：ModelRoute CRD
+## 两个 sidecar 的实现原理
 
-`ModelRoute`（`routing.gpucluster.io/v1alpha1`），一个模型一个对象。字段说明见样例
-[`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。一条 ModelRoute 可同时驱动：
+消费方 pod（openresty / CART）里除主容器外各挂两个 autoconfig sidecar：**hagate**（主备门控）+ **reload**（配置热重载）。
+两者都靠 `shareProcessNamespace: true` 与主容器同 pod 协作。
 
-- **CART 的 workers**（写 cart-config，专属 → ownerRef 级联 GC）；`cart` 段可选，省略 = nginx 直连后端。
-- **nginx 的 peers**（`spec.nginx`，写 openresty-conf，多路由共享一个 ConfigMap → 用 finalizer 摘各自 key）。`route` 省略 = `metadata.name`；它同时是 **外部路径 key `/<route>/`** 与 per-model unix socket 名（见下「消费方接入 · openresty 侧」的路径路由）。
-  peers 是有序分层（数字大=优先，高优层全 banned 才级联到低层），三种 `use`：
-  - `cart`（priority 3）—— CART 上游，走 **CART Service 的 ClusterIP（VIP，非 pod IP）**：CART 是 master-standby，VIP 恒指 active leader → CART failover/rollout 对 openresty 透明，autoconfig 无需重写。
-  - `backend`（priority 2）—— 后端 **pod IP**（session 亲和 / least_conn / per-peer 健康的主力层）。
-  - `backend-svc`（priority 1，可选兜底）—— 后端 **Service 的 ClusterIP（VIP）静态兜底**。意义：**autoconfig 本身宕 + 后端 rollout** 时，pod-IP 层是死 IP 且没人重写 → 若无兜底会全断；VIP 由 kube-proxy 维护、不依赖 autoconfig 存活，pod-IP 层全 banned 后 openresty 级联到它 → **降级（走 kube-proxy、无亲和）但不全断**。需 `discovery.service`（selector 模式无 VIP，自动跳过）。
-- **monitor 的三类行**（`spec.monitor`，可选；每模型一个 key）：
-  - `service: <name> | <url> | <model> | <gpu_type>` —— 发现的后端（每实例一行）；`model` 省略 = `metadata.name`；`gpu_type` 省略 = 从后端节点的 `nvidia.com/gpu.product`（GFD）自动推导；
-  - `nginx: <svc>-<i> | http://ip:8080/<route>` —— **复用 `spec.nginx.service/selector`** 探测 nginx 入口（端口取 Service 的 `dispatch` 命名端口 8080，路径 = 本模型 `route`；配了就默认开，`spec.monitor.nginx: false` 关）；
-  - `router: <name>-router-<i> | http://ip:port/workers` —— **复用 `spec.cart`** 发现的 CART pod（有 `spec.cart` 时默认开，`spec.monitor.router: false` 关）。
-  - monitor 自身每 60s 热加载 monitor.conf、**无需 reload sidecar**（区别于 openresty/CART）；消费方把该 ConfigMap 挂进 monitor pod 即可。
+### hagate —— master-standby 单活门控
+
+**为什么要单活**：openresty / CART 是**有状态**路由器（openresty 有 session 亲和 + `active_conns` 并发计数，
+CART 有 prefix-cache radix tree）。多副本同时进 Service endpoints = 缓存被打散、并发计数分裂，路由质量下降。
+所以要 **2 副本主备（master-standby）**：都保持运行，但同一时刻只有一个对外收流量。
+
+**为什么不用 readinessProbe 门控**：若让 standby 的 readiness 恒 NotReady 来挡流量，Deployment 滚动时
+`maxUnavailable`/`minReady` 会把「永久 NotReady 的 standby」当成不可用 → 滚动卡死。故改用**标签门控**而非 readiness。
+
+**机制**：每 pod 一个 hagate sidecar 参与 Lease `<name>-ha` 的 leader 选举。
+- 只有持 Lease 的 leader 给**自己 pod** 打 `<name>-active=true` 标签；
+- Service 的 selector 带这个标签 → **只有 leader 的 pod 进 endpoints**，standby 在池外待命；
+- 消费方上游（如 openresty 的 cart 层）走 **Service ClusterIP VIP**，VIP 恒指 active leader → failover/rollout 对上游透明。
+
+**level-triggered 自愈**：每 2s 读 pod 实际标签，与「**该不该 active**（= 是 leader **且**本地 app 端口可连）」比对，
+不符就纠正 —— 标签被外部误删也能自愈；本地 app 端口连不上时即便是 leader 也主动摘标签（避免把流量导向坏 pod）。
+
+**failover**：计划内下线（SIGTERM）主动 release Lease + 摘标签 → standby ~1-2s 接管；硬崩则等 Lease TTL 过期后接管。
+
+**monitor 不做 HA**：采集/告警是**自主轮询循环**（不接收外部流量），readiness 门控挡不住重复采集，单活无意义 →
+monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty/cart 默认开（`replicas: 2` + `ha.enabled: true`）。
+
+### reload —— 配置热重载
+
+**问题**：autoconfig 改写了 ConfigMap，主进程（nginx / CART）要重读配置才生效，但不能重启（会断在途长流式连接）。
+
+**机制**：每消费方 pod 一个 reload sidecar：
+- 把输出 ConfigMap **整卷挂**（非 subPath —— subPath 不随 ConfigMap 更新同步）到 `--watch` 目录，用 fsnotify 监听；
+- 文件变 → 找主进程 pid（读 `/proc/*/cmdline` 匹配 `nginx: master` / `cache-aware-router`；**用 cmdline 不用 `comm`**——comm 截断 15 字符、且要避开 nginx worker）→ `kill -HUP`；
+- nginx / CART 收 **SIGHUP 都是优雅重载**：坏配置只 log warning + 保留旧配置，绝不中断在途请求。
+
+**传播**：kubelet 同步挂载的 ConfigMap 有 ~1min 延迟（AtomicWriter `..data` 原子软链切换 → reload 看到的永远是完整文件，不会读到半写）。
+
+**openresty 侧 `--sock-dir`**：per-model server 监听 unix socket，模型删除后 nginx 不会自动 unlink 残留 `.sock`；reload 前先删掉「已无 conf 引用」的孤儿 socket。
+
+## ModelRoute CRD
+
+`ModelRoute`（`routing.gpucluster.io/v1alpha1`），一个模型一个对象，`kubectl apply` 当场 CEL 校验、`kubectl get mr` 看发现结果。
+完整样例见 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。下表逐字段说明（✅=必填）。
+
+**`spec` 顶层**
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `discovery` | ✅ | 本模型的后端桶发现方式（喂 CART workers / nginx backend / monitor services） |
+| `cart` | 可选 | 配了 = autoconfig 管这个 CART；省略 = nginx 直连后端（无 CART 层） |
+| `nginx` | ✅ | openresty 路由：渲染 peers → `session_route_<route>.conf` |
+| `monitor` | 可选 | 把发现的后端/入口/CART 也写进共享 `monitor.conf` |
+
+**`spec.discovery`** —— 一桶后端怎么发现
+
+| 字段 | 类型 | 默认/约束 | 含义与配置 |
+|---|---|---|---|
+| `service` | string | 与 `selector` **恰选一** | EndpointSlice 发现（推荐）；支持 `ns/name` 跨 ns（裸名默认同 ModelRoute 的 ns）→ ModelRoute 可放中心 ns |
+| `selector` | string | 与 `service` **恰选一** | pod label 发现（没建 Service 的单机/单卡兜底） |
+| `port` | int | 省略自动推导 | 后端端口；service 路径从 EndpointSlice 取、selector 路径从 containerPort 取（仅单端口可推） |
+| `includeNotReady` | bool | `false` | 默认只取 Ready 端点（排空中端点自动排除）；`true` = 含未 Ready |
+
+**`spec.cart`** —— 省略整段 = 无 CART
+
+| 字段 | 类型 | 默认/约束 | 含义与配置 |
+|---|---|---|---|
+| `service` / `selector` | string | **恰选一** | CART pod 发现（供 openresty 的 cart source）；`service` 支持 `ns/name` |
+| `port` | int | 省略推导 | CART 端口（EndpointSlice/containerPort 单端口自动推） |
+| `outputConfigMap` | string | ✅ | 写 CART `config.yaml` 的目标 `ns/name`；底稿（server/cache/health）由 chart 的 `values.baseConfig` 建在此 CM，autoconfig 只重填 `workers` 段 |
+| `maxLoad` | int | `20` | 每 worker 的 `max_load` |
+
+**`spec.nginx`** —— openresty 路由
+
+| 字段 | 类型 | 默认/约束 | 含义与配置 |
+|---|---|---|---|
+| `route` | string | 省略 = `metadata.name` | 路由短名 = conf 文件名 + openresty dict 名 + `<route>.sock` + 外部路径 key `/<route>/`。**字符集必须 ⊆ `[a-z0-9._-]`**（做 dispatch 路径捕获正则；含大写会派生不到 socket → 8080 打不通） |
+| `peers` | list | ✅（≥1） | 有序 peer 组（见 `peers[]` 表） |
+| `outputConfigMap` | string | ✅ | 输出 ConfigMap `ns/name`（多路由共享，每路由一个 key，finalizer 摘各自 key） |
+| `values` | map | 可选 | 任意调优项原样渲染进 lua `register_route` 返回表（key=value）→ 加新调优项无需改代码。常用 `ttft_limit_ms` / `tps_limit_tps` / `adaptive_cc_min` / `default_max`（数字不加引号） |
+| `service` | string | 可选 | nginx 入口自身的 Service `ns/name` → 供 monitor 的 `nginx:` 行 + 入口 pod 扩缩事件驱动；端口取 Service 的 dispatch 命名端口 8080 |
+| `selector` | string | 可选 | nginx 入口 pod label 发现（没建 Service 兜底；与 `service` 二选一，都配则 `service` 优先） |
+
+**`spec.nginx.peers[]`** —— 有序分层（数字大=优先，高优层全 banned 才级联到低层）
+
+| 字段 | 类型 | 默认/约束 | 含义与配置 |
+|---|---|---|---|
+| `use` | enum | ✅ `cart`\|`backend`\|`backend-svc` | 见下「三档 `use`」 |
+| `priority` | int | — | openresty peer 优先级（建议 cart=3、backend=2、backend-svc=1） |
+| `maxConcurrency` | int | 省略用 `values.default_max` | 该组所有 peer 的并发上限 |
+| `maxConcurrencyFromBackend` | bool | 仅 `use:cart` 有意义 | `true` = cart 并发上限动态 = 后端单实例并发 × 后端数（CART 扇出到 N 后端，容量随扩缩自动变）；设了则忽略静态 `maxConcurrency`，且**要求 `backend` 组 `maxConcurrency>0`** 作乘数 |
+| `probePath` | string | 省略见右 | openresty 健康探测路径覆盖（GET，状态行含 200=健康否则 ban）。`use:cart` 默认 `/health`（CART 的 `/v1/models` 是缓存端点、worker 全挂也返 200，不能当信号）；其余层默认空 = 用 route 的 `health_probe_path`（`/v1/models`）。显式设值（含给 cart 设 `/v1/models`）覆盖默认 |
+
+三档 `use`：
+- **`cart`**（priority 3）—— CART 上游，走 **CART Service 的 ClusterIP（VIP，非 pod IP）**：CART 是 master-standby，VIP 恒指 active leader → CART failover/rollout 对 openresty 透明，autoconfig 无需重写。
+- **`backend`**（priority 2）—— 后端 **pod IP**（session 亲和 / least_conn / per-peer 健康的主力层）。
+- **`backend-svc`**（priority 1，可选兜底）—— 后端 **Service 的 ClusterIP（VIP）静态兜底**：**autoconfig 本身宕 + 后端 rollout** 时 pod-IP 层是死 IP 又没人重写 → 若无兜底会全断；VIP 由 kube-proxy 维护、不依赖 autoconfig 存活，pod-IP 层全 banned 后级联到它 → **降级（走 kube-proxy、无亲和）但不全断**。需 `discovery.service`（selector 模式无 VIP，自动跳过）。
+
+**`spec.monitor`** —— 可选；monitor 自身每 60s 热加载，**无 reload sidecar**（区别于 nginx/CART）。每模型一个 key，三类行：
+
+| 字段 | 类型 | 默认/约束 | 含义与配置 |
+|---|---|---|---|
+| `outputConfigMap` | string | ✅ | 写 monitor 配置的 ConfigMap `ns/name`（多模型共享，每模型一个 key） |
+| `model` | string | 省略 = `metadata.name` | `service:` 行的 model 字段（served-model-name） |
+| `gpuType` | string | 省略自动推导 | `service:` 行的 gpu_type；省略 = 从后端节点 GPU label `nvidia.com/gpu.product`（GFD）推短名，推不出留空 |
+| `nginx` | bool | 默认 `true`（当 `spec.nginx` 配了 service/selector） | 复用 nginx 入口发现写 monitor 的 `nginx:` 行；`false` 关 |
+| `router` | bool | 默认 `true`（当配了 `spec.cart`） | 复用 `spec.cart` 发现的 CART pod 写 monitor 的 `router:` 表（`.../workers`）；`false` 关 |
+
+三类输出行格式：`service: <name> \| <url> \| <model> \| <gpu_type>`（每后端实例一行）、`nginx: <svc>-<i> \| http://ip:8080/<route>`、`router: <name>-router-<i> \| http://ip:port/workers`。
+
+**CEL 校验（apply 时即报错）**：① `discovery`/`cart` 的 `service` 与 `selector` 必须**恰好一个**；② `nginx.peers` 用了 `cart` 必须配 `spec.cart`；③ `cart` 用 `maxConcurrencyFromBackend` 必须给 `backend` 组配 `maxConcurrency>0`。
 
 ## 消费方接入
 

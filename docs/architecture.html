@@ -167,7 +167,8 @@
               <div class="ctr ha"><span class="clab">sidecar</span><div class="cnm">hagate</div></div>
             </div>
           </div>
-          <div class="mnote peers">peers＝CART（优先）＋后端（兜底）</div>
+          <div class="mnote peers">peers＝CART（优先3）＋后端 pod-IP（2）＋backend-svc VIP 兜底（1）</div>
+          <div class="mnote cmmap"><span class="mono">openresty-conf</span> ⇒ 挂载 <span class="mono">conf.d/routes/session_route_&lt;route&gt;.conf</span></div>
           <div class="mnote">hagate：leader 才打 active 标签 → 只 leader 进 Service</div>
         </div>
       </div>
@@ -185,6 +186,7 @@
               <div class="ctr ha"><span class="clab">sidecar</span><div class="cnm">hagate</div></div>
             </div>
           </div>
+          <div class="mnote cmmap"><span class="mono">cart-config</span> ⇒ 挂载 <span class="mono">configs/config.yaml</span></div>
           <div class="mnote">hagate：单 active 保缓存/计数 → 只 leader 进 Service</div>
         </div>
       </div>
@@ -197,6 +199,7 @@
           <div class="ctrs one">
             <div class="ctr app"><span class="clab">container</span><div class="cnm">monitor</div></div>
           </div>
+          <div class="mnote cmmap"><span class="mono">monitor-conf</span> ⇒ 挂载 <span class="mono">/etc/monitor/conf.d/&lt;model&gt;.monitor.conf</span></div>
           <div class="mnote">monitor.conf 每 60s 自动热加载，<br>无需 SIGHUP／sidecar</div>
         </div>
       </div>
