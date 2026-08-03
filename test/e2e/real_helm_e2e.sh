@@ -3,7 +3,7 @@
 # 三个消费方(openresty/cache_aware_router/monitor)各自 chart 部署(位置见下)(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
 # 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:charts/{autoconfig,openresty,cache_aware_router,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
-#   openresty / monitor chart 已迁到 llm-openresty / llm-monitor 仓的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor}(cache_aware_router chart 在本仓 cache_aware_router/k8s/helm/)。
+#   openresty / monitor / cache_aware_router chart 各在其仓(llm-openresty / llm-monitor / cache_aware_router)的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor,cache_aware_router}。
 #   IMG_TAG=0.3.22 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
