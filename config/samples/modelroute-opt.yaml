@@ -1,0 +1,33 @@
+# 示例:opt-125m 测试路由 —— 三层 peer(cart 优先 → backend pod-IP → backend-svc VIP 兜底)。
+# 后端由 config/samples/opt-backend.yaml 部署(opt ns 的 vLLM + opt-svc);此 ModelRoute 放中心 ns llm-route,
+# 跨 ns 发现后端(discovery.service 用 "opt/opt-svc")。autoconfig 据此写:
+#   - openresty-conf(session_route_opt.conf 的 peers)
+#   - cart-config(workers)
+#   - monitor-conf(opt.monitor.conf 的 service/nginx/router 行)
+# 带 backend-svc 兜底层 → autoconfig(≥0.3.26)自动注入 cross_tier_fallback=true + max_more_tries=3。
+apiVersion: routing.gpucluster.io/v1alpha1
+kind: ModelRoute
+metadata:
+  name: opt
+  namespace: llm-route
+spec:
+  discovery:                          # 后端桶(喂 cart workers + nginx backend 来源)
+    service: opt/opt-svc              # ns/name 跨 ns:opt ns 的 opt-svc;EndpointSlice 自动取就绪 pod
+    port: 8000
+  cart:                               # cache-aware-router(本模型专属)
+    service: cart                     # 同 ns 的 cart Service(VIP);nginx 的 cart peer 走它的 ClusterIP
+    port: 8071
+    outputConfigMap: llm-route/cart-config
+    maxLoad: 20                       # 每 worker 的 max_load
+  nginx:                              # openresty 路由(路径路由:外部经 8080/opt/ 访问)
+    route: opt                        # = conf 文件名 + dict 名 + unix socket 名 + 外部路径 key
+    service: openresty
+    outputConfigMap: llm-route/openresty-conf
+    peers:                            # 有序三层;priority 大=优先
+    - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart(并发上限随后端数自动变)
+    - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
+    - { use: backend-svc, priority: 1 }                                   # 兜底:后端 Service VIP(operator 挂时靠它)
+  monitor:                            # 可选:monitor 的 service/nginx/router 行
+    model: opt-125m                   # served-model-name(monitor 展示用)
+    gpuType: A100
+    outputConfigMap: monitoring/monitor-conf

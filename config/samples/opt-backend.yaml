@@ -1,0 +1,51 @@
+# 示例:opt-125m 测试后端(autoconfig 通过 opt-svc 发现它;不由 autoconfig/helm 管理,单独 apply)。
+# 重点演示【vLLM 优雅停机】配置,配 ModelRoute 用:
+#   - args 加 --shutdown-timeout=3540:收到 SIGTERM 后【停收新请求 + 排空在途】(最多 3540s),
+#     不再是 vLLM 默认的 --shutdown-timeout=0(在途直接 abort、客户端拿半截)。
+#   - terminationGracePeriodSeconds: 3600:k8s 唯一硬切刀,到点才 SIGKILL;比 shutdown-timeout 大 ~60s 留退出余量。
+#   - 生产取值:shutdown-timeout 设 ≥ 最长【合法】请求耗时(如 kimi 50K/1.5K ~368s → 400~600),grace 再加余量;
+#     别无脑拍很大(会掩盖真 hang、堵滚动)。此处 opt-125m 请求极短,3540/3600 只作样板。
+# apply: kubectl apply -f opt-backend.yaml   (含 ns opt 里的 Deployment + Service)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opt
+  namespace: opt
+  labels: { app: opt }
+spec:
+  replicas: 1
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  selector: { matchLabels: { app: opt } }
+  template:
+    metadata: { labels: { app: opt } }
+    spec:
+      nodeName: ucloud-wlcb-gpu-005
+      terminationGracePeriodSeconds: 3600          # 硬切刀:到点才 SIGKILL,覆盖排空 + 传播窗口
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest-cu129-ubuntu2404
+          command: ["python3","-m","vllm.entrypoints.openai.api_server"]
+          args:
+            - "--model=/data/models"
+            - "--served-model-name=opt-125m"
+            - "--host=0.0.0.0"
+            - "--port=8000"
+            - "--max-model-len=2048"          # opt-125m 绝对位置编码原生上限 2048,再高 vllm 拒(CUDA 越界)
+            - "--gpu-memory-utilization=0.25"
+            - "--shutdown-timeout=3540"            # >0 = 优雅排空在途(默认 0 = abort);≤ grace 留退出余量
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /v1/models, port: 8000 }, initialDelaySeconds: 10, periodSeconds: 5, failureThreshold: 3 }
+          resources: { limits: { nvidia.com/gpu: 1 } }
+          volumeMounts: [{ name: m, mountPath: /data/models }]
+      volumes:
+        - name: m
+          hostPath: { path: /mnt/disk0/models/facebook/opt-125m, type: DirectoryOrCreate }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opt-svc
+  namespace: opt
+spec:
+  selector: { app: opt }
+  ports: [{ port: 8000, targetPort: 8000 }]
