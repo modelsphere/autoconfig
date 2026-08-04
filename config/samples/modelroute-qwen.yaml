@@ -1,0 +1,31 @@
+# 示例:qwen(Qwen3.5-4B sglang)3 层路由 —— cart-qwen → backend pod-IP → backend-svc VIP 兜底。
+# 后端由 config/samples/qwen-backend.yaml 部署(sgl ns 的 sglang + qwen-svc)。
+# 前置:cart-qwen 需先用 cache_aware_router helm chart 装(一个模型一个 cart):
+#   helm -n llm-route install cart-qwen <cart-chart> \
+#     --set fullnameOverride=cart-qwen \
+#     --set reload.image=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.26 \
+#     --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.26
+#   (cart 起始 initContainer 等 cart-qwen-config 有 workers → 本 ModelRoute apply 后 autoconfig 写入即就绪)
+# autoconfig 据此写 openresty-conf(session_route_qwen.conf)+ cart-qwen-config(workers)。
+apiVersion: routing.gpucluster.io/v1alpha1
+kind: ModelRoute
+metadata:
+  name: qwen
+  namespace: llm-route
+spec:
+  discovery:                          # 后端桶(喂 cart workers + nginx backend)
+    service: sgl/qwen-svc            # ns/name 跨 ns:sgl ns 的 qwen-svc
+    port: 8000
+  cart:                               # 本模型专属 cart(cache-aware-router)
+    service: cart-qwen
+    port: 8071
+    outputConfigMap: llm-route/cart-qwen-config
+    maxLoad: 20
+  nginx:                              # openresty 路由(外部经 8080/qwen/ 访问)
+    route: qwen
+    service: openresty
+    outputConfigMap: llm-route/openresty-conf
+    peers:                            # 3 层,priority 大=优先
+    - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart-qwen
+    - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
+    - { use: backend-svc, priority: 1 }                                   # 兜底:qwen-svc VIP

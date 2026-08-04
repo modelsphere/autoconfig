@@ -14,10 +14,10 @@ spec:
   discovery:                          # 后端桶(喂 cart workers + nginx backend 来源)
     service: opt/opt-svc              # ns/name 跨 ns:opt ns 的 opt-svc;EndpointSlice 自动取就绪 pod
     port: 8000
-  cart:                               # cache-aware-router(本模型专属)
-    service: cart                     # 同 ns 的 cart Service(VIP);nginx 的 cart peer 走它的 ClusterIP
+  cart:                               # cache-aware-router —— ⚠️ 每个模型一个【专属 cart】,不共享(cache 亲和只对一个模型)
+    service: cart-opt                 # 本模型专属 cart Service(名字带模型标识);nginx 的 cart peer 走它的 ClusterIP VIP
     port: 8071
-    outputConfigMap: llm-route/cart-config
+    outputConfigMap: llm-route/cart-opt-config   # 专属 config(= cart helm chart 的 <fullname>-config,fullnameOverride=cart-opt)
     maxLoad: 20                       # 每 worker 的 max_load
   nginx:                              # openresty 路由(路径路由:外部经 8080/opt/ 访问)
     route: opt                        # = conf 文件名 + dict 名 + unix socket 名 + 外部路径 key

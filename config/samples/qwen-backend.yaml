@@ -1,0 +1,42 @@
+# 示例:Qwen3.5-4B sglang 测试后端(autoconfig 通过 qwen-svc 发现)。
+# 演示 sglang 优雅停机:sglang 收 SIGTERM 默认【排空在途 + drain 期间仍收新请求】,无需 --shutdown-timeout;
+#   只需 terminationGracePeriodSeconds 给足(默认 30s 会砍断长请求 drain)。这里 3600 作样板(生产 kimi 建议 400~600)。
+# NodePort 30055 便于从集群任一节点 IP:30055 直接压测(注:走 Service 会在 pod Terminating 时被 kube-proxy 摘端点)。
+# apply: kubectl apply -f qwen-backend.yaml
+apiVersion: v1
+kind: Namespace
+metadata: { name: sgl }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: qwen, namespace: sgl, labels: { app: qwen } }
+spec:
+  replicas: 1
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  selector: { matchLabels: { app: qwen } }
+  template:
+    metadata: { labels: { app: qwen } }
+    spec:
+      nodeName: ucloud-wlcb-gpu-005
+      terminationGracePeriodSeconds: 3600        # sglang 默认排空;硬切刀给足(无需 --shutdown-timeout)
+      runtimeClassName: nvidia
+      containers:
+        - name: sglang
+          image: harbor.4pd.io/hardcore-tech/sglang:v0.5.10.post1-gm-fix-v0.1
+          command: ["python3","-m","sglang.launch_server"]
+          args: ["--model-path=/models/Qwen3.5-4B","--served-model-name=qwen","--host=0.0.0.0","--port=8000","--mem-fraction-static=0.5","--trust-remote-code"]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /v1/models, port: 8000 }, initialDelaySeconds: 20, periodSeconds: 5, failureThreshold: 3 }
+          resources: { limits: { nvidia.com/gpu: 1 } }
+          volumeMounts: [{ name: m, mountPath: /models }]
+      volumes:
+        - name: m
+          hostPath: { path: /mnt/disk0/models, type: Directory }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: qwen-svc, namespace: sgl }
+spec:
+  type: NodePort
+  selector: { app: qwen }
+  ports: [{ port: 8000, targetPort: 8000, nodePort: 30055 }]
