@@ -29,3 +29,7 @@ spec:
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart-qwen
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
     - { use: backend-svc, priority: 1 }                                   # 兜底:qwen-svc VIP
+  monitor:                            # monitor 的 service/nginx/router 行(不配则无 qwen 监控)
+    model: qwen                       # served-model-name(monitor 展示用)
+    gpuType: A100
+    outputConfigMap: monitoring/monitor-conf
