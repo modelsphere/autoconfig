@@ -1,5 +1,5 @@
 # 示例:qwen(Qwen3.5-4B sglang)3 层路由 —— cart-qwen → backend pod-IP → backend-svc VIP 兜底。
-# 后端由 config/samples/qwen-backend.yaml 部署(sgl ns 的 sglang + qwen-svc)。
+# 后端由 config/samples/qwen-backend.yaml 部署(qwen ns 的 sglang + qwen-svc)。
 # 前置:cart-qwen 需先用 cache_aware_router helm chart 装(一个模型一个 cart):
 #   helm -n llm-route install cart-qwen <cart-chart> \
 #     --set fullnameOverride=cart-qwen \
@@ -14,7 +14,7 @@ metadata:
   namespace: llm-route
 spec:
   discovery:                          # 后端桶(喂 cart workers + nginx backend)
-    service: sgl/qwen-svc            # ns/name 跨 ns:sgl ns 的 qwen-svc
+    service: qwen/qwen-svc           # ns/name 跨 ns:qwen ns 的 qwen-svc
     port: 8000
   cart:                               # 本模型专属 cart(cache-aware-router)
     service: cart-qwen

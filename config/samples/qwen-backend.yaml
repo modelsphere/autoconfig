@@ -5,11 +5,11 @@
 # apply: kubectl apply -f qwen-backend.yaml
 apiVersion: v1
 kind: Namespace
-metadata: { name: sgl }
+metadata: { name: qwen }
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: qwen, namespace: sgl, labels: { app: qwen } }
+metadata: { name: qwen, namespace: qwen, labels: { app: qwen } }
 spec:
   replicas: 1
   strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
@@ -35,7 +35,7 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: qwen-svc, namespace: sgl }
+metadata: { name: qwen-svc, namespace: qwen }
 spec:
   type: NodePort
   selector: { app: qwen }
