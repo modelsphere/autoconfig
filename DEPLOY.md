@@ -128,30 +128,24 @@ kubectl -n llm-route rollout status deploy/openresty
 ## 6. monitor(dashboard + MySQL)
 
 chart 自带 MySQL(持久化 state + 时序);读 autoconfig 产出的 `monitor-conf`(service/nginx/router 行,60s 热加载)。
-secret / mysql 密码用 values 文件(**别把真密钥提交进 repo**)。
+
+**生产推荐:密钥走 `existingSecret`(带外建,不归 helm 管)** —— 这样 `helm upgrade` 无论带不带 `--set` 都碰不到密钥,避免「误用 `--set` 不带 `--reuse-values` → 密钥被刷成占位」的坑(app + mysql 两份密钥都能外置)。
 
 ```bash
-cat > /tmp/monitor-values.yaml <<'EOF'
-nginxHost: "openresty (llm-route k8s)"
-bodylogSummaryURL: "http://192.0.2.31:9998/summary"
-mysql:
-  auth:
-    user: monitor
-    password: "<DB_PASS>"
-    rootPassword: "<DB_ROOT_PASS>"
-secret:
-  data:
-    WEB_AUTH_USER: admin
-    WEB_AUTH_PASS: "<WEB_PASS>"
-    WEB_TPM_AUTH_USER: tpm
-    WEB_TPM_AUTH_PASS: "<TPM_PASS>"
-    BODYLOG_HTTP_TOKEN: "<BODYLOG_TOKEN>"
-    QINGZHOU_WEBHOOK: ""
-EOF
+# ① 带外建两份 secret(模板见 monitor 仓 k8s/secret.example.yaml,改成真值)——注意 mysql 密码两处要一致
+kubectl -n monitoring apply -f secret.example.yaml    # llm-monitor-secret + llm-monitor-mysql-secret
 
-helm -n monitoring install monitor harbor-chart-repo/monitor --version 0.1.3 -f /tmp/monitor-values.yaml
+# ② install:关掉 chart 自建密钥,引用带外的
+helm -n monitoring install monitor harbor-chart-repo/monitor --version 0.1.4 \
+  --set nginxHost="openresty (llm-route k8s)" \
+  --set bodylogSummaryURL="http://192.0.2.31:9998/summary" \
+  --set secret.create=false \
+  --set secret.existingSecret=llm-monitor-secret \
+  --set mysql.auth.existingSecret=llm-monitor-mysql-secret
 kubectl -n monitoring rollout status deploy/monitor
 ```
+
+> **快速起(测试用,chart 自建密钥)**:不想带外建 secret 时,可用 values 文件把密钥/密码写进去(`secret.data.*` + `mysql.auth.*`,占位改真值,**别提交 repo**)、`create:true` 装。但这种模式下升级务必 `--reuse-values`,且带 `--set` 时尤其小心(见 §9)。
 
 > dashboard 是 **NodePort:30080** → `http://<任一 node IP>:30080`(如 `http://192.0.2.20:30080`),Basic Auth `admin/<WEB_PASS>`;`/tpm` 子页独立 Auth `tpm/<TPM_PASS>`。
 
