@@ -24,7 +24,8 @@ spec:
         - name: sglang
           image: harbor.4pd.io/hardcore-tech/sglang:v0.5.10.post1-gm-fix-v0.1
           command: ["python3","-m","sglang.launch_server"]
-          args: ["--model-path=/models/Qwen3.5-4B","--served-model-name=qwen","--host=0.0.0.0","--port=8000","--mem-fraction-static=0.5","--trust-remote-code"]
+          # --enable-metrics:sglang 默认不暴露 /metrics(404),不加则 monitor 采不到 KV cache/运行中/等待中(全 "-")
+          args: ["--model-path=/models/Qwen3.5-4B","--served-model-name=qwen","--host=0.0.0.0","--port=8000","--mem-fraction-static=0.5","--trust-remote-code","--enable-metrics"]
           ports: [{ containerPort: 8000 }]
           readinessProbe: { httpGet: { path: /v1/models, port: 8000 }, initialDelaySeconds: 20, periodSeconds: 5, failureThreshold: 3 }
           resources: { limits: { nvidia.com/gpu: 1 } }
