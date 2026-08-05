@@ -5,23 +5,24 @@
 #   - cart-config(workers)
 #   - monitor-conf(opt.monitor.conf 的 service/nginx/router 行)
 # 带 backend-svc 兜底层 → autoconfig(≥0.3.26)自动注入 cross_tier_fallback=true + max_more_tries=3。
+# 所有 service / outputConfigMap 均为 ns/name 全限定 → 本 ModelRoute 放哪个 ns 都行(引用不依赖它)。
 apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
   name: opt
-  namespace: llm-route
+  namespace: llm-route                # 任意 ns 均可(所有引用已全限定)
 spec:
   discovery:                          # 后端桶(喂 cart workers + nginx backend 来源)
     service: opt/opt-svc              # ns/name 跨 ns:opt ns 的 opt-svc;EndpointSlice 自动取就绪 pod
     port: 8000
   cart:                               # cache-aware-router —— ⚠️ 每个模型一个【专属 cart】,不共享(cache 亲和只对一个模型)
-    service: cart-opt                 # 本模型专属 cart Service(名字带模型标识);nginx 的 cart peer 走它的 ClusterIP VIP
+    service: llm-route/cart-opt       # ns/name 全限定:本模型专属 cart Service;nginx 的 cart peer 走它的 ClusterIP VIP
     port: 8071
     outputConfigMap: llm-route/cart-opt-config   # 专属 config(= cart helm chart 的 <fullname>-config,fullnameOverride=cart-opt)
     maxLoad: 20                       # 每 worker 的 max_load
   nginx:                              # openresty 路由(路径路由:外部经 8080/opt/ 访问)
     route: opt                        # = conf 文件名 + dict 名 + unix socket 名 + 外部路径 key
-    service: openresty
+    service: llm-route/openresty      # ns/name:openresty 入口 Service 全限定
     outputConfigMap: llm-route/openresty-conf
     peers:                            # 有序三层;priority 大=优先
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart(并发上限随后端数自动变)

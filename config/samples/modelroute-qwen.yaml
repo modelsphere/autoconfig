@@ -7,23 +7,25 @@
 #     --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.26
 #   (cart 起始 initContainer 等 cart-qwen-config 有 workers → 本 ModelRoute apply 后 autoconfig 写入即就绪)
 # autoconfig 据此写 openresty-conf(session_route_qwen.conf)+ cart-qwen-config(workers)。
+# 所有 service / outputConfigMap 均为 ns/name 全限定 → controller 全集群 watch,本 ModelRoute 放哪个 ns 都行
+# (下面 namespace 仅示例;换成 qwen 等任意 ns 不影响,引用不依赖它)。
 apiVersion: routing.gpucluster.io/v1alpha1
 kind: ModelRoute
 metadata:
   name: qwen
-  namespace: llm-route
+  namespace: llm-route                # 任意 ns 均可(所有引用已全限定)
 spec:
   discovery:                          # 后端桶(喂 cart workers + nginx backend)
     service: qwen/qwen-svc           # ns/name 跨 ns:qwen ns 的 qwen-svc
     port: 8000
   cart:                               # 本模型专属 cart(cache-aware-router)
-    service: cart-qwen
+    service: llm-route/cart-qwen      # ns/name:全限定,不依赖本 ModelRoute 部署在哪个 ns
     port: 8071
     outputConfigMap: llm-route/cart-qwen-config
     maxLoad: 20
   nginx:                              # openresty 路由(外部经 8080/qwen/ 访问)
     route: qwen
-    service: openresty
+    service: llm-route/openresty      # ns/name:openresty 入口 Service 全限定
     outputConfigMap: llm-route/openresty-conf
     peers:                            # 3 层,priority 大=优先
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart-qwen
