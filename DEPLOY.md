@@ -33,8 +33,8 @@
 ## 1. 前置
 
 ```bash
-helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech \
-  --username hardcore-tech --password '<HARBOR_PASS>'
+# 1.1 helm 加 ChartMuseum 仓(harbor 的 hardcore-tech project 允许匿名 pull → 只读无需凭证)
+helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech
 helm repo update harbor-chart-repo
 
 # 1.2 确认能看到各 chart(注:helm search 对本 ChartMuseum 偶发空,用 helm show chart 按版本确认)
@@ -48,7 +48,7 @@ kubectl create ns llm-route   2>/dev/null || true
 kubectl create ns monitoring  2>/dev/null || true
 ```
 
-> chart 版本会随各仓发版变化;取最新版本:`curl -s -u hardcore-tech:<pass> https://harbor.4pd.io/api/chartrepo/hardcore-tech/charts/<chart>`。
+> chart 版本会随各仓发版变化;取最新版本(匿名可读):`curl -s https://harbor.4pd.io/api/chartrepo/hardcore-tech/charts/<chart>`。
 
 ---
 
