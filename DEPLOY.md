@@ -136,9 +136,8 @@ chart 自带 MySQL(持久化 state + 时序);读 autoconfig 产出的 `monitor-c
 kubectl -n monitoring apply -f secret.example.yaml    # llm-monitor-secret + llm-monitor-mysql-secret
 
 # ② install:关掉 chart 自建密钥,引用带外的
+#    (nginxHost / bodylogSummaryURL 已是 chart 默认值——bodylog 默认指 ts34,换集群才 --set 覆盖)
 helm -n monitoring install monitor harbor-chart-repo/monitor --version 0.1.4 \
-  --set nginxHost="openresty (llm-route k8s)" \
-  --set bodylogSummaryURL="http://192.0.2.31:9998/summary" \
   --set secret.create=false \
   --set secret.existingSecret=llm-monitor-secret \
   --set mysql.auth.existingSecret=llm-monitor-mysql-secret
