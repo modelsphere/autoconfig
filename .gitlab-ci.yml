@@ -45,3 +45,24 @@ build:hagate:
     - docker build -f Dockerfile.hagate -t "$HAGATE_IMAGE:$CI_COMMIT_TAG" -t "$HAGATE_IMAGE:latest" .
     - docker push "$HAGATE_IMAGE:$CI_COMMIT_TAG"
     - docker push "$HAGATE_IMAGE:latest"
+
+# helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
+# push-chart 自处理 harbor ChartMuseum 鉴权(helm cm-push 到 runner 内 helm repo 别名 harbor-chart-repo,
+#   即 https://harbor.4pd.io/chartrepo/hardcore-tech);不用 docker login、不用 helm 镜像、不用新凭证。
+# 版本:autoconfig 的 chart version=appVersion=git tag(三者同线),把 Chart.yaml 两行 sed 成 $CI_COMMIT_TAG
+#   → values.yaml image.tag="" 回落 appVersion → controller 镜像 tag 与 chart 版本永远一致。
+#   (reload/hagate 侧车镜像在 values 里另钉版本,不随本 tag 走;需同步升时手动改 values。)
+# 消费:helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech && helm upgrade ... autoconfig --version <tag>
+build:chart:
+  stage: build
+  tags: [public-buildx]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  variables:
+    MODULE_NAME: autoconfig
+    CHART_FOLDER: deploy/helm/autoconfig
+    REGISTRY_PROJECT: hardcore-tech
+  script:
+    - 'sed -i -E "s/^version:.*/version: ${CI_COMMIT_TAG}/; s/^appVersion:.*/appVersion: \"${CI_COMMIT_TAG}\"/" "${CHART_FOLDER}/Chart.yaml"'
+    - push-chart
+    - 'echo "chart pushed: autoconfig ${CI_COMMIT_TAG} → ChartMuseum(harbor-chart-repo)"'
