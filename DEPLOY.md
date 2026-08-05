@@ -1,6 +1,6 @@
 # k8s 部署手册(autoconfig 路由栈 + 测试模型 + ModelRoute)
 
-在一套干净的 k8s 集群上,把整套「ModelRoute 驱动的 LLM 路由栈」部署起来,并跑通一个测试模型(opt / qwen)。
+在一套干净的 k8s 集群上,把整套「ModelRoute 驱动的 LLM 路由栈」部署起来,并跑通一个测试模型(以 **qwen** 为例;opt 等其它模型同样方式接入)。
 所有组件镜像 + helm chart 都由各仓 CI 打 git tag 后产出到 harbor / ChartMuseum,本文档只做 `helm install` + `kubectl apply`。
 
 ## 0. 架构与依赖顺序
@@ -19,11 +19,11 @@
 **部署顺序(有依赖,别颠倒)**:
 1. 前置:helm repo(ChartMuseum)+ namespace
 2. **autoconfig**(先装 —— 它带 ModelRoute CRD + controller;后面组件都消费它产出的 ConfigMap)
-3. 测试模型后端(opt / qwen)
+3. 测试模型后端(qwen)
 4. **cart**(每模型一个;`waitForWorkers` 会 Init 等 autoconfig 写入 workers)
 5. **openresty**(对外入口)
 6. **monitor**(dashboard + MySQL)
-7. **ModelRoute CR**(opt / qwen)→ autoconfig 据此填三个 ConfigMap → cart 就绪、openresty 出路由、monitor 出监控
+7. **ModelRoute CR**(qwen)→ autoconfig 据此填三个 ConfigMap → cart 就绪、openresty 出路由、monitor 出监控
 8. 验证
 
 镜像统一在 `harbor.4pd.io/hardcore-tech/`;chart 统一在 ChartMuseum `https://harbor.4pd.io/chartrepo/hardcore-tech`。
@@ -43,7 +43,7 @@ helm show chart harbor-chart-repo/openresty          --version 0.1.1      | grep
 helm show chart harbor-chart-repo/cache_aware_router --version 0.6.2-k8s  | grep -E '^name|^version'
 helm show chart harbor-chart-repo/monitor            --version 0.1.3      | grep -E '^name|^version'
 
-# 1.3 namespace(opt/qwen ns 由后端 sample 自带 Namespace,无需先建)
+# 1.3 namespace(qwen ns 由后端 sample 自带 Namespace,无需先建)
 kubectl create ns llm-route   2>/dev/null || true
 kubectl create ns monitoring  2>/dev/null || true
 ```
@@ -67,24 +67,20 @@ kubectl -n llm-route rollout status deploy/autoconfig-controller
 
 ---
 
-## 3. 测试模型后端(opt / qwen)
+## 3. 测试模型后端(以 qwen 为例)
 
-sample 在 `config/samples/`,各自带 Namespace + Deployment + Service。
+sample 在 `config/samples/`,自带 Namespace + Deployment + Service。
 
-- `opt-backend.yaml`:vLLM `opt-125m`(ns `opt`,`opt-svc` ClusterIP:8000;`--shutdown-timeout=3540` 优雅停机)
 - `qwen-backend.yaml`:sglang `Qwen3.5-4B`(ns `qwen`,`qwen-svc` NodePort:30055;**`--enable-metrics`** 否则 monitor 采不到 KV/running/waiting;`terminationGracePeriodSeconds:3600` 排空长请求)
 
 ```bash
-kubectl apply -f config/samples/opt-backend.yaml
 kubectl apply -f config/samples/qwen-backend.yaml
-
-kubectl -n opt  rollout status deploy/opt
 kubectl -n qwen rollout status deploy/qwen
 # sglang /metrics 需 --enable-metrics 才 200(默认 404):
-QIP=$(kubectl -n qwen get pod -l app=qwen -o jsonpath='{.items[0].status.podIP}')
 kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/metrics"
 ```
 
+> **opt 同理**:`config/samples/opt-backend.yaml`(vLLM `opt-125m`,ns `opt`,`opt-svc` ClusterIP:8000;`--shutdown-timeout=3540` 优雅停机)+ `modelroute-opt.yaml`,后续步骤把 `qwen` 换成 `opt` 即可。
 > 生产模型(如 kimi 用 LeaderWorkerSet TP8/PP2)部署方式不同(见 `scripts/k8s-llm/`),但接入路由的方式一样:建 Service + 写 ModelRoute。
 
 ---
@@ -99,15 +95,14 @@ kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}
 RELOAD=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.26
 HAGATE=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.26
 
-helm -n llm-route install cart-opt harbor-chart-repo/cache_aware_router --version 0.6.2-k8s \
-  --set fullnameOverride=cart-opt --set reload.image=$RELOAD --set ha.image=$HAGATE
-
 helm -n llm-route install cart-qwen harbor-chart-repo/cache_aware_router --version 0.6.2-k8s \
   --set fullnameOverride=cart-qwen --set reload.image=$RELOAD --set ha.image=$HAGATE
 
 # 此时 cart pod 会停在 Init(等 workers),属正常;第 7 步后转 Running
 kubectl -n llm-route get pods | grep cart-
 ```
+
+> opt 同理:`--set fullnameOverride=cart-opt`(要与 `modelroute-opt.yaml` 的 `cart.service`/`cart.outputConfigMap` 对上)。
 
 ---
 
@@ -164,21 +159,20 @@ kubectl -n monitoring rollout status deploy/monitor
 
 ## 7. 安装 ModelRoute(触发全栈自动配置)
 
-ModelRoute 是**中心配置**:放 `llm-route` ns,跨 ns 发现后端,autoconfig 据此同时写 openresty-conf / cart-<model>-config / monitor-conf。
-sample 在 `config/samples/`:
-
-- `modelroute-opt.yaml`:opt 三层路由(cart-opt → backend pod-IP → backend-svc VIP);discovery `opt/opt-svc`;monitor model `opt-125m`
-- `modelroute-qwen.yaml`:qwen 三层路由(cart-qwen → …);discovery `qwen/qwen-svc`;monitor model `qwen`
+ModelRoute 是**中心配置**:autoconfig 据此同时写 openresty-conf / cart-<model>-config / monitor-conf。
+sample 在 `config/samples/`,`modelroute-qwen.yaml`:qwen 三层路由(cart-qwen → backend pod-IP → backend-svc VIP 兜底);discovery `qwen/qwen-svc`;monitor model `qwen`。
 
 ```bash
-kubectl apply -f config/samples/modelroute-opt.yaml
 kubectl apply -f config/samples/modelroute-qwen.yaml
 
 # autoconfig 会在 ~秒级 reconcile;ConfigMap→pod 挂载传播有 ~1min kubelet 同步 lag
-kubectl -n llm-route get modelroute            # READY 应为 true,BACKENDS≥1,CART=1
+kubectl -n llm-route get modelroute qwen        # READY 应为 true,BACKENDS≥1,CART=1
 ```
 
-apply 后应观察到:cart pod 从 Init 转 **Running**(autoconfig 写入 workers);openresty 出现 `session_route_<model>.conf`;monitor dashboard 出现该模型的 service 行。
+apply 后应观察到:cart-qwen pod 从 Init 转 **Running**(autoconfig 写入 workers);openresty 出现 `session_route_qwen.conf`;monitor dashboard 出现 qwen 的 service 行。
+
+> **ModelRoute 放哪个 ns?** 本例放 `llm-route`(与 cart/openresty 同 ns,sample 里 `cart.service: cart-qwen`、`nginx.service: openresty` 用裸名即可)。controller 是全集群 watch(ClusterRole),ModelRoute 放 model ns(如 `qwen`)也行,但那些**裸引用会默认解析到 ModelRoute 自己的 ns** → 需显式加前缀 `llm-route/cart-qwen`、`llm-route/openresty`(各 `outputConfigMap` 本就带 ns,不用改)。
+> **opt 同理**:`kubectl apply -f config/samples/modelroute-opt.yaml`(discovery `opt/opt-svc`、cart-opt、monitor model `opt-125m`)。
 
 ---
 
@@ -194,11 +188,9 @@ kubectl -n llm-route get pods | grep -E 'cart-|openresty'
 # 8.3 端到端经 openresty → cart → 后端(在 openresty pod 内打本地 8080)
 ORP=$(kubectl -n llm-route get pod -l app.kubernetes.io/name=openresty -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 [ -z "$ORP" ] && ORP=$(kubectl -n llm-route get pods -o name | grep openresty | head -1 | cut -d/ -f2)
-for m in opt qwen; do
-  kubectl -n llm-route exec $ORP -c openresty -- sh -c \
-    "curl -s -o /dev/null -w '$m /v1/models=%{http_code}\n' http://127.0.0.1:8080/$m/v1/models -H 'Authorization: Bearer REDACTED-SEE-DEPLOY-DOCS'"
-done
-# chat 流(qwen 是 chat 模型,应 200;opt-125m 是基座模型无 chat template,chat 端点会 404,属正常):
+kubectl -n llm-route exec $ORP -c openresty -- sh -c \
+  "curl -s -o /dev/null -w 'qwen /v1/models=%{http_code}\n' http://127.0.0.1:8080/qwen/v1/models -H 'Authorization: Bearer REDACTED-SEE-DEPLOY-DOCS'"
+# chat 流(应 200,并回 X-Routed-Peer 头):
 kubectl -n llm-route exec $ORP -c openresty -- sh -c \
   "curl -s -D - -o /dev/null http://127.0.0.1:8080/qwen/v1/chat/completions -H 'Content-Type: application/json' \
    -H 'Authorization: Bearer REDACTED-SEE-DEPLOY-DOCS' \
@@ -222,8 +214,7 @@ helm repo update harbor-chart-repo
 # --reuse-values 保留安装时的 fullnameOverride / 密钥 / bodylog.host 等
 helm -n llm-route  upgrade autoconfig harbor-chart-repo/autoconfig         --version <新版> --reuse-values
 helm -n llm-route  upgrade openresty  harbor-chart-repo/openresty          --version <新版> --reuse-values
-helm -n llm-route  upgrade cart-opt   harbor-chart-repo/cache_aware_router --version <新版> --reuse-values
-helm -n llm-route  upgrade cart-qwen  harbor-chart-repo/cache_aware_router --version <新版> --reuse-values
+helm -n llm-route  upgrade cart-qwen  harbor-chart-repo/cache_aware_router --version <新版> --reuse-values   # 每个 cart-<model> 各升一次
 helm -n monitoring upgrade monitor    harbor-chart-repo/monitor            --version <新版> --reuse-values
 
 helm -n <ns> history <release>            # 看修订
@@ -238,9 +229,9 @@ helm -n <ns> rollback <release> <REV>     # 回滚
 ## 10. 卸载 / 清理
 
 ```bash
-kubectl -n llm-route delete -f config/samples/modelroute-opt.yaml -f config/samples/modelroute-qwen.yaml
-helm -n llm-route  uninstall openresty cart-opt cart-qwen autoconfig
+kubectl delete -f config/samples/modelroute-qwen.yaml
+helm -n llm-route  uninstall openresty cart-qwen autoconfig      # opt 同理:再 uninstall cart-opt
 helm -n monitoring uninstall monitor
-kubectl delete -f config/samples/opt-backend.yaml -f config/samples/qwen-backend.yaml   # 连带删 opt/qwen ns
-kubectl delete crd modelroutes.routing.gpucluster.io                                     # 如需彻底移除 CRD
+kubectl delete -f config/samples/qwen-backend.yaml               # 连带删 qwen ns(opt 同理删 opt-backend.yaml)
+kubectl delete crd modelroutes.routing.gpucluster.io            # 如需彻底移除 CRD
 ```
