@@ -72,3 +72,25 @@ func TestLuaVal(t *testing.T) {
 		}
 	}
 }
+
+// nameUnnamed:优先用节点名(稳定物理标识),同节点多 pod 追加序号,无节点名回落 "<target>-N"。
+func TestNameUnnamedPrefersNode(t *testing.T) {
+	peers := []config.Peer{
+		{IP: "10.1.0.1", Port: 8050, Node: "gpu-41"},
+		{IP: "10.1.0.2", Port: 8050, Node: "gpu-35"},
+		{IP: "10.1.0.3", Port: 8050, Node: "gpu-41"}, // 同节点第二个 pod → 去重
+		{IP: "10.1.0.4", Port: 8050},                 // 无节点名(如 VIP 兜底)→ 回落
+		{IP: "10.1.0.5", Port: 8050, Name: "显式名"},    // 已有名字不覆盖
+	}
+	got := nameUnnamed(peers, "backend")
+	want := []string{"gpu-41", "gpu-35", "gpu-41#2", "backend-3", "显式名"}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("peers[%d].Name=%q want %q", i, got[i].Name, w)
+		}
+	}
+	// 不得改动入参(nameUnnamed 返回副本)
+	if peers[0].Name != "" {
+		t.Errorf("入参被修改:peers[0].Name=%q", peers[0].Name)
+	}
+}
