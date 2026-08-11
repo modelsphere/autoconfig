@@ -7,7 +7,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"autoconfig/internal/config"
 )
@@ -170,6 +172,62 @@ func TestNormalizeGPUProduct(t *testing.T) {
 	for in, want := range cases {
 		if got := normalizeGPUProduct(in); got != want {
 			t.Errorf("normalizeGPUProduct(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+// nodeObj:带 GFD gpu.product label 的节点。
+func nodeObj(name, product string) *corev1.Node {
+	l := map[string]string{}
+	if product != "" {
+		l[gpuProductLabel] = product
+	}
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: l}}
+}
+
+// AnnotateGPUTypes:【逐 peer】按各自节点标 GPU 型号 —— 混布场景每个 peer 各自正确
+// (旧实现取第一个端点的型号套给全部 peer,混布时会把其余标错)。
+func TestAnnotateGPUTypesMixed(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		nodeObj("n-h100", "NVIDIA-H100-80GB-HBM3"),
+		nodeObj("n-a100", "NVIDIA-A100-SXM4-80GB"),
+		nodeObj("n-bare", ""), // 无 GPU label
+	)
+	peers := []config.Peer{
+		{IP: "10.1.0.1", Port: 8050, Node: "n-h100"},
+		{IP: "10.1.0.2", Port: 8050, Node: "n-a100"},
+		{IP: "10.1.0.3", Port: 8050, Node: "n-bare"},
+		{IP: "10.1.0.4", Port: 8050, Node: "n-missing"}, // 节点不存在
+		{IP: "10.1.0.5", Port: 8050},                    // 无 node 名
+	}
+	AnnotateGPUTypes(context.Background(), cs, peers)
+
+	want := []string{"H100", "A100", "", "", ""}
+	for i, w := range want {
+		if peers[i].GPU != w {
+			t.Errorf("peers[%d].GPU=%q want %q", i, peers[i].GPU, w)
+		}
+	}
+}
+
+// 同节点的 label 只查一次(node → 型号 缓存),避免 peer 多时反复打 API server。
+func TestAnnotateGPUTypesCachesPerNode(t *testing.T) {
+	cs := fake.NewSimpleClientset(nodeObj("n1", "NVIDIA-H200"))
+	gets := 0
+	cs.PrependReactor("get", "nodes", func(action ktesting.Action) (bool, runtime.Object, error) {
+		gets++
+		return false, nil, nil // 继续走默认 tracker
+	})
+	peers := []config.Peer{
+		{IP: "10.1.0.1", Node: "n1"}, {IP: "10.1.0.2", Node: "n1"}, {IP: "10.1.0.3", Node: "n1"},
+	}
+	AnnotateGPUTypes(context.Background(), cs, peers)
+	if gets != 1 {
+		t.Errorf("同节点应只查 1 次 Node,实际 %d 次", gets)
+	}
+	for i := range peers {
+		if peers[i].GPU != "H200" {
+			t.Errorf("peers[%d].GPU=%q want H200", i, peers[i].GPU)
 		}
 	}
 }

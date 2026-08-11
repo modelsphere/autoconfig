@@ -98,6 +98,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		r.setStatus(ctx, req.NamespacedName, 0, 0, false, "DiscoverError", fmt.Sprintf("discover backends: %v", err))
 		return ctrl.Result{RequeueAfter: resyncEvery}, nil
 	}
+	// 逐 peer 标注 GPU 型号(各自所在节点的 GFD label);openresty peer 的 gpu 命名字段与 monitor
+	// 的 service 行都用它。混布场景下每个 peer 各自正确;推不出留空、不影响其余流程。
+	discovery.AnnotateGPUTypes(ctx, r.Clientset, backends)
 	if len(backends) == 0 {
 		// fail-safe:绝不写空(CART 拒空 workers、openresty 会丢全部流量)。标记 not-ready 后重试。
 		log.Info("0 ready backends, keep last config (fail-safe)")
@@ -222,12 +225,8 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if rb.Spec.Cart != nil && (m.Router == nil || *m.Router) { // 复用已探测的 CART pod 作 router
 			routerPeers = cartPeers
 		}
-		// gpuType:显式配了用显式;否则从后端所在节点的 GPU label 自动推导(推不出留空)
-		gpuType := m.GPUType
-		if gpuType == "" {
-			gpuType = discovery.GPUType(ctx, r.Clientset, backendTarget)
-		}
-		monConf := sink.RenderMonitor(rb.Name, m.Model, gpuType, nginxName, route, backends, nginxPeers, routerPeers)
+		// gpuType:显式配了整条 route 用显式覆盖;为空则用上面逐 peer 标注的结果(支持混布)。
+		monConf := sink.RenderMonitor(rb.Name, m.Model, m.GPUType, nginxName, route, backends, nginxPeers, routerPeers)
 		if err := r.writeConfigMap(ctx, &rb, m.OutputConfigMap,
 			map[string]string{monitorKey(rb.Name): monConf}); err != nil {
 			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), m.OutputConfigMap, err)

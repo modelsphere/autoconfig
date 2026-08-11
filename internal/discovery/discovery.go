@@ -28,8 +28,31 @@ const serviceNameLabel = "kubernetes.io/service-name"
 // 值如 "NVIDIA-A100-SXM4-80GB" / "NVIDIA-H100-80GB-HBM3" / "NVIDIA-H200"。
 const gpuProductLabel = "nvidia.com/gpu.product"
 
-// GPUType 推导 target 后端所在节点的 GPU 型号:取第一个就绪端点的 nodeName → 读 node 的 gpu.product label →
-// 归一化成短名(A100/H100/H200…)。推不出(无端点/节点无 GPU label/无 node 读权限)返回 ""。
+// AnnotateGPUTypes 逐 peer 填 GPU 型号:各自 Peer.Node → 读该 node 的 gpu.product label → 归一化成短名。
+// 【为什么逐 peer 而不是整组取一个】同一条 route 的后端可能混布不同型号(如 Kimi 跑在 H100/H800/A100/B300),
+// 取"第一个端点"会把其余 peer 全部标错,且该值随 pod 重启/扩缩容漂移。
+// 同节点的 label 只查一次(node → 型号 缓存)。查不到(无 node 名/无读权限/节点无 GPU label)该 peer 留空,不报错。
+func AnnotateGPUTypes(ctx context.Context, cs kubernetes.Interface, peers []config.Peer) {
+	cache := map[string]string{}
+	for i := range peers {
+		node := peers[i].Node
+		if node == "" {
+			continue
+		}
+		gpu, ok := cache[node]
+		if !ok {
+			if n, err := cs.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{}); err == nil {
+				gpu = normalizeGPUProduct(n.Labels[gpuProductLabel])
+			}
+			cache[node] = gpu
+		}
+		peers[i].GPU = gpu
+	}
+}
+
+// GPUType 推导 target 后端所在节点的 GPU 型号(整组取一个值):取第一个就绪端点的 nodeName →
+// 读 node 的 gpu.product label → 归一化成短名。推不出返回 ""。
+// ⚠️ 混布场景下该值只代表第一个端点,逐 peer 请用 AnnotateGPUTypes。
 func GPUType(ctx context.Context, cs kubernetes.Interface, t config.Target) string {
 	node := firstNodeName(ctx, cs, t)
 	if node == "" {
@@ -173,7 +196,11 @@ func discoverEndpointSlices(ctx context.Context, cs kubernetes.Interface, t conf
 					continue
 				}
 				seen[addr] = true
-				out = append(out, config.Peer{IP: addr, Port: port})
+				node := ""
+				if ep.NodeName != nil {
+					node = *ep.NodeName
+				}
+				out = append(out, config.Peer{IP: addr, Port: port, Node: node})
 			}
 		}
 	}
@@ -224,7 +251,7 @@ func discoverPods(ctx context.Context, cs kubernetes.Interface, t config.Target)
 			continue
 		}
 		seen[p.Status.PodIP] = true
-		out = append(out, config.Peer{IP: p.Status.PodIP, Port: port})
+		out = append(out, config.Peer{IP: p.Status.PodIP, Port: port, Node: p.Spec.NodeName})
 	}
 	sortPeers(out)
 	return out, nil

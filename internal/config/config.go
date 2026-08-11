@@ -13,10 +13,12 @@ type Peer struct {
 	MaxConcurrency int    // openresty only; 0 = use route default
 	MaxLoad        int    // cart only; 0 = sink default
 	ProbePath      string // openresty only; 空=用 route 默认(/v1/models)。cart peer 默认 "/health"
+	Node           string // 该端点所在节点名(发现时填);仅用于推导 GPU,不渲染进配置
+	GPU            string // 该端点所在节点的 GPU 型号短名(A100/H100/H200/…);推不出为空
 }
 
 // LuaTuple renders the positional lua peer form: "ip", port, "name"[, priority[, maxConcurrency]],
-// 再拼可选命名字段 , probe = "<path>"(命名字段不占位置,不影响前面的位置元组)。
+// 再拼可选命名字段 , probe = "<path>" / , gpu = "<型号>"(命名字段不占位置,不影响前面的位置元组)。
 // priority/maxConcurrency 只在非零时才输出(与 openresty peers 的位置约定一致);
 // maxConcurrency 非零必须先补 priority 占位(第 4 位),否则位置错位。
 func (p Peer) LuaTuple() string {
@@ -29,6 +31,9 @@ func (p Peer) LuaTuple() string {
 	}
 	if p.ProbePath != "" {
 		s += fmt.Sprintf(", probe = %q", p.ProbePath)
+	}
+	if p.GPU != "" {
+		s += fmt.Sprintf(", gpu = %q", p.GPU)
 	}
 	return s
 }

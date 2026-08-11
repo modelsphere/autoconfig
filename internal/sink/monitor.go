@@ -15,13 +15,19 @@ import (
 //	router:  <mrName>-router-<i> | http://ip:port/workers            —— CART(Router tab;url 为 /workers 端点)
 //
 // model 为空用 mrName;route 为 nginx 行的路径 key;nginxPeers/routerPeers 为空则不出对应行。
+// gpuType:CRD 显式配置(整条 route 覆盖);为空时逐 peer 用 Peer.GPU(自动推导,支持混布)。
 func RenderMonitor(mrName, model, gpuType, nginxName, route string, backends, nginxPeers, routerPeers []config.Peer) string {
 	if model == "" {
 		model = mrName
 	}
 	var b strings.Builder
 	for i, p := range backends {
-		fmt.Fprintf(&b, "service: %s-%d | http://%s:%d | %s | %s\n", mrName, i, p.IP, p.Port, model, gpuType)
+		// gpuType(来自 CRD 显式配置)优先;否则用该 peer 自己节点推导出的型号 —— 混布时各行各自正确。
+		g := gpuType
+		if g == "" {
+			g = p.GPU
+		}
+		fmt.Fprintf(&b, "service: %s-%d | http://%s:%d | %s | %s\n", mrName, i, p.IP, p.Port, model, g)
 	}
 	for i, p := range nginxPeers {
 		// 加 -nginx- 判别段(与 router 的 -router- 平行):否则当 model==mrName 时,nginx 行名 <model>-<i>
