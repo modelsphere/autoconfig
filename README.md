@@ -104,6 +104,29 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 | `service` | string | 可选 | nginx 入口自身的 Service `ns/name` → 供 monitor 的 `nginx:` 行 + 入口 pod 扩缩事件驱动；端口取 Service 的 dispatch 命名端口 8080 |
 | `selector` | string | 可选 | nginx 入口 pod label 发现（没建 Service 兜底；与 `service` 二选一，都配则 `service` 优先） |
 
+**`spec.nginx.values` 示例 —— 开启动态限流(自适应并发 AIMD)**
+
+配了 `tps_limit_tps` 即对本路由 opt-in;未显式 `adaptive_cc: "false"` 时,`adaptive_cc` 按全局默认(`ADAPTIVE_CC_DEFAULT=true`)自动开。删掉 `values` 即退回不限流。
+
+```yaml
+spec:
+  nginx:
+    route: qwen
+    service: llm-route/openresty
+    outputConfigMap: llm-route/openresty-conf
+    values:                       # 任意 key 原样渲染进 lua register_route opts(值必须字符串)
+      tps_limit_tps: "30"         # 解码速率下限(tok/s):EWMA 低于它→AIMD 缩并发,高于它→涨(= opt-in 闸门)
+      # adaptive_cc_min: "10"     # 可选:并发下限(不配 = 静态 max × 全局 min_frac 派生)
+      # ttft_limit_ms: "60000"    # 可选:TTFT 软控阈值
+      # adaptive_cc: "false"      # 可选:显式关自适应,走静态硬熔断
+    peers:
+    - { use: cart, priority: 3, maxConcurrencyFromBackend: true }
+    - { use: backend, priority: 2, maxConcurrency: 100 }
+    - { use: backend-svc, priority: 1 }
+```
+
+生效后 openresty 侧 `GET /<route>/_tps_status` 应见 `opt_in=true, adaptive_cc_on=true`;bodylog-exporter 的 `openresty_adaptive_cc{route}` / `openresty_tps_ewma{route}` 随之进 Prometheus。
+
 **`spec.nginx.peers[]`** —— 有序分层（数字大=优先，高优层全 banned 才级联到低层）
 
 | 字段 | 类型 | 默认/约束 | 含义与配置 |

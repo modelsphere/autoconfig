@@ -27,6 +27,10 @@ spec:
     route: qwen
     service: llm-route/openresty      # ns/name:openresty 入口 Service 全限定
     outputConfigMap: llm-route/openresty-conf
+    values:                           # 动态限流(自适应并发 AIMD):配 tps_limit_tps 即 opt-in 开启
+      tps_limit_tps: "30"             #   解码速率下限(tok/s):EWMA 低于它→AIMD 缩并发上限,高于它→涨
+      #                               #   配了它且未显式 adaptive_cc:false → adaptive_cc 按全局默认自动开
+      # adaptive_cc_min: "10"         #   可选:并发下限(不配 = 静态 max × 全局 min_frac 派生)
     peers:                            # 3 层,priority 大=优先
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart-qwen
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
