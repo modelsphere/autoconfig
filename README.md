@@ -43,7 +43,7 @@ CART 有 prefix-cache radix tree）。多副本同时进 Service endpoints = 缓
 **level-triggered 自愈**：每 2s 读 pod 实际标签，与「**该不该 active**（= 是 leader **且**本地 app 端口可连）」比对，
 不符就纠正 —— 标签被外部误删也能自愈；本地 app 端口连不上时即便是 leader 也主动摘标签（避免把流量导向坏 pod）。
 
-**failover**：计划内下线（SIGTERM）主动 release Lease + 摘标签 → standby ~1-2s 接管；硬崩则等 Lease TTL 过期后接管。
+**failover**：计划内下线（SIGTERM=删 pod/滚动/驱逐）release Lease → standby ~1-2s 接管**新**流量；本 pod **保留** active 标签作 **terminating endpoint**（deletionTimestamp），靠 Cilium graceful-terminating 把新连接导向 standby、老在途连接留在本 pod 排空（配合主容器 SIGQUIT 优雅停 + grace），**不硬摘标签 → 不 reset 在途连接**，pod 退出即自动出 endpoints。存活丢主（Lease 续约失败但 pod 没死）才摘标签离开 Service（避免 2-active）。硬崩则等 Lease TTL 过期后接管。
 
 **monitor 不做 HA**：采集/告警是**自主轮询循环**（不接收外部流量），readiness 门控挡不住重复采集，单活无意义 →
 monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty/cart 默认开（`replicas: 2` + `ha.enabled: true`）。
