@@ -3,8 +3,11 @@
 // → 只有 leader 进 endpoints。用标签而非 readiness 门控,避免 standby 永久 NotReady 卡住 Deployment 滚动。
 //
 // failover:
-//   - 计划内(SIGTERM:删 pod/滚动/驱逐):捕获信号 → 取消 context → ReleaseOnCancel 主动释放 Lease
-//   - 摘掉自己 active 标签 → standby ~1-2s(RetryPeriod)接管,近乎无缝。
+//   - 计划内(SIGTERM:删 pod/滚动/驱逐):捕获信号 → 取消 context → ReleaseOnCancel 释放 Lease
+//     → standby ~1-2s(RetryPeriod)接管【新】流量。本 pod【保留】active 标签:此时它已是
+//     terminating endpoint(deletionTimestamp),Cilium graceful-terminating 把新连接导向 standby、
+//     老在途连接留在本 pod 直到排空(openresty SIGQUIT + grace),避免在途被 reset;pod 退出即自动出 endpoints。
+//   - 存活丢主(Lease 续约失败,pod 没死):非 terminating → 协调循环摘标签,离开 Service(避免 2-active)。
 //   - 硬崩(节点宕/kill -9):无从释放,standby 等 Lease 过期(~LeaseDuration)接管。
 package hagate
 
@@ -63,8 +66,9 @@ func Run(c Config) error {
 		}
 	}()
 
-	// stopping:收到信号后置真,永久强制 want=false —— 协调循环从此不会再把标签打回来。
-	var stopping atomic.Bool
+	// terminating:收到 SIGTERM(=pod 正被删除)后置真,永久强制 want=true —— 保留 active 标签,
+	// 让本 pod 作为 terminating endpoint 留在 Service,由 Cilium graceful-terminating 优雅排空在途连接。
+	var terminating atomic.Bool
 
 	// 信号 → 取消 ctx(RunOrDie 收到后 ReleaseOnCancel 释放 Lease)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,10 +76,9 @@ func Run(c Config) error {
 	signal.Notify(sigc, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigc
-		log.Printf("signal received, releasing lease + label (%s)", c.Identity)
-		stopping.Store(true)                                                        // 先封死 want,再摘标签,防协调循环抢回
-		_ = setPodLabel(cs, c.Namespace, c.Identity, c.LabelKey, c.LabelVal, false) // 摘标签,Service 立刻剔除本 pod
-		cancel()
+		log.Printf("SIGTERM: releasing lease, KEEPING active label for graceful drain (%s)", c.Identity)
+		terminating.Store(true) // 强制 want=true:保留标签,不硬摘(硬摘=从 Service selector 剔除 → Cilium reset 在途连接)
+		cancel()                // 释放 Lease → standby 接管新流量;本 pod 保留标签作 terminating endpoint 排空在途
 	}()
 
 	// 标签协调(level-triggered):每轮读 pod 【实际】标签,与 desired(leader 且 appTCP 可连)不符就纠正。
@@ -96,12 +99,12 @@ func Run(c Config) error {
 			}
 		}
 		for {
-			// stopping 后恒 false:即使这轮的 want 是在信号到来前算出的(TOCTOU),下面 ctx.Done 分支
-			// 会在退出前把标签再摘一次兜底 —— 循环最后一个写动作一定是「移除」。
-			reconcile(!stopping.Load() && leader.Load() && (c.AppTCP == "" || dialOK(c.AppTCP)))
+			// terminating 后恒 true:强制保留标签。即使这轮 want 在信号前算出(TOCTOU),ctx.Done 分支
+			// 退出前会再确保标签在 —— 循环最后一个写动作是「保留」,让 pod 以 terminating endpoint 排空。
+			reconcile(terminating.Load() || (leader.Load() && (c.AppTCP == "" || dialOK(c.AppTCP))))
 			select {
 			case <-ctx.Done():
-				reconcile(false) // 退出前最后一次:确保将死 pod 不残留 active 标签(Service 立即剔除)
+				reconcile(true) // 退出前保留 active 标签:pod 仍 terminating,靠 Cilium graceful 排空在途;pod 退出即自动出 endpoints
 				return
 			case <-time.After(2 * time.Second):
 			}

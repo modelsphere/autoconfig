@@ -38,7 +38,7 @@ helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech
 helm repo update harbor-chart-repo
 
 # 1.2 确认能看到各 chart(注:helm search 对本 ChartMuseum 偶发空,用 helm show chart 按版本确认)
-helm show chart harbor-chart-repo/autoconfig         --version 0.3.27     | grep -E '^name|^version'
+helm show chart harbor-chart-repo/autoconfig         --version 0.3.28     | grep -E '^name|^version'
 helm show chart harbor-chart-repo/openresty          --version 0.1.1      | grep -E '^name|^version'
 helm show chart harbor-chart-repo/cache_aware_router --version 0.6.2-k8s  | grep -E '^name|^version'
 helm show chart harbor-chart-repo/monitor            --version 0.1.3      | grep -E '^name|^version'
@@ -57,7 +57,7 @@ kubectl create ns monitoring  2>/dev/null || true
 chart 自带 `crds/`(ModelRoute CRD)+ controller Deployment(2 副本 leader 选举)+ RBAC。
 
 ```bash
-helm -n llm-route install autoconfig harbor-chart-repo/autoconfig --version 0.3.27 \
+helm -n llm-route install autoconfig harbor-chart-repo/autoconfig --version 0.3.28 \
   --set fullnameOverride=autoconfig-controller
 
 # 校验:CRD 装上 + controller Running
@@ -92,8 +92,8 @@ kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}
 
 ```bash
 # reload/hagate 侧车镜像属于 autoconfig 仓(跨仓引用),版本按当前 autoconfig 发版对齐
-RELOAD=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.27
-HAGATE=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.27
+RELOAD=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.28
+HAGATE=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.28
 
 helm -n llm-route install cart-qwen harbor-chart-repo/cache_aware_router --version 0.6.2-k8s \
   --set fullnameOverride=cart-qwen --set reload.image=$RELOAD --set ha.image=$HAGATE
@@ -115,8 +115,8 @@ chart 挂载 autoconfig 产出的 `openresty-conf` ConfigMap(各 `session_route_
 helm -n llm-route install openresty harbor-chart-repo/openresty --version 0.1.1 \
   --set fullnameOverride=openresty \
   --set bodylog.host=192.0.2.31 \
-  --set reload.image=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.27 \
-  --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.27
+  --set reload.image=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.28 \
+  --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.28
 
 kubectl -n llm-route rollout status deploy/openresty
 ```
