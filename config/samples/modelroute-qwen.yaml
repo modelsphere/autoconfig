@@ -3,8 +3,8 @@
 # 前置:cart-qwen 需先用 cache_aware_router helm chart 装(一个模型一个 cart):
 #   helm -n llm-route install cart-qwen <cart-chart> \
 #     --set fullnameOverride=cart-qwen \
-#     --set reload.image=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.30 \
-#     --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.30
+#     --set reload.image=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.31 \
+#     --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.31
 #   (cart 起始 initContainer 等 cart-qwen-config 有 workers → 本 ModelRoute apply 后 autoconfig 写入即就绪)
 # autoconfig 据此写 openresty-conf(session_route_qwen.conf)+ cart-qwen-config(workers)。
 # 所有 service / outputConfigMap 均为 ns/name 全限定 → controller 全集群 watch,本 ModelRoute 放哪个 ns 都行

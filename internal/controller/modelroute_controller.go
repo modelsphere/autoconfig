@@ -306,14 +306,15 @@ func (r *ModelRouteReconciler) configMapWriteResult(ctx context.Context, nn type
 	return ctrl.Result{}, fmt.Errorf("write configmap %s: %w", ref, err)
 }
 
-// cleanupSharedKeys 删 RB 时,从各共享 ConfigMap(cart / openresty / 可选 monitor)里摘掉自己那个 key。
+// cleanupSharedKeys 删 RB 时,从【共享多-key】ConfigMap(openresty / 可选 monitor)里摘掉自己那个 key。
 // ConfigMap 本体归 chart / 手工所有,不由 autoconfig 删除。
+//
+// ⚠️ 【不碰 cart ConfigMap】:cart 是每模型【独占】ConfigMap,整份内容就是 `config.yaml` 这一个 key
+// (chart 建的 baseConfig + autoconfig 填的 workers),不是共享多-key。删掉 config.yaml = 把 cart 配置整个清空
+// → 下次 reconcile 读到 base="" → RenderCart 本会 clobber 成最小默认(6700/无 proxy)→ 与运行中 cart 不一致
+// → cart 只接受「仅 workers 变化」的 reload → 整包拒绝 → workers 永久冻结(2026-08-13 mf-fallback 因 route
+// 改名 delete+readd MR 踩坑)。MR 删掉后 cart 也随之下线,残留的 workers 无害;MR 若再加回,base 原样保留。
 func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routingv1.ModelRoute) error {
-	if c := rb.Spec.Cart; c != nil {
-		if err := r.removeConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace); err != nil {
-			return err
-		}
-	}
 	if err := r.removeConfigMapKey(ctx, rb.Spec.Nginx.OutputConfigMap, openrestyKey(nginxRoute(rb)), rb.Namespace); err != nil {
 		return err
 	}
