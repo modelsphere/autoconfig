@@ -111,14 +111,24 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 2) CART(可选):渲染 workers 写 cart-config,并发现 CART pod 供 openresty 引用
 	var cartPeers []config.Peer
 	if c := rb.Spec.Cart; c != nil {
-		// 底稿(server/cache/health)来自 chart 建的 cart-config(values.baseConfig);autoconfig 只覆盖 workers 键。
-		// 读现有 config.yaml 当底稿(YAML 解析,替换 workers);读不到则用内置默认。
-		cartYAML, rerr := sink.RenderCart(r.readConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace), backends, c.MaxLoad)
-		if rerr != nil {
-			return ctrl.Result{}, fmt.Errorf("render cart config: %w", rerr)
-		}
-		if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
-			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), 0, c.OutputConfigMap, err)
+		// 底稿(server/cache/health/proxy)来自 chart 建的 cart-config(values.baseConfig);autoconfig 只覆盖 workers 键。
+		// 读现有 config.yaml 当底稿(YAML 解析,替换 workers)。
+		// fail-safe:底稿读空(ConfigMap 缺失 / 瞬时读失败 / config.yaml 空)时【绝不】用内置最小默认去写——
+		// 那会把 chart 的 server.port/proxy.add_routed_peer_header/health.endpoint 整段 clobber 掉,
+		// 与【运行中 cart 启动时读到的 base】不一致 → cart 只接受「仅 workers 变化」的 reload → 整包拒绝 →
+		// workers 永久冻结在启动集合(2026-08-13 mf-fallback 踩坑:live 卡 4 而实际后端 8)。
+		// 保留现有 ConfigMap(base + 上次 workers),本轮跳过 cart 写入、requeue 重试;discovery/nginx 照常走。
+		base := r.readConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace)
+		if base == "" {
+			log.Info("cart base config.yaml not readable, keep last cart config (fail-safe, no clobber)", "cm", c.OutputConfigMap)
+		} else {
+			cartYAML, rerr := sink.RenderCart(base, backends, c.MaxLoad)
+			if rerr != nil {
+				return ctrl.Result{}, fmt.Errorf("render cart config: %w", rerr)
+			}
+			if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
+				return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), 0, c.OutputConfigMap, err)
+			}
 		}
 		// CART 作为 openresty 的 priority-1 单一上游:走 CART Service 的 ClusterIP(VIP)而非 pod IP。
 		// CART 是 hagate master-standby(Service selector 带 active 标签 → VIP 恒指当前 leader);用 VIP →

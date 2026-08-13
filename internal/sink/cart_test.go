@@ -20,9 +20,9 @@ func TestRenderCart(t *testing.T) {
 			t.Errorf("missing %q\n%s", w, out)
 		}
 	}
-	// base 为空用内置默认
-	if o, _ := RenderCart("", nil, 0); !strings.Contains(o, "port: 6700") {
-		t.Error("空 base 应用内置默认 6700")
+	// base 为空必须报错(绝不 fallback 到会 clobber chart base 的内置默认)
+	if _, err := RenderCart("", nil, 0); err == nil {
+		t.Error("空 base 应报错,不得渲染出会 clobber 掉 proxy/health 的最小默认")
 	}
 	// per-worker max_load 覆盖
 	o, _ := RenderCart("server: {}", []config.Peer{{IP: "1.2.3.4", Port: 80, MaxLoad: 5}}, 20)

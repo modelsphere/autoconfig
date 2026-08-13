@@ -6,9 +6,9 @@ autoconfig 运维手册。当前聚焦:**验证后端扩缩容时,autoconfig 是
 
 | 组件 | helm release | 运行镜像 |
 |---|---|---|
-| autoconfig controller | `autoconfig-0.3.29` | `autoconfig:0.3.29` |
-| openresty | `openresty-0.1.1` | `llm-openresty:0.1.1` + sidecar `autoconfig-reload/hagate:0.3.29` |
-| cart | `cache_aware_router-0.1.1` (app `v0.6.2-k8s`) | `cache_aware_router:v0.6.2-k8s` + sidecar `:0.3.29` |
+| autoconfig controller | `autoconfig-0.3.30` | `autoconfig:0.3.30` |
+| openresty | `openresty-0.1.1` | `llm-openresty:0.1.1` + sidecar `autoconfig-reload/hagate:0.3.30` |
+| cart | `cache_aware_router-0.1.1` (app `v0.6.2-k8s`) | `cache_aware_router:v0.6.2-k8s` + sidecar `:0.3.30` |
 | monitor | `monitor-0.1.0` | `llm-monitor:0.1.0`(在 `monitoring` ns) |
 
 **链路**:后端 pod 变化 → k8s EndpointSlice → **autoconfig watch → 重渲染 → 写 ConfigMap**(秒级)→ 消费方 pod 挂载卷更新(kubelet 传播 **~1min lag**)→ reload sidecar `SIGHUP` → 生效。
