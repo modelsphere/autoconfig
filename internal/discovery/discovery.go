@@ -119,7 +119,7 @@ func normalizeGPUProduct(product string) string {
 // 由 kube-proxy 维护到 pod 的映射,故后端 rollout / autoconfig(operator)宕 都不影响它可达(kube-proxy
 // 是平台组件、一直在)。代价:走 VIP 无 per-pod 亲和/least_conn(降级)。故只当最低优先级兜底 peer,
 // 平时用 pod-IP 层。headless(ClusterIP=None)/ 未分配 VIP 的 Service 报错(它没有可兜底的 VIP)。
-// 端口:t.Port>0 时必须匹配 Service 的某个 frontend 端口(否则报错,防误用 targetPort);否则取唯一 frontend 端口。
+// 端口:t.PortName 非空按名取(多端口消歧,如 openresty 的 dispatch);否则 t.Port>0 须匹配某 frontend 端口;都空取唯一。
 func ServiceClusterIP(ctx context.Context, cs kubernetes.Interface, t config.Target) ([]config.Peer, error) {
 	svc, err := cs.CoreV1().Services(t.Namespace).Get(ctx, t.Service, metav1.GetOptions{})
 	if err != nil {
@@ -129,7 +129,7 @@ func ServiceClusterIP(ctx context.Context, cs kubernetes.Interface, t config.Tar
 	if vip == "" || vip == corev1.ClusterIPNone {
 		return nil, fmt.Errorf("service %s/%s 无 ClusterIP(headless 或未分配)——不能作 VIP 兜底", t.Namespace, t.Service)
 	}
-	port, err := serviceFrontendPort(svc, t.Port)
+	port, err := serviceFrontendPort(svc, t.Port, t.PortName)
 	if err != nil {
 		return nil, fmt.Errorf("service %s/%s: %w", t.Namespace, t.Service, err)
 	}
@@ -137,8 +137,17 @@ func ServiceClusterIP(ctx context.Context, cs kubernetes.Interface, t config.Tar
 }
 
 // serviceFrontendPort 取 Service 的 frontend 端口(spec.ports[].port,= VIP 对外端口)。
-// hint>0:必须是其中之一(挡住误传 targetPort);hint==0:唯一端口推导(多端口要求显式)。
-func serviceFrontendPort(svc *corev1.Service, hint int) (int, error) {
+// name!="":按端口名取(多端口 Service 消歧,如 openresty 的 "dispatch");
+// hint>0:必须是其中之一(挡住误传 targetPort);两者皆空:唯一端口推导(多端口要求显式)。
+func serviceFrontendPort(svc *corev1.Service, hint int, name string) (int, error) {
+	if name != "" {
+		for _, p := range svc.Spec.Ports {
+			if p.Name == name && p.Port > 0 {
+				return int(p.Port), nil
+			}
+		}
+		return 0, fmt.Errorf("端口名 %q 不在 Service 的 frontend 端口里", name)
+	}
 	set := map[int32]bool{}
 	for _, p := range svc.Spec.Ports {
 		if p.Port > 0 {

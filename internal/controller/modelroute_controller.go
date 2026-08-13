@@ -213,7 +213,14 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// 端口用【本模型的 nginx.listen】→ monitor 每个 nginx 端口代表一个模型(每模型独立 key,不 dedup)
 			nginxTarget := discoveryTarget(rb.Spec.Nginx.Service, rb.Spec.Nginx.Selector, 0, false, rb.Namespace)
 			nginxTarget.PortName = dispatchPortName // 按名从 openresty Service 取 dispatch 端口(号在 chart)
-			nginxPeers, err = discovery.Discover(ctx, r.Clientset, nginxTarget)
+			// 探 openresty 入口用【Service VIP】而非 pod IP:openresty 是 master-standby,active pod 随
+			// 切换/滚动 churn → 探已删的 pod IP 会 Connection refused 误报。VIP 恒指 active leader,稳定不 churn。
+			// (只配 selector、没建 Service 时无 VIP 可用 → 回退 pod IP 发现。)
+			if rb.Spec.Nginx.Service != "" {
+				nginxPeers, err = discovery.ServiceClusterIP(ctx, r.Clientset, nginxTarget)
+			} else {
+				nginxPeers, err = discovery.Discover(ctx, r.Clientset, nginxTarget)
+			}
 			if err != nil {
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil
