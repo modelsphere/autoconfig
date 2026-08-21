@@ -33,6 +33,16 @@ modelRoutes: []
 #        service: openresty/openresty     # 可选:nginx 入口 → monitor nginx 行
 #        peers: [ { use: cart, priority: 1, maxConcurrency: 180 }, { use: backend, priority: 0 } ]
 
+# controller-runtime 自带指标(/metrics:reconcile 次数/耗时/错误、workqueue 深度与
+# 未完成时长、client-go 请求、Go 运行时)。卡死排查主看 workqueue_unfinished_work_seconds。
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    labels:
+      release: kube-prometheus-stack   # 本集群 Prometheus 的 serviceMonitorSelector 认这个 label,缺了不抓
+
 nameOverride: ""
 fullnameOverride: ""
 podAnnotations: {}

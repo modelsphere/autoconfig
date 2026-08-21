@@ -1,0 +1,23 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+# ⚠️ label `release: kube-prometheus-stack` 必须有 —— 本集群 Prometheus 的
+#    serviceMonitorSelector 就是 matchLabels{release: kube-prometheus-stack},
+#    缺了这个 label 的 ServiceMonitor 会被静默忽略(建出来了但没人抓)。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "autoconfig.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "autoconfig.labels" . | nindent 4 }}
+    {{- toYaml .Values.metrics.serviceMonitor.labels | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels: {{- include "autoconfig.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      honorLabels: true
+{{- end }}

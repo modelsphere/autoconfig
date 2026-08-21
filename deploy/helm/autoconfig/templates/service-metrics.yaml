@@ -1,0 +1,19 @@
+{{- if .Values.metrics.enabled }}
+# controller-runtime metrics 的 Service。仅供 Prometheus 抓取,不承载业务流量。
+# 注意:两个副本是主备(leader 选举),【两个都会被抓】—— standby 的 reconcile 计数近 0、
+# workqueue 恒空,这是正常的;判断卡死要看 leader 那个实例(按 pod 标签区分)。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "autoconfig.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "autoconfig.labels" . | nindent 4 }}
+spec:
+  clusterIP: None          # headless:直接按 pod 抓,保留每副本视角(主备要分开看)
+  selector: {{- include "autoconfig.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

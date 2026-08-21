@@ -47,8 +47,14 @@ func runController(leaderElect bool) error {
 	}
 	shutdownTimeout := 10 * time.Second
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsserver.Options{BindAddress: "0"}, // 关 metrics server,避免端口占用
+		Scheme: scheme,
+		// metrics server:controller-runtime 自带的 /metrics(reconcile 次数/耗时/错误、
+		// workqueue 深度与未完成时长、client-go 对 apiserver 的请求、Go 运行时)。
+		// 关键用途:workqueue_unfinished_work_seconds 持续上涨 = reconcile 卡死
+		// (如 cart ConfigMap wedge)—— 这是 healthz.Ping 发现不了的,它只证明进程能应答。
+		// 端口 8080 是 kubebuilder 惯例;本 pod 单容器、非 hostNetwork,不存在占用问题
+		// (早先注释说的"避免端口占用"是 kubebuilder 老默认值撞车的历史问题)。
+		Metrics: metricsserver.Options{BindAddress: ":8080"},
 		// 健康探针端口:kubebuilder 默认 8081。之前没开,导致 Deployment 里连 liveness 都没法配 ——
 		// 一旦 reconcile 卡死(如 cart ConfigMap wedge),进程活着但不干活,k8s 永远不会重启它。
 		HealthProbeBindAddress:  ":8081",

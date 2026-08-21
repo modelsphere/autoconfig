@@ -31,6 +31,9 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
           ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
             - name: health
               containerPort: 8081
               protocol: TCP
