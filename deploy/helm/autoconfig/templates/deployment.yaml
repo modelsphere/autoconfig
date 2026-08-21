@@ -30,6 +30,27 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          # 卡死自愈:之前没有任何探针,reconcile 卡住(如 cart ConfigMap wedge)时进程还活着,
+          # k8s 不会重启、restartCount 永远 0,监控面板一路绿灯。
+          # ⚠️ healthz 是 controller-runtime 的 ping,只证明【进程存活】,发现不了 reconcile 卡死;
+          #    真要抓卡死看 metrics 的 workqueue_depth(metrics server 目前是关的)。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
           resources: {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}

@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -46,8 +47,11 @@ func runController(leaderElect bool) error {
 	}
 	shutdownTimeout := 10 * time.Second
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                  scheme,
-		Metrics:                 metricsserver.Options{BindAddress: "0"}, // 关 metrics server,避免端口占用
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"}, // 关 metrics server,避免端口占用
+		// 健康探针端口:kubebuilder 默认 8081。之前没开,导致 Deployment 里连 liveness 都没法配 ——
+		// 一旦 reconcile 卡死(如 cart ConfigMap wedge),进程活着但不干活,k8s 永远不会重启它。
+		HealthProbeBindAddress:  ":8081",
 		LeaderElection:          leaderElect,
 		LeaderElectionID:        "autoconfig-controller.routing.gpucluster.io",
 		LeaderElectionNamespace: envOr("PS_NAMESPACE", ""), // 空 = in-cluster 自动推断
@@ -67,6 +71,15 @@ func runController(leaderElect bool) error {
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}
+	// controller-runtime 自带的 ping 检查:进程存活即通过。
+	// 注意它【不能】发现 reconcile 卡死 —— 要那个得看 metrics 的 workqueue_depth。
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		return err
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return err
+	}
+
 	log.Print("controller start: ModelRoute (routing.gpucluster.io/v1alpha1)")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
