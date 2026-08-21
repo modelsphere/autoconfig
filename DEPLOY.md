@@ -65,6 +65,57 @@ kubectl get crd modelroutes.routing.gpucluster.io
 kubectl -n llm-route rollout status deploy/autoconfig-controller
 ```
 
+### 2.1 健康探针与指标(0.3.32 起)
+
+容器暴露两个端口,都**只给 k8s / Prometheus 用**,不承载业务:
+
+| 端口 | 路径 | 用途 |
+|---|---|---|
+| 8081 | `/healthz` `/readyz` | liveness / readiness 探针 |
+| 8080 | `/metrics` | controller-runtime 自带指标(Prometheus 抓) |
+
+```bash
+# 校验探针
+kubectl -n llm-route get deploy autoconfig-controller \
+  -o jsonpath='{.spec.template.spec.containers[0].livenessProbe.httpGet}{"\n"}'
+
+# 校验 ServiceMonitor 被 Prometheus 收编(注意 label release=kube-prometheus-stack)
+kubectl -n llm-route get servicemonitor autoconfig-controller -o jsonpath='{.metadata.labels}{"\n"}'
+# 抓到没:Prometheus 里应有 job=autoconfig-controller-metrics 的 target
+```
+
+**⚠️ 两个副本是主备,但 Service 里两个都在**。k8s Service 只按 label 选 pod,**不认 leader**;
+autoconfig 也没有 hagate 侧车(它不接流量,不需要把 standby 摘出 endpoints)。
+所以 metrics Service 做成 **headless(`clusterIP: None`)**,让 Prometheus 按 pod 逐个抓、指标带 `pod` 标签分开。
+**直接 curl Service 会随机落到某个副本,可能是 standby,看到的队列恒空、reconcile 计数近 0,别误判成没干活。**
+
+在 Prometheus 里认 leader 用 `leader_election_master_status`(leader=1 / standby=0,controller-runtime 自带):
+
+```promql
+# 只看 leader 的队列积压
+workqueue_depth{job=~"autoconfig.*"} and on(pod) (leader_election_master_status == 1)
+```
+
+**排查 reconcile 卡死(如 cart ConfigMap wedge)看这条**——健康探针发现不了,它只证明进程能应答 HTTP:
+
+```promql
+# 当前这次 reconcile 已经跑了多久;持续上涨且不归零 = 卡住了
+workqueue_unfinished_work_seconds{job=~"autoconfig.*"} and on(pod) (leader_election_master_status == 1)
+```
+
+其余常用:`workqueue_depth`(排队的 ModelRoute 数,线上 4 个对象 + 10s resync,稳态 0~1)、
+`workqueue_retries_total`(调谐失败重试,DiscoverError / 底稿读空会陡增)、
+`controller_runtime_reconcile_errors_total`、`rest_client_requests_total`(出现 429 = 被 apiserver 限流)、
+`go_goroutines`(泄漏)。
+
+leader 是 k8s Lease,查当前持有者:
+
+```bash
+kubectl -n llm-route get lease autoconfig-controller.routing.gpucluster.io -o jsonpath='{.spec.holderIdentity}{"\n"}'
+```
+
+关掉指标(如不想被抓):`--set metrics.enabled=false` 或 `--set metrics.serviceMonitor.enabled=false`。
+
 ---
 
 ## 3. 测试模型后端(以 qwen 为例)
