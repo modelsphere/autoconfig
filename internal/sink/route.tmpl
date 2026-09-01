@@ -26,6 +26,12 @@ server {
 {{- range $k, $v := .Extra}}
                 {{$k}} = {{luaVal $v}},
 {{- end}}
+{{- /* Raw:已经是 lua 字面量的片段(如 ttft_metrics 的嵌套 table),原样输出不加引号。
+       只由 operator 自己生成(见 sink/slo.go),不接受用户自由文本 —— 走 luaVal 会被
+       整个当成字符串加引号,引擎读到的就不是 table 了。 */}}
+{{- range $k, $v := .Raw}}
+                {{$k}} = {{$v}},
+{{- end}}
             }
         end)
         return ""
