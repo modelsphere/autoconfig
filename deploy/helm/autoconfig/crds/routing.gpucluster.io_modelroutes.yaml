@@ -200,6 +200,12 @@ spec:
                     description: |-
                       Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。nginx 加新调优项无需改代码。
                       常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
+
+                      ⚠️ 这里的值全部走 luaVal:非数字/非布尔会被**加引号当字符串**。所以不能在这里手写
+                      ttft_metrics / tps_metrics 这类**嵌套 table** —— 写了会渲染成字符串,引擎的
+                      util.validate_metrics 直接整份丢弃。那两个键由 spec.slo 从 LLMSLORequirement 生成,
+                      且渲染在本段之后 → **配了 spec.slo 时,这里手写的同名键会被静默覆盖**(实测确认)。
+                      要调 SLO 阈值请改 LLMSLORequirement,不要在这里写。
                     type: object
                 required:
                 - outputConfigMap

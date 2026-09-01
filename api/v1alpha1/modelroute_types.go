@@ -76,6 +76,12 @@ type NginxSpec struct {
 	OutputConfigMap string `json:"outputConfigMap"`
 	// Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。nginx 加新调优项无需改代码。
 	// 常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
+	//
+	// ⚠️ 这里的值全部走 luaVal:非数字/非布尔会被**加引号当字符串**。所以不能在这里手写
+	// ttft_metrics / tps_metrics 这类**嵌套 table** —— 写了会渲染成字符串,引擎的
+	// util.validate_metrics 直接整份丢弃。那两个键由 spec.slo 从 LLMSLORequirement 生成,
+	// 且渲染在本段之后 → **配了 spec.slo 时,这里手写的同名键会被静默覆盖**(实测确认)。
+	// 要调 SLO 阈值请改 LLMSLORequirement,不要在这里写。
 	Values map[string]string `json:"values,omitempty"`
 	// Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
 	// 端口取 Service 的 dispatch 命名端口(8080,路径路由统一入口)。与 selector 二选一(都配则 service 优先)。
@@ -125,6 +131,9 @@ type ModelRouteSpec struct {
 // 与 nginx.values 的关系:**两个来源,不冲突**。values.ttft_limit_ms / tps_limit_tps 继续作为
 // **静态默认值**渲染进 conf;CRD 在 openresty 的优先级链里排在它前面
 // (手工 override > CRD > factory opts > 全局默认)。CRD 没覆盖到的 route 用 values 的值。
+//
+// 唯一的例外是**同名键**:本 spec 生成的 ttft_metrics / tps_metrics 渲染在 nginx.values 之后,
+// 用户若在 values 里手写同名键会被静默覆盖(见 NginxSpec.Values 的说明)。
 type SLOSpec struct {
 	// ServiceID:显式指定要读哪个 LLMSLORequirement 的 serviceId。
 	// 省略则自动推导:取 discovery.service 的名字部分、去掉可选的 "-leader" 后缀

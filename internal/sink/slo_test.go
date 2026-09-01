@@ -146,3 +146,40 @@ func TestWithSLOMetrics_NoMutate(t *testing.T) {
 		t.Errorf("空维度不该产生 key: %v", out)
 	}
 }
+
+// Extra 与 Raw 出现同名键时,**Raw 必须在后** —— lua 表构造式里后写的赢。
+//
+// 这条不是形式主义:2026-09-01 在 k8s-cpu-16 上实测过,用户在 nginx.values 里手写
+// ttft_metrics 时,conf 里会真的出现两行同名键(Extra 那份被 luaVal 加了引号变成字符串)。
+// 顺序对 → CRD 的 table 生效;顺序反了 → 引擎收到字符串 → validate_metrics 整份丢弃 →
+// **静默降级成静态阈值**,而 /_ttft_status 的 source 看不出任何异常。
+//
+// 也就是说这个正确性此前**只由 route.tmpl 里两个 range 块的先后决定,没有任何测试保护**,
+// 有人重排模板就会翻车。这条测试就是那道保护。
+func TestRenderRoute_RawWinsOverExtra(t *testing.T) {
+	out, err := RenderRoute(RouteData{
+		Route: "r",
+		Extra: map[string]string{"ttft_metrics": "BOGUS"}, // 用户手写 → 走 luaVal → 加引号
+		Raw:   map[string]string{"ttft_metrics": `{ { metric = "p95", q = 0.95, threshold = 35000 }, }`},
+		Peers: []config.Peer{{IP: "10.1.0.1", Port: 8050, Name: "n1"}},
+	})
+	if err != nil {
+		t.Fatalf("RenderRoute: %v", err)
+	}
+	quoted := strings.Index(out, `ttft_metrics = "BOGUS"`)
+	table := strings.Index(out, `ttft_metrics = { { metric = "p95"`)
+	if quoted < 0 || table < 0 {
+		t.Fatalf("两份都该出现在 conf 里(quoted=%d table=%d)\n%s", quoted, table, out)
+	}
+	if table < quoted {
+		t.Errorf("Raw 必须排在 Extra 之后,否则 CRD 的 table 会被手写字符串覆盖 → "+
+			"validate_metrics 丢弃 → 静默降级成静态阈值\n%s", out)
+	}
+
+	// 更直接的断言:最后一次出现的 ttft_metrics 必须是**未加引号的 table** ——
+	// 这正是 lua 实际会用的那一份。上面的下标比较若因模板改写而失真,这条仍能兜住。
+	last := strings.LastIndex(out, "ttft_metrics =")
+	if !strings.HasPrefix(out[last:], `ttft_metrics = { `) {
+		t.Errorf("生效的(最后一份)ttft_metrics 不是 table:%.60q", out[last:])
+	}
+}
