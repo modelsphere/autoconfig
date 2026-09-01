@@ -321,6 +321,57 @@ func TestReconcileSLO_NoRequirement(t *testing.T) {
 	}
 }
 
+// CRD **存在**但只写了 ranges(本期不支持)→ 必须与「CRD 不存在」区分开。
+// 共用 NoRequirement + 「没有匹配的 LLMSLORequirement」会把人指去查 serviceId 对不对,
+// 而真正的原因(ranges 不支持)只在 warns 里、以前被整个丢掉了。
+func TestReconcileSLO_OnlyRanges(t *testing.T) {
+	onlyRanges := &slov1.LLMSLORequirement{
+		ObjectMeta: metav1.ObjectMeta{Name: "kimi-k25", Namespace: "kimi"},
+		Spec: slov1.LLMSLORequirementSpec{
+			ServiceID: "kimi-k25",
+			TTFT: &slov1.SLOTarget{Ranges: []slov1.SLORange{
+				{ContextLengthRangeLow: 0, Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: 20}}}}},
+		},
+	}
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050}, onlyRanges)
+
+	if strings.Contains(routeConf(t, cl), "ttft_metrics") {
+		t.Errorf("ranges 不支持,不该渲染 ttft_metrics\n%s", routeConf(t, cl))
+	}
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Reason != "NothingApplicable" {
+		t.Fatalf("应为 NothingApplicable(不是 NoRequirement),得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "ranges") {
+		t.Errorf("message 必须带上 ranges 被忽略这条 warn —— 那就是「为什么没生效」的答案,得到 %q", c.Message)
+	}
+}
+
+// spec.slo 从"有"变成"没有":SLOSynced 必须被摘掉,不能永久残留一个失败态。
+func TestReconcileSLO_RemovedClearsCondition(t *testing.T) {
+	r, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
+		routingv1.Discovery{Selector: "app=kimi", Port: 8050}) // 推不出 serviceId → False
+	if c := condOf(t, cl, nn, "SLOSynced"); c == nil || c.Status != metav1.ConditionFalse {
+		t.Fatalf("前置条件:应先有一个 False 的 SLOSynced,得到 %+v", c)
+	}
+
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	rb.Spec.SLO = nil
+	if err := cl.Update(context.Background(), &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if c := condOf(t, cl, nn, "SLOSynced"); c != nil {
+		t.Errorf("移除 spec.slo 后 SLOSynced 应被摘掉,得到 %+v", c)
+	}
+}
+
 // selector 发现推不出 serviceId —— 这是**永久性**失败,以前只进 operator 日志,
 // 用户会看到一个 Ready=true 却永远没有 SLO 的路由,毫无线索。
 func TestReconcileSLO_SelectorCannotDeriveServiceID(t *testing.T) {

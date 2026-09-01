@@ -40,6 +40,8 @@ const (
 	// 要探 dispatch 口 + /<route> 路径(路径路由),autoconfig 按此名从 openresty Service 取端口号
 	//(端口数字只存在于 chart Service,autoconfig 不硬编码)。per-model 路由 conf 只监听 unix socket、不涉端口。
 	dispatchPortName = "dispatch"
+	// sloCondType:SLO 下发结果的 condition 类型(与 "Ready" 分开 —— SLO 下发不了不影响转发)
+	sloCondType = "SLOSynced"
 )
 
 // ModelRouteReconciler 调谐 ModelRoute。
@@ -210,7 +212,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// (见 syncSLOCondition:为什么不打 Ready=false、以及为什么不能只打日志)。
 	raw := map[string]string(nil)
 	if s := rb.Spec.SLO; s != nil {
-		m, warns, serr := r.sloMetricsFor(ctx, &rb, s)
+		m, warns, found, serr := r.sloMetricsFor(ctx, &rb, s)
 		for _, w := range warns {
 			log.Info("SLO: " + w)
 		}
@@ -219,7 +221,11 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		} else if !m.Empty() {
 			raw = sink.WithSLOMetrics(nil, m)
 		}
-		r.syncSLOCondition(ctx, &rb, m, warns, serr)
+		r.syncSLOCondition(ctx, &rb, m, warns, found, serr)
+	} else {
+		// spec.slo 被移除:摘掉 SLOSynced —— 否则曾经的 False/TranslateError 会永久留在
+		// status 上,describe 一直显示一个吓人的失败态,而这条路由早就不用 SLO 了。
+		r.clearSLOCondition(ctx, &rb)
 	}
 	conf, err := sink.RenderRoute(sink.RouteData{
 		Route: route,
@@ -306,21 +312,26 @@ func sloServiceID(rb *routingv1.ModelRoute) string {
 // 找不到 → 返回空(引擎回落静态阈值)。这一点必须是"空"而不是"保留上次的值":
 // CRD 被删之后如果还留着旧指标,阈值会永久冻结在删除前那一版。
 // 这里天然满足 —— conf 每轮都整份重渲染,没写进去就是没有。
-func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute, s *routingv1.SLOSpec) (sink.SLOMetrics, []string, error) {
+// found 区分两种「没有指标」:CRD 压根不存在 vs CRD 存在但没产出可用的 default metrics
+// (比如只写了 ranges —— 本期不支持)。两者都回落静态阈值,但排查方向完全相反,
+// 混成一个 "NoRequirement" 会把人指向错误的地方(去查 serviceId 对不对,而真正的原因
+// 是"你写的是 ranges")。
+func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute, s *routingv1.SLOSpec) (m sink.SLOMetrics, warns []string, found bool, err error) {
 	sid := sloServiceID(rb)
 	if sid == "" {
-		return sink.SLOMetrics{}, nil, fmt.Errorf("推导不出 serviceId(discovery 用的是 selector?)—— 请显式配 spec.slo.serviceId")
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("推导不出 serviceId(discovery 用的是 selector?)—— 请显式配 spec.slo.serviceId")
 	}
 	var list slov1.LLMSLORequirementList
 	if err := r.List(ctx, &list, client.InNamespace(rb.Namespace)); err != nil {
-		return sink.SLOMetrics{}, nil, fmt.Errorf("list LLMSLORequirement: %w", err)
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("list LLMSLORequirement: %w", err)
 	}
 	for i := range list.Items {
 		if list.Items[i].Spec.ServiceID == sid {
-			return sink.RenderSLOMetrics(list.Items[i].Spec)
+			m, warns, err = sink.RenderSLOMetrics(list.Items[i].Spec)
+			return m, warns, true, err
 		}
 	}
-	return sink.SLOMetrics{}, nil, nil
+	return sink.SLOMetrics{}, nil, false, nil
 }
 
 // syncSLOCondition 把 SLO 下发结果写进 status 的 SLOSynced condition。
@@ -335,22 +346,29 @@ func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.
 //
 // 只在**内容真的变了**时才写 —— 否则每 10s resync 都会打一次 status update。
 func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routingv1.ModelRoute,
-	m sink.SLOMetrics, warns []string, serr error) {
+	m sink.SLOMetrics, warns []string, found bool, serr error) {
 
-	cond := metav1.Condition{Type: "SLOSynced", Status: metav1.ConditionTrue, Reason: "Synced"}
+	cond := metav1.Condition{Type: sloCondType, Status: metav1.ConditionTrue, Reason: "Synced"}
 	switch {
 	case serr != nil:
 		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "TranslateError", serr.Error()
+	case !found:
+		// 同 ns 里压根没有这个 serviceId 的 CRD。不是错误(引擎回落静态),但要能看出来 ——
+		// 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
+		cond.Reason = "NoRequirement"
+		cond.Message = fmt.Sprintf("同 ns 内没有 serviceId=%s 的 LLMSLORequirement,使用静态阈值", sloServiceID(rb))
 	case m.Empty():
-		// 没有匹配的 LLMSLORequirement,或它没声明 ttft/otps。这不是错误(引擎回落静态),
-		// 但要能看出来 —— 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
-		cond.Reason, cond.Message = "NoRequirement",
-			fmt.Sprintf("没有匹配的 LLMSLORequirement(serviceId=%s),使用静态阈值", sloServiceID(rb))
+		// CRD **存在**,但没产出可用指标 —— 最典型的就是只写了 ranges(本期不支持)。
+		// 这一条以前和上面那条共用 "NoRequirement" + 「没有匹配的 LLMSLORequirement」,
+		// 会把人指去查 serviceId 对不对,而真正的原因写在 warns 里。
+		cond.Reason = "NothingApplicable"
+		cond.Message = fmt.Sprintf("serviceId=%s 的 LLMSLORequirement 存在,但没有可用的 default metrics,使用静态阈值", sloServiceID(rb))
 	default:
 		cond.Message = "ttft_metrics/tps_metrics 已下发"
-		if len(warns) > 0 {
-			cond.Message += ";" + strings.Join(warns, ";")
-		}
+	}
+	// warns(如 ranges 被忽略)在**所有**分支都带上 —— 它往往就是"为什么没生效"的答案
+	if len(warns) > 0 {
+		cond.Message += ";" + strings.Join(warns, ";")
 	}
 
 	// 与已有的 condition 比对,一致就不写(避免 resync 每轮一次 status update)
@@ -360,18 +378,44 @@ func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routing
 			return
 		}
 	}
+	r.updateStatus(ctx, rb, "写 SLOSynced condition 失败", func(cur *routingv1.ModelRoute) {
+		cond.LastTransitionTime = metav1.Now()
+		cond.ObservedGeneration = cur.Generation
+		setCondition(&cur.Status.Conditions, cond)
+	})
+}
+
+// clearSLOCondition 在 spec.slo 被移除后摘掉 SLOSynced。
+// 不做的话,之前留下的 False/TranslateError 会永久挂在 status 上,describe 一直显示失败态,
+// 而这条路由早就不用 SLO 了。只在确实存在时才写。
+func (r *ModelRouteReconciler) clearSLOCondition(ctx context.Context, rb *routingv1.ModelRoute) {
+	present := false
+	for _, c := range rb.Status.Conditions {
+		if c.Type == sloCondType {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return
+	}
+	r.updateStatus(ctx, rb, "摘 SLOSynced condition 失败", func(cur *routingv1.ModelRoute) {
+		removeCondition(&cur.Status.Conditions, sloCondType)
+	})
+}
+
+// updateStatus 读-改-写 status 的公共壳(RetryOnConflict 内重新 Get,避免拿陈旧对象覆盖)。
+func (r *ModelRouteReconciler) updateStatus(ctx context.Context, rb *routingv1.ModelRoute, failMsg string, mutate func(*routingv1.ModelRoute)) {
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cur routingv1.ModelRoute
 		if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}, &cur); err != nil {
 			return err
 		}
-		cond.LastTransitionTime = metav1.Now()
-		cond.ObservedGeneration = cur.Generation
-		setCondition(&cur.Status.Conditions, cond)
+		mutate(&cur)
 		return r.Status().Update(ctx, &cur)
 	})
 	if err != nil {
-		logf.FromContext(ctx).Error(err, "写 SLOSynced condition 失败")
+		logf.FromContext(ctx).Error(err, failMsg)
 	}
 }
 
@@ -516,6 +560,16 @@ func (r *ModelRouteReconciler) setStatus(ctx context.Context, nn types.Namespace
 	if err != nil {
 		log.Error(err, "update status failed")
 	}
+}
+
+func removeCondition(conds *[]metav1.Condition, typ string) {
+	out := (*conds)[:0]
+	for _, c := range *conds {
+		if c.Type != typ {
+			out = append(out, c)
+		}
+	}
+	*conds = out
 }
 
 func setCondition(conds *[]metav1.Condition, c metav1.Condition) {
