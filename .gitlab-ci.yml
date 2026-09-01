@@ -6,7 +6,7 @@
 # 镜像多阶段 build(照 llm-openresty/Dockerfile.bodylog):builder = golang:1.23.3-alpine3.20,依赖走国内 goproxy
 # (mirrors.tencent.com/go —— public-buildx runner 实测可达,见 llm-openresty CI #416384),不再 vendor(go.sum+GOSUMDB=off 可复现)。
 #
-# 触发:仅打 git tag。产物 harbor.4pd.io/hardcore-tech/autoconfig:<tag> (+ :latest)。
+# 触发:仅打 git tag。产物 harbor.4pd.io/hardcore-tech/autoconfig:<tag> (+ :latest;预发布 tag 不推 latest)。
 # 生效前提:本文件要在【被打 tag 的 commit】上(先合进 main),再打 tag。
 
 stages: [build]
@@ -16,35 +16,41 @@ variables:
   RELOAD_IMAGE: harbor.4pd.io/hardcore-tech/autoconfig-reload   # reload sidecar(独立小镜像)
   HAGATE_IMAGE: harbor.4pd.io/hardcore-tech/autoconfig-hagate   # master-standby leader 选举门控 sidecar
 
-build:image:
+# 三个镜像 job 的公共部分。PRERELEASE:tag 里带 "-"(SemVer 预发布,如 0.3.34-slo-rc1)时非空,
+# 各 job 据此**跳过 :latest** —— RC 是拿去测试集群验证的,不该变成「没指定版本时默认拿到的那个」。
+# 正式版(0.3.34)行为不变,照旧同时推 :latest。
+.tag-build:
   stage: build
   tags: [public-buildx]            # org 共享构建 runner(在线到 harbor;docker 已 login harbor)
   rules:
     - if: '$CI_COMMIT_TAG'         # 只在打 tag 时构建;其它 push 不触发
+  before_script:
+    - 'case "$CI_COMMIT_TAG" in *-*) PRERELEASE=1 ;; *) PRERELEASE= ;; esac'
+    - 'echo "tag=$CI_COMMIT_TAG prerelease=${PRERELEASE:-0}"'
+
+build:image:
+  extends: .tag-build
   script:
-    - docker build -t "$IMAGE:$CI_COMMIT_TAG" -t "$IMAGE:latest" .
+    - docker build -t "$IMAGE:$CI_COMMIT_TAG" .
     - docker push "$IMAGE:$CI_COMMIT_TAG"
-    - docker push "$IMAGE:latest"
+    # 预发布跳过 :latest(见 .tag-build 的 PRERELEASE)
+    - if [ -z "$PRERELEASE" ]; then docker tag "$IMAGE:$CI_COMMIT_TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"; fi
 
 build:reload:
-  stage: build
-  tags: [public-buildx]
-  rules:
-    - if: '$CI_COMMIT_TAG'
+  extends: .tag-build
   script:
-    - docker build -f Dockerfile.reload -t "$RELOAD_IMAGE:$CI_COMMIT_TAG" -t "$RELOAD_IMAGE:latest" .
+    - docker build -f Dockerfile.reload -t "$RELOAD_IMAGE:$CI_COMMIT_TAG" .
     - docker push "$RELOAD_IMAGE:$CI_COMMIT_TAG"
-    - docker push "$RELOAD_IMAGE:latest"
+    # 预发布跳过 :latest(见 .tag-build 的 PRERELEASE)
+    - if [ -z "$PRERELEASE" ]; then docker tag "$RELOAD_IMAGE:$CI_COMMIT_TAG" "$RELOAD_IMAGE:latest" && docker push "$RELOAD_IMAGE:latest"; fi
 
 build:hagate:
-  stage: build
-  tags: [public-buildx]
-  rules:
-    - if: '$CI_COMMIT_TAG'
+  extends: .tag-build
   script:
-    - docker build -f Dockerfile.hagate -t "$HAGATE_IMAGE:$CI_COMMIT_TAG" -t "$HAGATE_IMAGE:latest" .
+    - docker build -f Dockerfile.hagate -t "$HAGATE_IMAGE:$CI_COMMIT_TAG" .
     - docker push "$HAGATE_IMAGE:$CI_COMMIT_TAG"
-    - docker push "$HAGATE_IMAGE:latest"
+    # 预发布跳过 :latest(见 .tag-build 的 PRERELEASE)
+    - if [ -z "$PRERELEASE" ]; then docker tag "$HAGATE_IMAGE:$CI_COMMIT_TAG" "$HAGATE_IMAGE:latest" && docker push "$HAGATE_IMAGE:latest"; fi
 
 # helm chart 打包 + push,用 public-buildx runner 内置的 push-chart(org 标准,参考 llm-monitor CI 实测)。
 # push-chart 自处理 harbor ChartMuseum 鉴权(helm cm-push 到 runner 内 helm repo 别名 harbor-chart-repo,
