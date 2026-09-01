@@ -113,6 +113,27 @@ type ModelRouteSpec struct {
 	Nginx NginxSpec `json:"nginx"`
 	// Monitor:可选;有 = 把发现的后端也写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)。
 	Monitor *MonitorSpec `json:"monitor,omitempty"`
+	// SLO:可选;有 = 把同 ns 里匹配本路由的 LLMSLORequirement 翻译进 openresty 的 slo.json。
+	// 没有 = 完全不碰 SLO(openresty 回落 nginx.values 里的静态 ttft_limit_ms / tps_limit_tps)。
+	SLO *SLOSpec `json:"slo,omitempty"`
+}
+
+// SLOSpec:把 LLMSLORequirement(inference.x-k8s.io,别人的 CRD)下发给 openresty。
+//
+// 与 nginx.values 的关系:**两个来源,不冲突**。values.ttft_limit_ms / tps_limit_tps 继续作为
+// **静态默认值**渲染进 conf;CRD 在 openresty 的优先级链里排在它前面
+// (手工 override > CRD > factory opts > 全局默认)。CRD 没覆盖到的 route 用 values 的值。
+type SLOSpec struct {
+	// OutputConfigMap:autoconfig 写 slo.json 的 ConfigMap("ns/name",**所有 route 共享一个 key**)。
+	// ⚠️ 这个 ConfigMap 绝不能挂进 openresty 的 /watch —— 那是 reload sidecar 的监视目录,
+	// 挂进去每次 SLO 变更都会触发一次 openresty reload,免 reload 的意义就没了。
+	OutputConfigMap string `json:"outputConfigMap"`
+	// ServiceID:显式指定要读哪个 LLMSLORequirement 的 serviceId。
+	// 省略则自动推导:取 discovery.service 的名字部分、去掉可选的 "-leader" 后缀
+	// (LWS 的 Service 惯例是 <serviceId>-leader)。三个线上模型都符合这个推导,
+	// 留这个字段是给不符合惯例的服务一个不用改名的出口。
+	// +optional
+	ServiceID string `json:"serviceId,omitempty"`
 }
 
 // ModelRouteStatus 是 controller 回写的观测状态。

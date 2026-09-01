@@ -205,6 +205,27 @@ spec:
                 - outputConfigMap
                 - peers
                 type: object
+              slo:
+                description: |-
+                  SLO:可选;有 = 把同 ns 里匹配本路由的 LLMSLORequirement 翻译进 openresty 的 slo.json。
+                  没有 = 完全不碰 SLO(openresty 回落 nginx.values 里的静态 ttft_limit_ms / tps_limit_tps)。
+                properties:
+                  outputConfigMap:
+                    description: |-
+                      OutputConfigMap:autoconfig 写 slo.json 的 ConfigMap("ns/name",**所有 route 共享一个 key**)。
+                      ⚠️ 这个 ConfigMap 绝不能挂进 openresty 的 /watch —— 那是 reload sidecar 的监视目录,
+                      挂进去每次 SLO 变更都会触发一次 openresty reload,免 reload 的意义就没了。
+                    type: string
+                  serviceId:
+                    description: |-
+                      ServiceID:显式指定要读哪个 LLMSLORequirement 的 serviceId。
+                      省略则自动推导:取 discovery.service 的名字部分、去掉可选的 "-leader" 后缀
+                      (LWS 的 Service 惯例是 <serviceId>-leader)。三个线上模型都符合这个推导,
+                      留这个字段是给不符合惯例的服务一个不用改名的出口。
+                    type: string
+                required:
+                - outputConfigMap
+                type: object
             required:
             - discovery
             - nginx

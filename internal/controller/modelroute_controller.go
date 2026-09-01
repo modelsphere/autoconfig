@@ -25,6 +25,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	slov1 "autoconfig/api/inference/v1alpha1"
 	routingv1 "autoconfig/api/v1alpha1"
 	"autoconfig/internal/config"
 	"autoconfig/internal/discovery"
@@ -56,6 +57,7 @@ type ModelRouteReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
+// +kubebuilder:rbac:groups=inference.x-k8s.io,resources=llmslorequirements,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -250,9 +252,124 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// 5) 回写 status
+	// 5) SLO(可选):把匹配本路由的 LLMSLORequirement 翻译进 openresty 的 slo.json。
+	// 失败**不阻塞**这轮 reconcile 的其余部分 —— peers 才是"不下发就断流"的东西,
+	// SLO 下发不了只是回落到 conf 里的静态阈值(与接 CRD 前一致)。写 status 提示 + 下轮重试。
+	if s := rb.Spec.SLO; s != nil {
+		if err := r.syncSLO(ctx, &rb, route, s); err != nil {
+			log.Error(err, "同步 SLO 失败,本轮跳过(openresty 回落静态阈值)", "cm", s.OutputConfigMap)
+			r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "SLOSyncError", err.Error())
+			return ctrl.Result{RequeueAfter: resyncEvery}, nil
+		}
+	}
+
+	// 6) 回写 status
 	r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), true, "Synced", "synced")
 	return ctrl.Result{RequeueAfter: resyncEvery}, nil
+}
+
+// ── SLO(LLMSLORequirement → openresty slo.json)────────────────────────────────
+
+// sloServiceID 推导本路由对应的 serviceId:显式配了用显式的;否则取 discovery.service 的
+// 名字部分并去掉可选的 "-leader" 后缀(LWS 的 Service 惯例是 <serviceId>-leader)。
+//
+// 三个线上模型都符合:
+//
+//	kimi/kimi-k25-leader                → kimi-k25                (LWS,带 -leader)
+//	modelforge-01-glm/modelforge-01-glm → modelforge-01-glm       (无后缀)
+//	modelforge/fallback-modelforge-01   → fallback-modelforge-01  (无后缀)
+//
+// selector 发现路径没有 Service 名可推 → 返回空,调用方跳过(要用就显式配 slo.serviceId)。
+func sloServiceID(rb *routingv1.ModelRoute) string {
+	if id := rb.Spec.SLO.ServiceID; id != "" {
+		return id
+	}
+	if rb.Spec.Discovery.Service == "" {
+		return ""
+	}
+	_, name := splitNSName(rb.Spec.Discovery.Service, rb.Namespace)
+	return strings.TrimSuffix(name, "-leader")
+}
+
+// syncSLO 查同 ns 里 serviceId 匹配的 LLMSLORequirement,翻译后并进共享的 slo.json。
+// 找不到(或它两个维度都没声明)→ 把本 route 从 slo.json 里**摘掉**,让 openresty 回落静态阈值。
+// 这一步必须做:CRD 被删而 json 里还留着旧节点的话,阈值会永久冻结在删除前的值。
+func (r *ModelRouteReconciler) syncSLO(ctx context.Context, rb *routingv1.ModelRoute, route string, s *routingv1.SLOSpec) error {
+	sid := sloServiceID(rb)
+	if sid == "" {
+		return fmt.Errorf("推导不出 serviceId(discovery 用的是 selector?)—— 请显式配 spec.slo.serviceId")
+	}
+	var list slov1.LLMSLORequirementList
+	if err := r.List(ctx, &list, client.InNamespace(rb.Namespace)); err != nil {
+		return fmt.Errorf("list LLMSLORequirement: %w", err)
+	}
+	// node == nil 表示"把本 route 从 slo.json 里摘掉":没有匹配的 CRD 时就是这种情况。
+	var node map[string]sink.SLOModelOut
+	for i := range list.Items {
+		if list.Items[i].Spec.ServiceID != sid {
+			continue
+		}
+		var err error
+		if node, err = sink.RenderSLO(list.Items[i].Spec); err != nil {
+			return fmt.Errorf("翻译 LLMSLORequirement(serviceId=%s): %w", sid, err)
+		}
+		break
+	}
+	return r.writeSLOConfigMap(ctx, s.OutputConfigMap, rb.Namespace, route, node)
+}
+
+// writeSLOConfigMap 把一条 route 的节点并进共享的 slo.json。
+//
+// ⚠️ 读-改-写必须**整个在 RetryOnConflict 里面**:所有 route 共用 `slo.json` 这**一个 key**,
+// 多个 ModelRoute 的 reconcile 会并发写它。若在循环外先算好内容、循环内只重试 Update,
+// 冲突重试会拿着**基于陈旧快照算出的内容**再写一遍 → 把别人刚写进去的 route 节点整个抹掉。
+//
+// 与 writeConfigMap 一样**只更新不创建**:ConfigMap 归 chart 所有(它还负责把这个 CM 挂进
+// openresty 的 volume —— 而且是 /watch 之外的独立 volume)。不存在则报 NotFound,等 chart 建。
+func (r *ModelRouteReconciler) writeSLOConfigMap(ctx context.Context, ref, defaultNS, route string, node map[string]sink.SLOModelOut) error {
+	ns, name := splitNSName(ref, defaultNS)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cm corev1.ConfigMap
+		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm); err != nil {
+			return err
+		}
+		merged, changed, err := sink.MergeSLO(cm.Data[sink.SLOKey], route, node)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return nil // 无变化不写:避免多余的 kubelet 同步与 ConfigMap churn
+		}
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		cm.Data[sink.SLOKey] = merged
+		return r.Update(ctx, &cm)
+	})
+}
+
+// modelRoutesForSLO:LLMSLORequirement 变化 → 找出同 ns 里 serviceId 匹配的 ModelRoute 入队。
+// 没有它,改 CRD 阈值要等 10s resync 才生效(能接受,但事件驱动几乎零成本)。
+func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client.Object) []reconcile.Request {
+	slo, ok := obj.(*slov1.LLMSLORequirement)
+	if !ok || slo.Spec.ServiceID == "" {
+		return nil
+	}
+	var mrs routingv1.ModelRouteList
+	if err := r.List(ctx, &mrs, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range mrs.Items {
+		if mrs.Items[i].Spec.SLO == nil {
+			continue
+		}
+		if sloServiceID(&mrs.Items[i]) == slo.Spec.ServiceID {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: mrs.Items[i].Namespace, Name: mrs.Items[i].Name}})
+		}
+	}
+	return reqs
 }
 
 // openrestyKey 是这条路由在 openresty ConfigMap 里的 key(= 文件名)。
@@ -320,6 +437,13 @@ func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routin
 	}
 	if m := rb.Spec.Monitor; m != nil {
 		if err := r.removeConfigMapKey(ctx, m.OutputConfigMap, monitorKey(rb.Name), rb.Namespace); err != nil {
+			return err
+		}
+	}
+	// SLO:不能用 removeConfigMapKey —— slo.json 这个 key 是**所有 route 共享**的,删掉它
+	// 会把别的 route 的 SLO 一起带走。走 MergeSLO(node=nil) 只摘自己那条 route。
+	if s := rb.Spec.SLO; s != nil {
+		if err := r.writeSLOConfigMap(ctx, s.OutputConfigMap, rb.Namespace, nginxRoute(rb), nil); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
@@ -449,6 +573,8 @@ func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&routingv1.ModelRoute{}).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice), builder.OnlyMetadata).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForPod), builder.OnlyMetadata).
+		// LLMSLORequirement 不能用 OnlyMetadata:映射函数要读 spec.serviceId 才知道该唤醒谁。
+		Watches(&slov1.LLMSLORequirement{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForSLO)).
 		Complete(r)
 }
 
