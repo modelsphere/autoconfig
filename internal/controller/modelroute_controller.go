@@ -206,7 +206,8 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// SLO(可选):把匹配本路由的 LLMSLORequirement 翻译成 ttft_metrics / tps_metrics,
 	// 与其它调优项一起渲染进同一份 conf(改 CRD → 重写 conf → reload sidecar SIGHUP)。
 	// 翻译失败**不阻塞 peers 下发** —— peers 才是"不下发就断流"的东西;SLO 缺席只是让
-	// 引擎回落到 conf 里的静态阈值(与接 CRD 前一致)。记 event + 日志,下轮重试。
+	// 引擎回落到 conf 里的静态阈值(与接 CRD 前一致)。结果写进 SLOSynced condition
+	// (见 syncSLOCondition:为什么不打 Ready=false、以及为什么不能只打日志)。
 	raw := map[string]string(nil)
 	if s := rb.Spec.SLO; s != nil {
 		m, warns, serr := r.sloMetricsFor(ctx, &rb, s)
@@ -218,6 +219,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		} else if !m.Empty() {
 			raw = sink.WithSLOMetrics(nil, m)
 		}
+		r.syncSLOCondition(ctx, &rb, m, warns, serr)
 	}
 	conf, err := sink.RenderRoute(sink.RouteData{
 		Route: route,
@@ -274,7 +276,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{RequeueAfter: resyncEvery}, nil
 }
 
-// ── SLO(LLMSLORequirement → openresty slo.json)────────────────────────────────
+// ── SLO(LLMSLORequirement → session_route_<route>.conf 的 ttft_metrics / tps_metrics)──
 
 // sloServiceID 推导本路由对应的 serviceId:显式配了用显式的;否则取 discovery.service 的
 // 名字部分并去掉可选的 "-leader" 后缀(LWS 的 Service 惯例是 <serviceId>-leader)。
@@ -287,6 +289,9 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 //
 // selector 发现路径没有 Service 名可推 → 返回空,调用方跳过(要用就显式配 slo.serviceId)。
 func sloServiceID(rb *routingv1.ModelRoute) string {
+	if rb.Spec.SLO == nil {
+		return "" // 防御:两个现有调用点都已 guard,但别让第三个调用点踩 nil panic
+	}
 	if id := rb.Spec.SLO.ServiceID; id != "" {
 		return id
 	}
@@ -316,6 +321,58 @@ func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.
 		}
 	}
 	return sink.SLOMetrics{}, nil, nil
+}
+
+// syncSLOCondition 把 SLO 下发结果写进 status 的 SLOSynced condition。
+//
+// 为什么**不**把 Ready 打成 false:SLO 下发不了不影响转发 —— peers 照常下发,引擎回落到
+// conf 里的静态阈值。把 Ready 打成 false 会让「这条路由通不通」这个信号失真。
+//
+// 为什么**不能只打日志**:本文件其余所有失败路径(DiscoverError / NoBackends /
+// ConfigMapMissing)都写 status,理由同一条 —— 让 kubectl describe 看得到。而 SLO 这里最常见
+// 的失败是**永久性**的:selector 发现的路由推不出 serviceId(没有 Service 名可截),
+// 只进 operator 日志的话,用户会看到一个 Ready=true、却永远没有 SLO 的路由,毫无线索。
+//
+// 只在**内容真的变了**时才写 —— 否则每 10s resync 都会打一次 status update。
+func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routingv1.ModelRoute,
+	m sink.SLOMetrics, warns []string, serr error) {
+
+	cond := metav1.Condition{Type: "SLOSynced", Status: metav1.ConditionTrue, Reason: "Synced"}
+	switch {
+	case serr != nil:
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "TranslateError", serr.Error()
+	case m.Empty():
+		// 没有匹配的 LLMSLORequirement,或它没声明 ttft/otps。这不是错误(引擎回落静态),
+		// 但要能看出来 —— 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
+		cond.Reason, cond.Message = "NoRequirement",
+			fmt.Sprintf("没有匹配的 LLMSLORequirement(serviceId=%s),使用静态阈值", sloServiceID(rb))
+	default:
+		cond.Message = "ttft_metrics/tps_metrics 已下发"
+		if len(warns) > 0 {
+			cond.Message += ";" + strings.Join(warns, ";")
+		}
+	}
+
+	// 与已有的 condition 比对,一致就不写(避免 resync 每轮一次 status update)
+	for _, c := range rb.Status.Conditions {
+		if c.Type == cond.Type && c.Status == cond.Status &&
+			c.Reason == cond.Reason && c.Message == cond.Message {
+			return
+		}
+	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur routingv1.ModelRoute
+		if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}, &cur); err != nil {
+			return err
+		}
+		cond.LastTransitionTime = metav1.Now()
+		cond.ObservedGeneration = cur.Generation
+		setCondition(&cur.Status.Conditions, cond)
+		return r.Status().Update(ctx, &cur)
+	})
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "写 SLOSynced condition 失败")
+	}
 }
 
 // modelRoutesForSLO:LLMSLORequirement 变化 → 找出同 ns 里 serviceId 匹配的 ModelRoute 入队。

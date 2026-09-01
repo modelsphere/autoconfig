@@ -15,6 +15,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	slov1 "autoconfig/api/inference/v1alpha1"
 	routingv1 "autoconfig/api/v1alpha1"
 )
 
@@ -194,5 +197,186 @@ func TestReferencesPodBySelector(t *testing.T) {
 		if got := referencesPodBySelector(c.mr, c.podNS, c.labels); got != c.want {
 			t.Errorf("%s: got %v want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// ── SLO(LLMSLORequirement → ttft_metrics / tps_metrics + SLOSynced condition)──
+
+func sloReq(ns, name, serviceID string, ttftSec, otpsTPS float64) *slov1.LLMSLORequirement {
+	return &slov1.LLMSLORequirement{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: slov1.LLMSLORequirementSpec{
+			ServiceID: serviceID,
+			TTFT:      &slov1.SLOTarget{Default: &slov1.SLODefault{Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: ttftSec}}}},
+			OTPS:      &slov1.SLOTarget{Default: &slov1.SLODefault{Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: otpsTPS}}}},
+		},
+	}
+}
+
+// sloFixture 搭一条最小可 reconcile 的 ModelRoute(service 发现 + 直连后端,无 cart/monitor)。
+func sloFixture(t *testing.T, slo *routingv1.SLOSpec, discovery routingv1.Discovery,
+	objs ...client.Object) (*ModelRouteReconciler, types.NamespacedName, client.Client) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+	_ = slov1.AddToScheme(scheme)
+
+	rb := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "kimi-k2.5", Namespace: "kimi"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: discovery,
+			Nginx: routingv1.NginxSpec{
+				Route: "kimi-k2.5", OutputConfigMap: "llm-route/openresty-conf",
+				Values: map[string]string{"ttft_limit_ms": "30000"},
+				Peers:  []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+			},
+			SLO: slo,
+		},
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(append([]client.Object{rb, cm}, objs...)...).
+		WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	// selector 路径要有 pod 才发现得到后端 —— 否则 reconcile 在 len(backends)==0 就 return,
+	// 根本走不到 SLO 那一步(第一版测试就是这么假绿的)。
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "kimi-0", Namespace: "kimi", Labels: map[string]string{"app": "kimi"}},
+		Status: corev1.PodStatus{PodIP: "10.1.0.1", Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	}
+	cs := k8sfake.NewSimpleClientset(
+		epslice("kimi-k25-leader-1", "kimi-k25-leader", "kimi", "10.1.0.1"), pod)
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nn := types.NamespacedName{Namespace: "kimi", Name: "kimi-k2.5"}
+	for i := 0; i < 2; i++ { // 第一次加 finalizer 并 requeue,第二次真正干活
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+			t.Fatalf("reconcile %d: %v", i+1, err)
+		}
+	}
+	return r, nn, cl
+}
+
+func routeConf(t *testing.T, cl client.Client) string {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("get openresty-conf: %v", err)
+	}
+	return cm.Data["session_route_kimi-k2.5.conf"]
+}
+
+func condOf(t *testing.T, cl client.Client, nn types.NamespacedName, typ string) *metav1.Condition {
+	t.Helper()
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("get mr: %v", err)
+	}
+	for i := range rb.Status.Conditions {
+		if rb.Status.Conditions[i].Type == typ {
+			return &rb.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// 线上 kimi 的形状:discovery.service = kimi/kimi-k25-leader → serviceId kimi-k25。
+func TestReconcileSLO_Rendered(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("kimi", "kimi-k25", "kimi-k25", 20, 15))
+
+	conf := routeConf(t, cl)
+	for _, want := range []string{
+		`ttft_metrics = { { metric = "p80", q = 0.8, threshold = 20000 }, },`, // 秒 → 毫秒
+		`tps_metrics = { { metric = "p80", q = 0.2, threshold = 15 }, },`,     // 覆盖率 0.8 → 低尾 q=0.2
+		"ttft_limit_ms = 30000,", // 静态默认不被挤掉
+	} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("conf 缺少 %s\n%s", want, conf)
+		}
+	}
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Synced" {
+		t.Errorf("SLOSynced 应为 True/Synced,得到 %+v", c)
+	}
+}
+
+// 没有匹配的 CRD:不是错误(引擎回落静态),但要能从 status 看出来 ——
+// 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
+func TestReconcileSLO_NoRequirement(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+
+	if strings.Contains(routeConf(t, cl), "ttft_metrics") {
+		t.Errorf("没有 CRD 时不该渲染 ttft_metrics\n%s", routeConf(t, cl))
+	}
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "NoRequirement" {
+		t.Errorf("应为 True/NoRequirement,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "kimi-k25") {
+		t.Errorf("message 应带上推导出的 serviceId 便于排查,得到 %q", c.Message)
+	}
+}
+
+// selector 发现推不出 serviceId —— 这是**永久性**失败,以前只进 operator 日志,
+// 用户会看到一个 Ready=true 却永远没有 SLO 的路由,毫无线索。
+func TestReconcileSLO_SelectorCannotDeriveServiceID(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
+		routingv1.Discovery{Selector: "app=kimi", Port: 8050})
+
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "TranslateError" {
+		t.Fatalf("应为 False/TranslateError,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "slo.serviceId") {
+		t.Errorf("message 应指出补救办法,得到 %q", c.Message)
+	}
+	// SLO 失败**不该**把 Ready 打成 false —— peers 照常下发,转发是好的
+	if ready := condOf(t, cl, nn, "Ready"); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Errorf("Ready 不该被 SLO 失败带下去,得到 %+v", ready)
+	}
+}
+
+// spec.slo == nil:完全不碰 SLO,连 condition 都不该出现。
+func TestReconcileSLO_Disabled(t *testing.T) {
+	_, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("kimi", "kimi-k25", "kimi-k25", 20, 15))
+
+	if strings.Contains(routeConf(t, cl), "metrics") {
+		t.Errorf("没配 spec.slo 时不该渲染任何 metrics\n%s", routeConf(t, cl))
+	}
+	if c := condOf(t, cl, nn, "SLOSynced"); c != nil {
+		t.Errorf("没配 spec.slo 不该产生 SLOSynced condition,得到 %+v", c)
+	}
+}
+
+func TestSLOServiceID(t *testing.T) {
+	mk := func(slo *routingv1.SLOSpec, svc string) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kimi"},
+			Spec:       routingv1.ModelRouteSpec{Discovery: routingv1.Discovery{Service: svc}, SLO: slo},
+		}
+	}
+	cases := []struct{ svc, want string }{
+		{"kimi/kimi-k25-leader", "kimi-k25"},                         // LWS,带 -leader
+		{"modelforge-01-glm/modelforge-01-glm", "modelforge-01-glm"}, // 无后缀
+		{"modelforge/fallback-modelforge-01", "fallback-modelforge-01"},
+		{"", ""}, // selector 路径,推不出
+	}
+	for _, c := range cases {
+		if got := sloServiceID(mk(&routingv1.SLOSpec{}, c.svc)); got != c.want {
+			t.Errorf("sloServiceID(%q) = %q; want %q", c.svc, got, c.want)
+		}
+	}
+	// 显式 serviceId 压过推导
+	if got := sloServiceID(mk(&routingv1.SLOSpec{ServiceID: "x"}, "kimi/kimi-k25-leader")); got != "x" {
+		t.Errorf("显式 serviceId 应优先,得到 %q", got)
+	}
+	// spec.slo == nil 不该 panic
+	if got := sloServiceID(mk(nil, "kimi/kimi-k25-leader")); got != "" {
+		t.Errorf("spec.slo=nil 应返回空,得到 %q", got)
 	}
 }
