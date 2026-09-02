@@ -258,10 +258,11 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.clearSLOCondition(ctx, &rb)
 		}
 		conf, err := sink.RenderRoute(sink.RouteData{
-			Route: route,
-			Extra: extra, // 任意调优项,原样渲染
-			Raw:   raw,   // 已是 lua 字面量的片段(SLO 指标表)
-			Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
+			Route:     route,
+			ModelType: rb.Spec.ModelType, // 空/llm = lua 路由引擎;video = 纯反向代理
+			Extra:     extra,             // 任意调优项,原样渲染
+			Raw:       raw,               // 已是 lua 字面量的片段(SLO 指标表)
+			Peers:     sink.ResolveSources(peersByTarget, sources, "backend"),
 		})
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("render route: %w", err)

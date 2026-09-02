@@ -1,2 +1,3 @@
 resources:
 - modelroute-glm.yaml
+- modelroute-minimax-h3.yaml
