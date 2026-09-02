@@ -284,28 +284,16 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // ── SLO(LLMSLORequirement → session_route_<route>.conf 的 ttft_metrics / tps_metrics)──
 
-// sloServiceID 推导本路由对应的 serviceId:显式配了用显式的;否则取 discovery.service 的
-// 名字部分并去掉可选的 "-leader" 后缀(LWS 的 Service 惯例是 <serviceId>-leader)。
+// sloServiceID 读本路由声明的 serviceId。**只读显式字段,不做推导。**
 //
-// 三个线上模型都符合:
-//
-//	kimi/kimi-k25-leader                → kimi-k25                (LWS,带 -leader)
-//	modelforge-01-glm/modelforge-01-glm → modelforge-01-glm       (无后缀)
-//	modelforge/fallback-modelforge-01   → fallback-modelforge-01  (无后缀)
-//
-// selector 发现路径没有 Service 名可推 → 返回空,调用方跳过(要用就显式配 slo.serviceId)。
+// 早先这里会在字段为空时从 discovery.service 截掉 "-leader" 后缀推一个出来。已删:
+// 那是拿命名规则猜「这条路由该读谁的 SLO」,猜错不报错 —— 要么静默回落静态阈值,
+// 要么套用别的服务的 SLO。关联关系写在 spec.slo.serviceId 里,是唯一真相。
 func sloServiceID(rb *routingv1.ModelRoute) string {
 	if rb.Spec.SLO == nil {
 		return "" // 防御:两个现有调用点都已 guard,但别让第三个调用点踩 nil panic
 	}
-	if id := rb.Spec.SLO.ServiceID; id != "" {
-		return id
-	}
-	if rb.Spec.Discovery.Service == "" {
-		return ""
-	}
-	_, name := splitNSName(rb.Spec.Discovery.Service, rb.Namespace)
-	return strings.TrimSuffix(name, "-leader")
+	return rb.Spec.SLO.ServiceID
 }
 
 // sloMetricsFor 查同 ns 里 serviceId 匹配的 LLMSLORequirement,翻译成 lua 指标表。
@@ -319,19 +307,32 @@ func sloServiceID(rb *routingv1.ModelRoute) string {
 func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute, s *routingv1.SLOSpec) (m sink.SLOMetrics, warns []string, found bool, err error) {
 	sid := sloServiceID(rb)
 	if sid == "" {
-		return sink.SLOMetrics{}, nil, false, fmt.Errorf("推导不出 serviceId(discovery 用的是 selector?)—— 请显式配 spec.slo.serviceId")
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.serviceId 为空 —— 必须显式声明要读哪个 LLMSLORequirement(不再从 Service 名推导)")
 	}
 	var list slov1.LLMSLORequirementList
 	if err := r.List(ctx, &list, client.InNamespace(rb.Namespace)); err != nil {
 		return sink.SLOMetrics{}, nil, false, fmt.Errorf("list LLMSLORequirement: %w", err)
 	}
+	// 按 spec.serviceId 精确匹配(不是按对象名 —— 两者可以不同)。
+	// 同 ns 内 serviceId 重复时**报错而非取第一个**:List 的顺序没有保证,取第一个会让
+	// 生效的是哪份 SLO 随 informer 缓存顺序漂移,阈值时而 A 时而 B、还查不出原因。
+	var hit *slov1.LLMSLORequirement
 	for i := range list.Items {
-		if list.Items[i].Spec.ServiceID == sid {
-			m, warns, err = sink.RenderSLOMetrics(list.Items[i].Spec)
-			return m, warns, true, err
+		if list.Items[i].Spec.ServiceID != sid {
+			continue
 		}
+		if hit != nil {
+			return sink.SLOMetrics{}, nil, false, fmt.Errorf(
+				"同 ns 内有多个 serviceId=%s 的 LLMSLORequirement(%s、%s ...)—— 无法确定用哪份,请删掉重复的",
+				sid, hit.Name, list.Items[i].Name)
+		}
+		hit = &list.Items[i]
 	}
-	return sink.SLOMetrics{}, nil, false, nil
+	if hit == nil {
+		return sink.SLOMetrics{}, nil, false, nil
+	}
+	m, warns, err = sink.RenderSLOMetrics(hit.Spec)
+	return m, warns, true, err
 }
 
 // syncSLOCondition 把 SLO 下发结果写进 status 的 SLOSynced condition。

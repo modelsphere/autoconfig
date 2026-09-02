@@ -135,12 +135,15 @@ type ModelRouteSpec struct {
 // 唯一的例外是**同名键**:本 spec 生成的 ttft_metrics / tps_metrics 渲染在 nginx.values 之后,
 // 用户若在 values 里手写同名键会被静默覆盖(见 NginxSpec.Values 的说明)。
 type SLOSpec struct {
-	// ServiceID:显式指定要读哪个 LLMSLORequirement 的 serviceId。
-	// 省略则自动推导:取 discovery.service 的名字部分、去掉可选的 "-leader" 后缀
-	// (LWS 的 Service 惯例是 <serviceId>-leader)。三个线上模型都符合这个推导,
-	// 留这个字段是给不符合惯例的服务一个不用改名的出口。
-	// +optional
-	ServiceID string `json:"serviceId,omitempty"`
+	// ServiceID:要读哪个 LLMSLORequirement 的 spec.serviceId。**必填,不做任何推导。**
+	//
+	// 曾经的实现是从 discovery.service 截掉 "-leader" 后缀推出来的(LWS 惯例
+	// <serviceId>-leader)。已删,因为那是**按命名规则猜关联**:线上 3 条里只有 kimi
+	// 真的依赖它,另外两条是名字碰巧相同 —— 也就是说这条规则几乎没被验证过,却决定了
+	// 一条路由读谁的 SLO。Service 改名/换成非 LWS 部署时,它不会报错,而是静默换成
+	// "匹配不上"(阈值悄悄回落静态)或更糟的"匹配到别的 serviceId"(套用别人的 SLO)。
+	// 关联关系必须写出来,不能从字符串里猜。
+	ServiceID string `json:"serviceId"`
 }
 
 // ModelRouteStatus 是 controller 回写的观测状态。

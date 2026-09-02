@@ -36,17 +36,14 @@ spec:
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
     - { use: backend-svc, priority: 1 }                                   # 兜底:qwen-svc VIP
   slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
-    {}                                #   空对象即可 —— serviceId 默认从 discovery.service 推导
-    #                                 #   (取名字部分并去掉可选的 "-leader" 后缀,LWS 的 Service 惯例)
-    # serviceId: qwen-svc             #   ⚠️ 推导依赖命名惯例。不符合惯例、或推错时显式指定。
-    #                                 #   推导结果会出现在 status 的 SLOSynced condition message 里;
-    #                                 #   推错的表现是 reason=NoRequirement 且能看到用的是哪个 id。
+    serviceId: qwen-svc           #   **必填**:要读同 ns 里哪个 LLMSLORequirement 的 spec.serviceId。
+    #                                 #   不做任何推导 —— 关联关系必须写出来,不能从 Service 名猜
+    #                                 #   (猜错不报错:要么静默回落静态阈值,要么套用别人的 SLO)。
+    #                                 #   匹配的是 CRD 的 spec.serviceId,不是 CRD 的对象名。
+    #                                 #   没匹配上 → status 的 SLOSynced condition reason=NoRequirement。
     #
-    # 配了 slo 之后,同 ns 里 spec.serviceId 匹配的 LLMSLORequirement 会被翻译成
+    # 配了 slo 之后,匹配到的 LLMSLORequirement 会被翻译成
     # ttft_metrics / tps_metrics 渲染进本路由的 conf,**优先级高于上面 values 里的静态阈值**。
-    # 没有匹配的 CRD → 回落静态,condition 报 True/NoRequirement(不是错误)。
-    # ⚠️ 不要在 values 里手写 ttft_metrics / tps_metrics:那里的值会被 luaVal 加引号变成字符串,
-    #    引擎的 validate_metrics 会整份丢弃;而且本段生成的同名键渲染在后面,会覆盖它。
   monitor:                            # monitor 的 service/nginx/router 行(不配则无 qwen 监控)
     model: qwen                       # served-model-name(monitor 展示用)
     gpuType: A100
