@@ -135,15 +135,19 @@ type ModelRouteSpec struct {
 // 唯一的例外是**同名键**:本 spec 生成的 ttft_metrics / tps_metrics 渲染在 nginx.values 之后,
 // 用户若在 values 里手写同名键会被静默覆盖(见 NginxSpec.Values 的说明)。
 type SLOSpec struct {
-	// ServiceID:要读哪个 LLMSLORequirement 的 spec.serviceId。**必填,不做任何推导。**
+	// Name:要读同 ns 里哪个 LLMSLORequirement,按 **metadata.name** 取。必填,不做任何推导。
 	//
-	// 曾经的实现是从 discovery.service 截掉 "-leader" 后缀推出来的(LWS 惯例
-	// <serviceId>-leader)。已删,因为那是**按命名规则猜关联**:线上 3 条里只有 kimi
-	// 真的依赖它,另外两条是名字碰巧相同 —— 也就是说这条规则几乎没被验证过,却决定了
-	// 一条路由读谁的 SLO。Service 改名/换成非 LWS 部署时,它不会报错,而是静默换成
-	// "匹配不上"(阈值悄悄回落静态)或更糟的"匹配到别的 serviceId"(套用别人的 SLO)。
-	// 关联关系必须写出来,不能从字符串里猜。
-	ServiceID string `json:"serviceId"`
+	// 用 name 而不是 spec.serviceId,有两个原因:
+	//
+	//  1. **唯一性由 k8s 保证**。serviceId 只是个自由字符串,同 ns 里两个对象写同一个
+	//     serviceId 完全能 apply,那时"用哪份"就由 List 的顺序(informer 缓存,无序保证)
+	//     决定,阈值会在两份之间漂,而两份 CRD 看上去都正常。按 name 是直接 Get,不存在这问题。
+	//  2. **不含糊**。一个服务在不同地方叫 glm 和 glm-leader,serviceId 写哪个要靠猜;
+	//     name 是这个对象唯一的、写在 yaml 上的身份。
+	//
+	// 早先还有一版是从 discovery.service 截掉 "-leader" 后缀推 serviceId(LWS 惯例)。
+	// 一并删了:那是按命名规则猜关联,猜错不报错——要么静默回落静态阈值,要么套用别人的 SLO。
+	Name string `json:"name"`
 }
 
 // ModelRouteStatus 是 controller 回写的观测状态。

@@ -281,11 +281,15 @@ func condOf(t *testing.T, cl client.Client, nn types.NamespacedName, typ string)
 	return nil
 }
 
-// 线上 kimi 的形状:discovery.service = kimi/kimi-k25-leader → serviceId kimi-k25。
+// 线上 kimi 的形状:ModelRoute 引用同 ns 的 LLMSLORequirement "kimi-k25"。
+//
+// CRD 的 spec.serviceId 这里**故意写成别的值**:匹配只看 metadata.name,
+// serviceId 是给 autoscaler 用的、与路由层无关。写成同值的话,这个用例在
+// 「改回按 serviceId 匹配」时照样会绿,就测不住这件事了。
 func TestReconcileSLO_Rendered(t *testing.T) {
-	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{ServiceID: "kimi-k25"},
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
 		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
-		sloReq("kimi", "kimi-k25", "kimi-k25", 20, 15))
+		sloReq("kimi", "kimi-k25", "some-other-service-id", 20, 15))
 
 	conf := routeConf(t, cl)
 	for _, want := range []string{
@@ -306,7 +310,7 @@ func TestReconcileSLO_Rendered(t *testing.T) {
 // 没有匹配的 CRD:不是错误(引擎回落静态),但要能从 status 看出来 ——
 // 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
 func TestReconcileSLO_NoRequirement(t *testing.T) {
-	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{ServiceID: "kimi-k25"},
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
 		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
 
 	if strings.Contains(routeConf(t, cl), "ttft_metrics") {
@@ -333,7 +337,7 @@ func TestReconcileSLO_OnlyRanges(t *testing.T) {
 				{ContextLengthRangeLow: 0, Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: 20}}}}},
 		},
 	}
-	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{ServiceID: "kimi-k25"},
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
 		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050}, onlyRanges)
 
 	if strings.Contains(routeConf(t, cl), "ttft_metrics") {
@@ -372,10 +376,10 @@ func TestReconcileSLO_RemovedClearsCondition(t *testing.T) {
 	}
 }
 
-// 配了 spec.slo 却没写 serviceId —— **永久性**失败(不会自愈、也不会随重试变好)。
+// 配了 spec.slo 却没写 name —— **永久性**失败(不会自愈、也不会随重试变好)。
 // 以前只进 operator 日志,用户会看到一个 Ready=true 却永远没有 SLO 的路由,毫无线索。
 // 用 selector 发现构造,因为这条路由连 Service 名都没有,是最没法"猜"的形状。
-func TestReconcileSLO_MissingServiceID(t *testing.T) {
+func TestReconcileSLO_MissingName(t *testing.T) {
 	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
 		routingv1.Discovery{Selector: "app=kimi", Port: 8050})
 
@@ -383,7 +387,7 @@ func TestReconcileSLO_MissingServiceID(t *testing.T) {
 	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "TranslateError" {
 		t.Fatalf("应为 False/TranslateError,得到 %+v", c)
 	}
-	if !strings.Contains(c.Message, "slo.serviceId") {
+	if !strings.Contains(c.Message, "slo.name") {
 		t.Errorf("message 应指出补救办法,得到 %q", c.Message)
 	}
 	// SLO 失败**不该**把 Ready 打成 false —— peers 照常下发,转发是好的
@@ -405,45 +409,23 @@ func TestReconcileSLO_Disabled(t *testing.T) {
 	}
 }
 
-// 同 ns 内两个 LLMSLORequirement 用了同一个 serviceId:必须报错。
-// 静默取 List 的第一个会让"生效的是哪份 SLO"随 informer 缓存顺序漂移 ——
-// 阈值时而 A 时而 B,而两份 CRD 看上去都好好的,几乎无法排查。
-func TestReconcileSLO_DuplicateServiceID(t *testing.T) {
-	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{ServiceID: "kimi-k25"},
-		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
-		sloReq("kimi", "slo-a", "kimi-k25", 20, 15),
-		sloReq("kimi", "slo-b", "kimi-k25", 99, 99))
-
-	c := condOf(t, cl, nn, "SLOSynced")
-	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "TranslateError" {
-		t.Fatalf("应为 False/TranslateError,得到 %+v", c)
-	}
-	if !strings.Contains(c.Message, "多个") {
-		t.Errorf("message 应说明是重复,得到 %q", c.Message)
-	}
-	// 拿不准用哪份就**一份都不下发**,回落静态 —— 不能赌一个
-	if conf := routeConf(t, cl); strings.Contains(conf, "ttft_metrics") {
-		t.Errorf("重复时不该下发任何 metrics\n%s", conf)
-	}
-}
-
-func TestSLOServiceID(t *testing.T) {
+func TestSLOName(t *testing.T) {
 	mk := func(slo *routingv1.SLOSpec, svc string) *routingv1.ModelRoute {
 		return &routingv1.ModelRoute{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "kimi"},
 			Spec:       routingv1.ModelRouteSpec{Discovery: routingv1.Discovery{Service: svc}, SLO: slo},
 		}
 	}
-	// 只读显式字段。**这个用例的重点是"不推导"**:曾经这里会把 kimi/kimi-k25-leader
+	// 只读显式字段。**这个用例的重点是"不推导"**:早先这里会把 kimi/kimi-k25-leader
 	// 截成 kimi-k25,现在给了 Service 名也必须原样为空 —— 否则就是推导又被加回来了。
-	if got := sloServiceID(mk(&routingv1.SLOSpec{}, "kimi/kimi-k25-leader")); got != "" {
-		t.Errorf("serviceId 空时不该从 Service 名推导,得到 %q", got)
+	if got := sloName(mk(&routingv1.SLOSpec{}, "kimi/kimi-k25-leader")); got != "" {
+		t.Errorf("name 空时不该从 Service 名推导,得到 %q", got)
 	}
-	if got := sloServiceID(mk(&routingv1.SLOSpec{ServiceID: "x"}, "kimi/kimi-k25-leader")); got != "x" {
-		t.Errorf("应原样返回显式 serviceId,得到 %q", got)
+	if got := sloName(mk(&routingv1.SLOSpec{Name: "x"}, "kimi/kimi-k25-leader")); got != "x" {
+		t.Errorf("应原样返回显式 name,得到 %q", got)
 	}
 	// spec.slo == nil 不该 panic
-	if got := sloServiceID(mk(nil, "kimi/kimi-k25-leader")); got != "" {
+	if got := sloName(mk(nil, "kimi/kimi-k25-leader")); got != "" {
 		t.Errorf("slo==nil 应返回空,得到 %q", got)
 	}
 }

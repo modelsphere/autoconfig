@@ -284,16 +284,12 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // ── SLO(LLMSLORequirement → session_route_<route>.conf 的 ttft_metrics / tps_metrics)──
 
-// sloServiceID 读本路由声明的 serviceId。**只读显式字段,不做推导。**
-//
-// 早先这里会在字段为空时从 discovery.service 截掉 "-leader" 后缀推一个出来。已删:
-// 那是拿命名规则猜「这条路由该读谁的 SLO」,猜错不报错 —— 要么静默回落静态阈值,
-// 要么套用别的服务的 SLO。关联关系写在 spec.slo.serviceId 里,是唯一真相。
-func sloServiceID(rb *routingv1.ModelRoute) string {
+// sloName 读本路由声明的 LLMSLORequirement 名字。**只读显式字段,不做推导。**
+func sloName(rb *routingv1.ModelRoute) string {
 	if rb.Spec.SLO == nil {
 		return "" // 防御:两个现有调用点都已 guard,但别让第三个调用点踩 nil panic
 	}
-	return rb.Spec.SLO.ServiceID
+	return rb.Spec.SLO.Name
 }
 
 // sloMetricsFor 查同 ns 里 serviceId 匹配的 LLMSLORequirement,翻译成 lua 指标表。
@@ -305,33 +301,19 @@ func sloServiceID(rb *routingv1.ModelRoute) string {
 // 混成一个 "NoRequirement" 会把人指向错误的地方(去查 serviceId 对不对,而真正的原因
 // 是"你写的是 ranges")。
 func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute, s *routingv1.SLOSpec) (m sink.SLOMetrics, warns []string, found bool, err error) {
-	sid := sloServiceID(rb)
-	if sid == "" {
-		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.serviceId 为空 —— 必须显式声明要读哪个 LLMSLORequirement(不再从 Service 名推导)")
+	name := sloName(rb)
+	if name == "" {
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.name 为空 —— 必须显式声明要读同 ns 里哪个 LLMSLORequirement")
 	}
-	var list slov1.LLMSLORequirementList
-	if err := r.List(ctx, &list, client.InNamespace(rb.Namespace)); err != nil {
-		return sink.SLOMetrics{}, nil, false, fmt.Errorf("list LLMSLORequirement: %w", err)
-	}
-	// 按 spec.serviceId 精确匹配(不是按对象名 —— 两者可以不同)。
-	// 同 ns 内 serviceId 重复时**报错而非取第一个**:List 的顺序没有保证,取第一个会让
-	// 生效的是哪份 SLO 随 informer 缓存顺序漂移,阈值时而 A 时而 B、还查不出原因。
-	var hit *slov1.LLMSLORequirement
-	for i := range list.Items {
-		if list.Items[i].Spec.ServiceID != sid {
-			continue
+	// 按 name 直接 Get:唯一性由 k8s 保证,不会出现"同 ns 多份匹配、用哪份看 List 顺序"。
+	var req slov1.LLMSLORequirement
+	if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: name}, &req); err != nil {
+		if apierrors.IsNotFound(err) {
+			return sink.SLOMetrics{}, nil, false, nil // 不存在 → 回落静态,由 condition 说明
 		}
-		if hit != nil {
-			return sink.SLOMetrics{}, nil, false, fmt.Errorf(
-				"同 ns 内有多个 serviceId=%s 的 LLMSLORequirement(%s、%s ...)—— 无法确定用哪份,请删掉重复的",
-				sid, hit.Name, list.Items[i].Name)
-		}
-		hit = &list.Items[i]
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("get LLMSLORequirement %s: %w", name, err)
 	}
-	if hit == nil {
-		return sink.SLOMetrics{}, nil, false, nil
-	}
-	m, warns, err = sink.RenderSLOMetrics(hit.Spec)
+	m, warns, err = sink.RenderSLOMetrics(req.Spec)
 	return m, warns, true, err
 }
 
@@ -354,16 +336,16 @@ func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routing
 	case serr != nil:
 		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "TranslateError", serr.Error()
 	case !found:
-		// 同 ns 里压根没有这个 serviceId 的 CRD。不是错误(引擎回落静态),但要能看出来 ——
-		// 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
+		// 同 ns 里压根没有这个名字的 CRD。不是错误(引擎回落静态),但要能看出来 ——
+		// 否则「配了 slo 却没生效」和「CRD 本来就没建」分不开。
 		cond.Reason = "NoRequirement"
-		cond.Message = fmt.Sprintf("同 ns 内没有 serviceId=%s 的 LLMSLORequirement,使用静态阈值", sloServiceID(rb))
+		cond.Message = fmt.Sprintf("同 ns 内没有名为 %s 的 LLMSLORequirement,使用静态阈值", sloName(rb))
 	case m.Empty():
 		// CRD **存在**,但没产出可用指标 —— 最典型的就是只写了 ranges(本期不支持)。
 		// 这一条以前和上面那条共用 "NoRequirement" + 「没有匹配的 LLMSLORequirement」,
-		// 会把人指去查 serviceId 对不对,而真正的原因写在 warns 里。
+		// 会把人指去查名字对不对,而真正的原因写在 warns 里。
 		cond.Reason = "NothingApplicable"
-		cond.Message = fmt.Sprintf("serviceId=%s 的 LLMSLORequirement 存在,但没有可用的 default metrics,使用静态阈值", sloServiceID(rb))
+		cond.Message = fmt.Sprintf("LLMSLORequirement %s 存在,但没有可用的 default metrics,使用静态阈值", sloName(rb))
 	default:
 		cond.Message = "ttft_metrics/tps_metrics 已下发"
 	}
@@ -420,11 +402,11 @@ func (r *ModelRouteReconciler) updateStatus(ctx context.Context, rb *routingv1.M
 	}
 }
 
-// modelRoutesForSLO:LLMSLORequirement 变化 → 找出同 ns 里 serviceId 匹配的 ModelRoute 入队。
+// modelRoutesForSLO:LLMSLORequirement 变化 → 找出同 ns 里引用了它的 ModelRoute 入队。
 // 没有它,改 CRD 阈值要等 10s resync 才生效(能接受,但事件驱动几乎零成本)。
 func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client.Object) []reconcile.Request {
 	slo, ok := obj.(*slov1.LLMSLORequirement)
-	if !ok || slo.Spec.ServiceID == "" {
+	if !ok {
 		return nil
 	}
 	var mrs routingv1.ModelRouteList
@@ -436,7 +418,7 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 		if mrs.Items[i].Spec.SLO == nil {
 			continue
 		}
-		if sloServiceID(&mrs.Items[i]) == slo.Spec.ServiceID {
+		if sloName(&mrs.Items[i]) == slo.GetName() {
 			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
 				Namespace: mrs.Items[i].Namespace, Name: mrs.Items[i].Name}})
 		}

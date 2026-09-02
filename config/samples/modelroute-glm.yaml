@@ -30,11 +30,12 @@ spec:
                                                                            #   致 pod-IP 层全死时级联到 VIP(kube-proxy 维护)→ 降级不全断
   # (backend-svc 需 discovery.service;selector 模式无 VIP 会被自动跳过)
   slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
-    serviceId: glm                 #   **必填**:要读同 ns 里哪个 LLMSLORequirement 的 spec.serviceId。
-    #                                 #   不做任何推导 —— 关联关系必须写出来,不能从 Service 名猜
+    name: glm                     #   **必填**:同 ns 里那个 LLMSLORequirement 的 metadata.name。
+    #                                 #   按 name 而不是 spec.serviceId:name 的唯一性由 k8s 保证,
+    #                                 #   serviceId 是自由字符串,同 ns 写重了就没法确定用哪份。
+    #                                 #   也不做任何推导 —— 关联关系必须写出来,不能从 Service 名猜
     #                                 #   (猜错不报错:要么静默回落静态阈值,要么套用别人的 SLO)。
-    #                                 #   匹配的是 CRD 的 spec.serviceId,不是 CRD 的对象名。
-    #                                 #   没匹配上 → status 的 SLOSynced condition reason=NoRequirement。
+    #                                 #   不存在 → status 的 SLOSynced condition reason=NoRequirement。
     #
     # 配了 slo 之后,匹配到的 LLMSLORequirement 会被翻译成
     # ttft_metrics / tps_metrics 渲染进本路由的 conf,**优先级高于上面 values 里的静态阈值**。
@@ -63,12 +64,14 @@ spec:
     peers:
       - { use: backend }
   slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
-    serviceId: kimi-k26           #   **必填**:要读同 ns 里哪个 LLMSLORequirement 的 spec.serviceId。
+    name: kimi-k26                #   **必填**:同 ns 里那个 LLMSLORequirement 的 metadata.name。
     #                                 #   注意这条用的是 selector 发现,**压根没有 Service 名**——
-    #                                 #   旧的"从 Service 名推导"在这种路由上根本无解,只能显式写。
+    #                                 #   早先那版"从 Service 名推导"在这种路由上根本无解,只能显式写。
+    #                                 #   按 name 而不是 spec.serviceId:name 的唯一性由 k8s 保证,
+    #                                 #   serviceId 是自由字符串,同 ns 写重了就没法确定用哪份。
+    #                                 #   也不做任何推导 —— 关联关系必须写出来,不能从 Service 名猜
     #                                 #   (猜错不报错:要么静默回落静态阈值,要么套用别人的 SLO)。
-    #                                 #   匹配的是 CRD 的 spec.serviceId,不是 CRD 的对象名。
-    #                                 #   没匹配上 → status 的 SLOSynced condition reason=NoRequirement。
+    #                                 #   不存在 → status 的 SLOSynced condition reason=NoRequirement。
     #
     # 配了 slo 之后,匹配到的 LLMSLORequirement 会被翻译成
     # ttft_metrics / tps_metrics 渲染进本路由的 conf,**优先级高于上面 values 里的静态阈值**。
