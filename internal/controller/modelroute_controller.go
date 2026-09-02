@@ -236,6 +236,19 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render route: %w", err)
 	}
+	// 多条 ModelRoute 渲染同一个 openresty key 时,**只有归属者能写**。
+	// 不判的话两边每轮 resync 互相覆盖,而两边的 status 都是 Ready/Synced —— 表现为
+	// "某条路由的后端时多时少",且从任何一条 MR 上都看不出异常。
+	// (2026-09-01 线上真实发生:modelforge-02-kimi 与 modelforge/fallback-modelforge-01
+	//  都用 route=fallback-modelforge-0.1,该路由在 8 后端与 1 后端之间来回翻,每翻一次还带一次 reload。)
+	if owner, conflict, err := r.routeKeyOwner(ctx, &rb); err != nil {
+		return ctrl.Result{}, err
+	} else if conflict {
+		// **在位者赢**(见 routeKeyOwner):新加的错配置永远抢不走一条正在服务的路由。
+		r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "RouteKeyConflict",
+			fmt.Sprintf("openresty key %s 已归属 %s(创建更早)——本路由拒绝写入以免互相覆盖;改 spec.nginx.route 换个名字", openrestyKey(route), owner))
+		return ctrl.Result{RequeueAfter: resyncEvery}, nil
+	}
 	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Nginx.OutputConfigMap,
 		map[string]string{openrestyKey(route): conf}); err != nil {
 		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
@@ -436,6 +449,53 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 	return reqs
 }
 
+// routeKeyOwner 判断 rb 是不是「目标 ConfigMap + openresty key」这一对的归属者。
+// 返回 (归属者标识, rb 是否为冲突输家, error);无冲突时 conflict=false。
+//
+// 归属规则:**创建更早的赢**,同刻则按 ns/name 字典序 —— 必须是与 reconcile 顺序、
+// informer 缓存顺序完全无关的确定性规则,否则"谁赢"会随时间漂移,和不判几乎一样糟。
+// 选"在位者赢"而不是"后来者赢":一条新加的错配置不该能抢走一条正在服务的路由。
+//
+// 正在删除的(DeletionTimestamp 非空)不参与竞争 —— 它马上就走了,不该继续压着别人。
+func (r *ModelRouteReconciler) routeKeyOwner(ctx context.Context, rb *routingv1.ModelRoute) (string, bool, error) {
+	cmNS, cmName := splitNSName(rb.Spec.Nginx.OutputConfigMap, rb.Namespace)
+	key := openrestyKey(nginxRoute(rb))
+
+	var all routingv1.ModelRouteList
+	if err := r.List(ctx, &all); err != nil {
+		return "", false, fmt.Errorf("list ModelRoute(key 冲突检测): %w", err)
+	}
+	best := rb
+	for i := range all.Items {
+		o := &all.Items[i]
+		if o.Namespace == rb.Namespace && o.Name == rb.Name {
+			continue
+		}
+		if !o.DeletionTimestamp.IsZero() {
+			continue
+		}
+		ns, name := splitNSName(o.Spec.Nginx.OutputConfigMap, o.Namespace)
+		if ns != cmNS || name != cmName || openrestyKey(nginxRoute(o)) != key {
+			continue
+		}
+		if earlierThan(o, best) {
+			best = o
+		}
+	}
+	if best == rb {
+		return rb.Namespace + "/" + rb.Name, false, nil
+	}
+	return best.Namespace + "/" + best.Name, true, nil
+}
+
+// earlierThan:创建更早的排前;同刻按 ns/name 字典序(确定性 tie-break)。
+func earlierThan(a, b *routingv1.ModelRoute) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.Namespace+"/"+a.Name < b.Namespace+"/"+b.Name
+}
+
 // openrestyKey 是这条路由在 openresty ConfigMap 里的 key(= 文件名)。
 func openrestyKey(route string) string { return "session_route_" + route + ".conf" }
 
@@ -496,8 +556,17 @@ func (r *ModelRouteReconciler) configMapWriteResult(ctx context.Context, nn type
 // → cart 只接受「仅 workers 变化」的 reload → 整包拒绝 → workers 永久冻结(2026-08-13 mf-fallback 因 route
 // 改名 delete+readd MR 踩坑)。MR 删掉后 cart 也随之下线,残留的 workers 无害;MR 若再加回,base 原样保留。
 func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routingv1.ModelRoute) error {
-	if err := r.removeConfigMapKey(ctx, rb.Spec.Nginx.OutputConfigMap, openrestyKey(nginxRoute(rb)), rb.Namespace); err != nil {
+	// ⚠️ 只删**自己归属**的 key。有 key 冲突时,输家从来没写过这个 key,它删就是把赢家
+	// (一条正在服务的路由)的配置删掉 —— 删掉一个配错的 MR 反而打断线上流量,
+	// 而且现场只剩"key 凭空消失",几乎无法归因。
+	_, conflict, err := r.routeKeyOwner(ctx, rb)
+	if err != nil {
 		return err
+	}
+	if !conflict {
+		if err := r.removeConfigMapKey(ctx, rb.Spec.Nginx.OutputConfigMap, openrestyKey(nginxRoute(rb)), rb.Namespace); err != nil {
+			return err
+		}
 	}
 	if m := rb.Spec.Monitor; m != nil {
 		if err := r.removeConfigMapKey(ctx, m.OutputConfigMap, monitorKey(rb.Name), rb.Namespace); err != nil {

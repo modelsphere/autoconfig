@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -462,5 +463,142 @@ func TestSLOName(t *testing.T) {
 	// spec.slo == nil 不该 panic
 	if got := sloName(mk(nil, "kimi/kimi-k25-leader")); got != "" {
 		t.Errorf("slo==nil 应返回空,得到 %q", got)
+	}
+}
+
+// ── openresty key 冲突 ──────────────────────────────────────────────────────
+//
+// 两条 ModelRoute 用同一个 nginx.route,就会渲染同一个 ConfigMap key,互相覆盖。
+// 这不是假想:2026-09-01 线上 modelforge-02-kimi 与 modelforge/fallback-modelforge-01
+// 都用 route=fallback-modelforge-0.1,该路由在 8 后端与 1 后端之间来回翻(每翻一次带一次 reload),
+// 而两条的 status 都是 Ready/Synced —— 从任何一条上都看不出异常。
+
+// conflictFixture 搭两条抢同一个 key 的 ModelRoute;old 创建更早。
+func conflictFixture(t *testing.T) (*ModelRouteReconciler, client.Client, types.NamespacedName, types.NamespacedName) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+	_ = slov1.AddToScheme(scheme)
+
+	mk := func(ns, name string, created time.Time, podIP string) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+				CreationTimestamp: metav1.NewTime(created)},
+			Spec: routingv1.ModelRouteSpec{
+				Discovery: routingv1.Discovery{Selector: "app=" + name, Port: 8050},
+				Nginx: routingv1.NginxSpec{
+					Route: "shared-route", OutputConfigMap: "llm-route/openresty-conf", // ← 同一个 key
+					Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+				},
+			},
+		}
+	}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	oldMR := mk("ns-old", "old", t0, "10.1.0.1")
+	newMR := mk("ns-new", "new", t0.Add(24*time.Hour), "10.2.0.1")
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(oldMR, newMR, cm).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	pod := func(ns, name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-0", Namespace: ns, Labels: map[string]string{"app": name}},
+			Status: corev1.PodStatus{PodIP: ip, Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+	}
+	cs := k8sfake.NewSimpleClientset(pod("ns-old", "old", "10.1.0.1"), pod("ns-new", "new", "10.2.0.1"))
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nnOld := types.NamespacedName{Namespace: "ns-old", Name: "old"}
+	nnNew := types.NamespacedName{Namespace: "ns-new", Name: "new"}
+	for i := 0; i < 2; i++ {
+		for _, nn := range []types.NamespacedName{nnOld, nnNew} {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("reconcile %s: %v", nn, err)
+			}
+		}
+	}
+	return r, cl, nnOld, nnNew
+}
+
+func sharedKey(t *testing.T, cl client.Client) (string, bool) {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	v, ok := cm.Data["session_route_shared-route.conf"]
+	return v, ok
+}
+
+// 在位者(创建更早)赢;后来者拒绝写入并把冲突写进 status。
+func TestRouteKeyConflict_IncumbentWins(t *testing.T) {
+	_, cl, nnOld, nnNew := conflictFixture(t)
+
+	conf, ok := sharedKey(t, cl)
+	if !ok {
+		t.Fatal("共享 key 应由在位者写入")
+	}
+	// 内容必须是 old 的后端(10.1.0.1),不能被 new 覆盖成 10.2.0.1
+	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
+		t.Errorf("key 被后来者覆盖了\n%s", conf)
+	}
+	if c := condOf(t, cl, nnOld, "Ready"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("在位者应正常,得到 %+v", c)
+	}
+	c := condOf(t, cl, nnNew, "Ready")
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "RouteKeyConflict" {
+		t.Fatalf("后来者应为 False/RouteKeyConflict,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "ns-old/old") || !strings.Contains(c.Message, "spec.nginx.route") {
+		t.Errorf("message 应指出归属者和补救办法,得到 %q", c.Message)
+	}
+}
+
+// 删掉冲突的输家时,**不能**顺手删掉赢家的 key。
+// 输家从没写过这个 key;它一删就是把一条正在服务的路由的配置删掉,
+// 而现场只剩"key 凭空消失",几乎无法归因。
+func TestRouteKeyConflict_LoserDeletionKeepsWinnerKey(t *testing.T) {
+	r, cl, _, nnNew := conflictFixture(t)
+	if _, ok := sharedKey(t, cl); !ok {
+		t.Fatal("前置:赢家的 key 应存在")
+	}
+
+	var loser routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nnNew, &loser); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if err := cl.Delete(context.Background(), &loser); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nnNew}); err != nil {
+		t.Fatalf("reconcile(删除): %v", err)
+	}
+
+	conf, ok := sharedKey(t, cl)
+	if !ok {
+		t.Fatal("赢家的 key 被输家的 finalizer 删掉了")
+	}
+	if !strings.Contains(conf, "10.1.0.1") {
+		t.Errorf("赢家的内容被动过\n%s", conf)
+	}
+}
+
+// 归属规则必须与 reconcile 顺序无关:先 reconcile 后来者,结果不变。
+// 否则"谁赢"随时间漂移,和不判几乎一样糟。
+func TestRouteKeyConflict_OrderIndependent(t *testing.T) {
+	r, cl, nnOld, nnNew := conflictFixture(t)
+	for i := 0; i < 3; i++ {
+		for _, nn := range []types.NamespacedName{nnNew, nnOld, nnNew} { // 故意让后来者多跑
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%v", err)
+			}
+		}
+	}
+	conf, _ := sharedKey(t, cl)
+	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
+		t.Errorf("归属随 reconcile 顺序漂移了\n%s", conf)
 	}
 }
