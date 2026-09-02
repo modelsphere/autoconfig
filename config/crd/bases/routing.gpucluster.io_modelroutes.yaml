@@ -219,7 +219,9 @@ spec:
                 properties:
                   name:
                     description: |-
-                      Name:要读同 ns 里哪个 LLMSLORequirement,按 **metadata.name** 取。必填,不做任何推导。
+                      Name:要读哪个 LLMSLORequirement,按 **metadata.name** 取。必填,不做任何推导。
+                      支持 "ns/name" 跨 ns 引用;裸名默认用 ModelRoute 自己的 ns
+                      (与 discovery.service、nginx.outputConfigMap 同一套写法)。
 
                       用 name 而不是 spec.serviceId,有两个原因:
 

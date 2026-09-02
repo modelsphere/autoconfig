@@ -409,6 +409,37 @@ func TestReconcileSLO_Disabled(t *testing.T) {
 	}
 }
 
+// 跨 ns 引用:slo.name 写 "ns/name" 时应到那个 ns 去取。
+// 与 discovery.service / nginx.outputConfigMap 同一套写法。
+func TestReconcileSLO_CrossNamespace(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "slo-shared/kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("slo-shared", "kimi-k25", "whatever", 20, 15))
+
+	if c := condOf(t, cl, nn, "SLOSynced"); c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Synced" {
+		t.Fatalf("跨 ns 引用应正常下发,得到 %+v", c)
+	}
+	if conf := routeConf(t, cl); !strings.Contains(conf, `ttft_metrics = { { metric = "p80", q = 0.8, threshold = 20000 }, },`) {
+		t.Errorf("跨 ns 的 SLO 没渲染进 conf\n%s", conf)
+	}
+}
+
+// 裸名不该跑到别的 ns 去找:CRD 在 slo-shared,ModelRoute 在 kimi,写裸名就应该找不到。
+// 这条守的是「裸名 = ModelRoute 自己的 ns」这个默认,别哪天被改成全 ns 搜。
+func TestReconcileSLO_BareNameDoesNotCrossNamespace(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("slo-shared", "kimi-k25", "whatever", 20, 15))
+
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Reason != "NoRequirement" {
+		t.Fatalf("裸名应只在本 ns 找 → NoRequirement,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "kimi/kimi-k25") {
+		t.Errorf("message 应显示解析后的 ns/name 便于排查,得到 %q", c.Message)
+	}
+}
+
 func TestSLOName(t *testing.T) {
 	mk := func(slo *routingv1.SLOSpec, svc string) *routingv1.ModelRoute {
 		return &routingv1.ModelRoute{
@@ -423,6 +454,10 @@ func TestSLOName(t *testing.T) {
 	}
 	if got := sloName(mk(&routingv1.SLOSpec{Name: "x"}, "kimi/kimi-k25-leader")); got != "x" {
 		t.Errorf("应原样返回显式 name,得到 %q", got)
+	}
+	// ns/name 原样返回,拆分由调用点的 splitNSName 做
+	if got := sloName(mk(&routingv1.SLOSpec{Name: "other/x"}, "")); got != "other/x" {
+		t.Errorf("ns/name 应原样返回,得到 %q", got)
 	}
 	// spec.slo == nil 不该 panic
 	if got := sloName(mk(nil, "kimi/kimi-k25-leader")); got != "" {

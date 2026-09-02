@@ -33,15 +33,8 @@ spec:
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
     - { use: backend-svc, priority: 1 }                                   # 兜底:后端 Service VIP(operator 挂时靠它)
   slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
-    name: opt-13b                 #   **必填**:同 ns 里那个 LLMSLORequirement 的 metadata.name。
-    #                                 #   按 name 而不是 spec.serviceId:name 的唯一性由 k8s 保证,
-    #                                 #   serviceId 是自由字符串,同 ns 写重了就没法确定用哪份。
-    #                                 #   也不做任何推导 —— 关联关系必须写出来,不能从 Service 名猜
-    #                                 #   (猜错不报错:要么静默回落静态阈值,要么套用别人的 SLO)。
-    #                                 #   不存在 → status 的 SLOSynced condition reason=NoRequirement。
-    #
-    # 配了 slo 之后,匹配到的 LLMSLORequirement 会被翻译成
-    # ttft_metrics / tps_metrics 渲染进本路由的 conf,**优先级高于上面 values 里的静态阈值**。
+    name: opt-13b                       # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
+    # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。
   monitor:                            # 可选:monitor 的 service/nginx/router 行
     model: opt-125m                   # served-model-name(monitor 展示用)
     gpuType: A100

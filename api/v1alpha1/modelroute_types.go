@@ -135,7 +135,9 @@ type ModelRouteSpec struct {
 // 唯一的例外是**同名键**:本 spec 生成的 ttft_metrics / tps_metrics 渲染在 nginx.values 之后,
 // 用户若在 values 里手写同名键会被静默覆盖(见 NginxSpec.Values 的说明)。
 type SLOSpec struct {
-	// Name:要读同 ns 里哪个 LLMSLORequirement,按 **metadata.name** 取。必填,不做任何推导。
+	// Name:要读哪个 LLMSLORequirement,按 **metadata.name** 取。必填,不做任何推导。
+	// 支持 "ns/name" 跨 ns 引用;裸名默认用 ModelRoute 自己的 ns
+	// (与 discovery.service、nginx.outputConfigMap 同一套写法)。
 	//
 	// 用 name 而不是 spec.serviceId,有两个原因:
 	//

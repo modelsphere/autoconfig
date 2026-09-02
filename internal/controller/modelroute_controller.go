@@ -301,17 +301,18 @@ func sloName(rb *routingv1.ModelRoute) string {
 // 混成一个 "NoRequirement" 会把人指向错误的地方(去查 serviceId 对不对,而真正的原因
 // 是"你写的是 ranges")。
 func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute, s *routingv1.SLOSpec) (m sink.SLOMetrics, warns []string, found bool, err error) {
-	name := sloName(rb)
-	if name == "" {
-		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.name 为空 —— 必须显式声明要读同 ns 里哪个 LLMSLORequirement")
+	ref := sloName(rb)
+	if ref == "" {
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.name 为空 —— 必须显式声明要读哪个 LLMSLORequirement")
 	}
-	// 按 name 直接 Get:唯一性由 k8s 保证,不会出现"同 ns 多份匹配、用哪份看 List 顺序"。
+	// 按 name 直接 Get:唯一性由 k8s 保证,不会出现"多份匹配、用哪份看 List 顺序"。
+	ns, name := splitNSName(ref, rb.Namespace)
 	var req slov1.LLMSLORequirement
-	if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: name}, &req); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &req); err != nil {
 		if apierrors.IsNotFound(err) {
 			return sink.SLOMetrics{}, nil, false, nil // 不存在 → 回落静态,由 condition 说明
 		}
-		return sink.SLOMetrics{}, nil, false, fmt.Errorf("get LLMSLORequirement %s: %w", name, err)
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("get LLMSLORequirement %s/%s: %w", ns, name, err)
 	}
 	m, warns, err = sink.RenderSLOMetrics(req.Spec)
 	return m, warns, true, err
@@ -336,16 +337,20 @@ func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routing
 	case serr != nil:
 		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "TranslateError", serr.Error()
 	case !found:
-		// 同 ns 里压根没有这个名字的 CRD。不是错误(引擎回落静态),但要能看出来 ——
+		// 压根没有这个 LLMSLORequirement。不是错误(引擎回落静态),但要能看出来 ——
 		// 否则「配了 slo 却没生效」和「CRD 本来就没建」分不开。
+		// 消息里带上**解析后的 ns/name**,而不是原样的 ref:裸名默认落到 ModelRoute 自己的 ns,
+		// 而跨 ns 引用写错 ns 时,"找不到 glm"和"在 a 这个 ns 里找不到 glm"排查方向完全不同。
+		ns, name := splitNSName(sloName(rb), rb.Namespace)
 		cond.Reason = "NoRequirement"
-		cond.Message = fmt.Sprintf("同 ns 内没有名为 %s 的 LLMSLORequirement,使用静态阈值", sloName(rb))
+		cond.Message = fmt.Sprintf("找不到 LLMSLORequirement %s/%s,使用静态阈值", ns, name)
 	case m.Empty():
 		// CRD **存在**,但没产出可用指标 —— 最典型的就是只写了 ranges(本期不支持)。
 		// 这一条以前和上面那条共用 "NoRequirement" + 「没有匹配的 LLMSLORequirement」,
 		// 会把人指去查名字对不对,而真正的原因写在 warns 里。
 		cond.Reason = "NothingApplicable"
-		cond.Message = fmt.Sprintf("LLMSLORequirement %s 存在,但没有可用的 default metrics,使用静态阈值", sloName(rb))
+		ns, name := splitNSName(sloName(rb), rb.Namespace)
+		cond.Message = fmt.Sprintf("LLMSLORequirement %s/%s 存在,但没有可用的 default metrics,使用静态阈值", ns, name)
 	default:
 		cond.Message = "ttft_metrics/tps_metrics 已下发"
 	}
@@ -402,15 +407,19 @@ func (r *ModelRouteReconciler) updateStatus(ctx context.Context, rb *routingv1.M
 	}
 }
 
-// modelRoutesForSLO:LLMSLORequirement 变化 → 找出同 ns 里引用了它的 ModelRoute 入队。
+// modelRoutesForSLO:LLMSLORequirement 变化 → 找出引用了它的 ModelRoute 入队。
 // 没有它,改 CRD 阈值要等 10s resync 才生效(能接受,但事件驱动几乎零成本)。
+//
+// **必须列全 ns**,不能只列 CRD 自己那个 ns:slo.name 支持 "ns/name" 跨 ns 引用,
+// 引用方 ModelRoute 可以在任何 ns 里。只列同 ns 的话,跨 ns 引用会静默退化成
+// "只有 10s resync 才更新"—— 能用,但和同 ns 的行为不一致,排查时极难想到。
 func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client.Object) []reconcile.Request {
 	slo, ok := obj.(*slov1.LLMSLORequirement)
 	if !ok {
 		return nil
 	}
 	var mrs routingv1.ModelRouteList
-	if err := r.List(ctx, &mrs, client.InNamespace(obj.GetNamespace())); err != nil {
+	if err := r.List(ctx, &mrs); err != nil {
 		return nil
 	}
 	var reqs []reconcile.Request
@@ -418,7 +427,8 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 		if mrs.Items[i].Spec.SLO == nil {
 			continue
 		}
-		if sloName(&mrs.Items[i]) == slo.GetName() {
+		ns, name := splitNSName(sloName(&mrs.Items[i]), mrs.Items[i].Namespace)
+		if ns == slo.GetNamespace() && name == slo.GetName() {
 			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
 				Namespace: mrs.Items[i].Namespace, Name: mrs.Items[i].Name}})
 		}
