@@ -640,7 +640,9 @@ func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&routingv1.ModelRoute{}).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice), builder.OnlyMetadata).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForPod), builder.OnlyMetadata).
-		// LLMSLORequirement 不能用 OnlyMetadata:映射函数要读 spec.serviceId 才知道该唤醒谁。
+		// LLMSLORequirement 不能用 OnlyMetadata:映射函数现在只看 name/namespace(够了),
+		// 但 sloMetricsFor 的 typed Get 走的是同一个 informer cache —— cache 只存元数据的话
+		// 就读不到 spec.ttft/otps 了。
 		Watches(&slov1.LLMSLORequirement{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForSLO)).
 		Complete(r)
 }
