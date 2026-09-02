@@ -37,18 +37,18 @@
 helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech
 helm repo update harbor-chart-repo
 
-# 1.2 确认能看到各 chart(注:helm search 对本 ChartMuseum 偶发空,用 helm show chart 按版本确认)
-helm show chart harbor-chart-repo/autoconfig         --version 0.3.31     | grep -E '^name|^version'
-helm show chart harbor-chart-repo/openresty          --version 0.1.1      | grep -E '^name|^version'
-helm show chart harbor-chart-repo/cache_aware_router --version 0.6.2-k8s  | grep -E '^name|^version'
-helm show chart harbor-chart-repo/monitor            --version 0.1.3      | grep -E '^name|^version'
+# 1.2 确认能看到各 chart(注:helm search 对本 ChartMuseum 偶发空,用 helm show chart 确认;不加 --version 默认取最新)
+helm show chart harbor-chart-repo/autoconfig         | grep -E '^name|^version'
+helm show chart harbor-chart-repo/openresty          | grep -E '^name|^version'
+helm show chart harbor-chart-repo/cache_aware_router | grep -E '^name|^version'
+helm show chart harbor-chart-repo/monitor            | grep -E '^name|^version'
 
 # 1.3 namespace(qwen ns 由后端 sample 自带 Namespace,无需先建)
 kubectl create ns llm-route   2>/dev/null || true
 kubectl create ns monitoring  2>/dev/null || true
 ```
 
-> chart 版本会随各仓发版变化;取最新版本(匿名可读):`curl -s https://harbor.4pd.io/api/chartrepo/hardcore-tech/charts/<chart>`。
+> **本文档所有 `helm install`/`upgrade` 都不带 `--version`** —— helm 默认拉 ChartMuseum 里的最新版本,新 tag 一发布下次执行就自动用上,无需改本文档维护版本号。若需要锁定/回滚到某个历史版本,再显式加 `--version <x.y.z>`(可用版本:`curl -s https://harbor.4pd.io/api/chartrepo/hardcore-tech/charts/<chart>`)。
 
 ---
 
@@ -57,7 +57,7 @@ kubectl create ns monitoring  2>/dev/null || true
 chart 自带 `crds/`(ModelRoute CRD)+ controller Deployment(2 副本 leader 选举)+ RBAC。
 
 ```bash
-helm -n llm-route install autoconfig harbor-chart-repo/autoconfig --version 0.3.31 \
+helm -n llm-route install autoconfig harbor-chart-repo/autoconfig \
   --set fullnameOverride=autoconfig-controller
 
 # 校验:CRD 装上 + controller Running
@@ -142,12 +142,10 @@ kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}
 `waitForWorkers=true`:cart pod 停在 Init 等 autoconfig 写 workers(第 7 步 apply ModelRoute 后就绪),不会 CrashLoop。
 
 ```bash
-# reload/hagate 侧车镜像属于 autoconfig 仓(跨仓引用),版本按当前 autoconfig 发版对齐
-RELOAD=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.31
-HAGATE=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.31
-
-helm -n llm-route install cart-qwen harbor-chart-repo/cache_aware_router --version 0.6.2-k8s \
-  --set fullnameOverride=cart-qwen --set reload.image=$RELOAD --set ha.image=$HAGATE
+# reload/hagate 侧车镜像版本已是 chart 的默认值(每次 autoconfig 发版会同步 bump 进各 chart),
+# 不用显式 --set 覆盖 —— 显式写死版本号反而会在 chart 默认值升级后仍锁在旧版,忘了改就悄悄漂移。
+helm -n llm-route install cart-qwen harbor-chart-repo/cache_aware_router \
+  --set fullnameOverride=cart-qwen
 
 # 此时 cart pod 会停在 Init(等 workers),属正常;第 7 步后转 Running
 kubectl -n llm-route get pods | grep cart-
@@ -160,14 +158,13 @@ kubectl -n llm-route get pods | grep cart-
 ## 5. openresty(对外入口)
 
 chart 挂载 autoconfig 产出的 `openresty-conf` ConfigMap(各 `session_route_<model>.conf`),reload sidecar 收 SIGHUP 热更路由。
-`image.tag` 已是 chart 默认(= 0.1.1);`bodylog.host` 指向 bodylog-listener(k8s 里需 FQDN 或可解析地址)。
+`image.tag` 用 chart 默认(= chart 的 `appVersion`,随最新 tag 走);`reload.image`/`ha.image` 同理用 chart 默认,不显式覆盖;
+`bodylog.host` 指向 bodylog-listener(k8s 里需 FQDN 或可解析地址)。
 
 ```bash
-helm -n llm-route install openresty harbor-chart-repo/openresty --version 0.1.1 \
+helm -n llm-route install openresty harbor-chart-repo/openresty \
   --set fullnameOverride=openresty \
-  --set bodylog.host=192.0.2.31 \
-  --set reload.image=harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.31 \
-  --set ha.image=harbor.4pd.io/hardcore-tech/autoconfig-hagate:0.3.31
+  --set bodylog.host=192.0.2.31
 
 kubectl -n llm-route rollout status deploy/openresty
 ```
@@ -188,7 +185,7 @@ kubectl -n monitoring apply -f secret.example.yaml    # llm-monitor-secret + llm
 
 # ② install:关掉 chart 自建密钥,引用带外的
 #    (nginxHost / bodylogSummaryURL 已是 chart 默认值——bodylog 默认指 ts34,换集群才 --set 覆盖)
-helm -n monitoring install monitor harbor-chart-repo/monitor --version 0.1.4 \
+helm -n monitoring install monitor harbor-chart-repo/monitor \
   --set secret.create=false \
   --set secret.existingSecret=llm-monitor-secret \
   --set mysql.auth.existingSecret=llm-monitor-mysql-secret
@@ -255,14 +252,15 @@ kubectl -n monitoring exec deploy/monitor -- python3 -c \
 
 ```bash
 helm repo update harbor-chart-repo
-# --reuse-values 保留安装时的 fullnameOverride / 密钥 / bodylog.host 等
-helm -n llm-route  upgrade autoconfig harbor-chart-repo/autoconfig         --version <新版> --reuse-values
-helm -n llm-route  upgrade openresty  harbor-chart-repo/openresty          --version <新版> --reuse-values
-helm -n llm-route  upgrade cart-qwen  harbor-chart-repo/cache_aware_router --version <新版> --reuse-values   # 每个 cart-<model> 各升一次
-helm -n monitoring upgrade monitor    harbor-chart-repo/monitor            --version <新版> --reuse-values
+# 不带 --version = 拉最新 tag;--reuse-values 保留安装时的 fullnameOverride / 密钥 / bodylog.host 等
+helm -n llm-route  upgrade autoconfig harbor-chart-repo/autoconfig         --reuse-values
+helm -n llm-route  upgrade openresty  harbor-chart-repo/openresty          --reuse-values
+helm -n llm-route  upgrade cart-qwen  harbor-chart-repo/cache_aware_router --reuse-values   # 每个 cart-<model> 各升一次
+helm -n monitoring upgrade monitor    harbor-chart-repo/monitor            --reuse-values
 
-helm -n <ns> history <release>            # 看修订
-helm -n <ns> rollback <release> <REV>     # 回滚
+helm -n <ns> history <release>                          # 看修订
+helm -n <ns> rollback <release> <REV>                    # 回滚到某修订
+helm -n <ns> upgrade <release> <chart> --version <x.y.z> --reuse-values   # 需要锁定/回退到某个历史版本才加 --version
 ```
 
 > chart 内容不变时,`helm upgrade` 只更新 release 元数据、**不重启 pod**(渲染出的 spec 一致),零中断。
