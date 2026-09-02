@@ -57,7 +57,7 @@ var hasListener = func(sockPath string) bool {
 //   - 无 conf 引用:排除「正常模型的 socket」(它被 conf listen)。
 //   - 无 listener:排除「手动创建/外部进程正在用」及「刚删模型但老 worker 还在 drain listen」的 socket
 //     → 绝不误删任何在用 socket。刚删模型的 socket 本轮因老 worker 还 listen 而暂留,老 worker 退出后
-//       下一轮 cleanup(下次 conf 变化)再 reap;此时 conf key 已删、dispatch 不再路由到它,无 502 风险。
+//     下一轮 cleanup(下次 conf 变化)再 reap;此时 conf key 已删、dispatch 不再路由到它,无 502 风险。
 func cleanupOrphanSockets(sockDir, confDir string) {
 	active := map[string]bool{}
 	confs, _ := filepath.Glob(filepath.Join(confDir, "*.conf"))

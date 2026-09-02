@@ -70,10 +70,62 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 
 | 字段 | 必填 | 含义 |
 |---|---|---|
+| `modelType` | 可选 | 这条路由服务的是哪类模型，决定渲染方式。默认 `llm`（不写 = 现状，老对象行为不变）；`video` = 视频生成，见下 |
 | `discovery` | ✅ | 本模型的后端桶发现方式（喂 CART workers / nginx backend / monitor services） |
 | `cart` | 可选 | 配了 = autoconfig 管这个 CART；省略 = nginx 直连后端（无 CART 层） |
 | `nginx` | ✅ | openresty 路由：渲染 peers → `session_route_<route>.conf` |
 | `monitor` | 可选 | 把发现的后端/入口/CART 也写进共享 `monitor.conf` |
+
+### modelType：一条路由服务哪类模型
+
+| 取值 | 渲染成什么 | 适用 |
+|---|---|---|
+| `llm`（默认） | 走 lua 路由引擎：会话亲和、TTFT/TPS 限流、自适应并发、CART 前置 | `/v1/chat/completions` 这类 token 流式接口 |
+| `video` | **纯反向代理**：不解析请求体、不限流；放开超时、关响应缓冲、透传 `Range`、补齐 `X-Forwarded-Host/Proto` | 视频生成（如 MiniMax H3）：异步建任务 + 轮询 + 大文件下载 |
+
+为什么视频不能套 LLM 那套：请求体可能是 64MB 的 base64 图（引擎要解析 body 取 model）、
+一条片子要 1~3 分钟才出结果（TTFT/TPS 这类 token 级指标无从谈起）、响应是几十 MB 的视频流
+（响应缓冲会把它憋在内存或磁盘上），而下载接口还要支持断点续传（`Range` 必须原样透传）。
+
+`video` 的可用调优项如下（其余会被 CEL 拒，避免"配了以为生效"）：
+
+| `nginx.values` 键 | 默认 | 含义 |
+|---|---|---|
+| `max_body_size` | `64m` | 请求体上限（I2V 允许 base64 传图） |
+| `proxy_timeout` | `3600s` | 读/写超时（生成 + 大文件下载） |
+| `connect_timeout` | `10s` | 连后端超时 |
+| `rate_limit` | **不配 = 不限速** | **单连接**下载限速,配了才渲染 `limit_rate`。接受 `200Mbps`/`1.5Gbps`(比特口径,自动换算成 nginx 要的字节/秒)或 nginx 原生写法(`25m`/`512k`)。视频是几十 MB 的大文件,而 openresty 是所有模型共享的入口 —— 担心把节点网卡吃满时再开 |
+| `rate_limit_after` | `1m`(仅当配了 `rate_limit`) | 前 N 字节全速。建任务/查询/删除都是几百字节的 JSON,不该被下载限速拖慢 |
+| `upload_conn_limit` | 不配 = 不限 | 每 IP 同时在传的连接数(`limit_conn`),超出直接 503 |
+| `upload_req_limit` | 不配 = 不限 | 每 IP 请求速率(`limit_req`,nginx 原生写法如 `10r/s`) |
+| `upload_req_burst` | 不配 = 无突发 | 配合 `upload_req_limit` 的突发额度 |
+
+**下载限速必须配合开缓冲**:`proxy_buffering off` 时 `limit_rate` 会被 nginx 完全忽略
+(50MB 实测:静态文件 4.99s / 开缓冲 4.61s / 关缓冲 0.089s,`proxy_limit_rate` 同理)。
+所以配了 `rate_limit` 时模板渲染成 `proxy_buffering on` + `proxy_max_temp_file_size 0`
+—— 开缓冲但不落临时文件,缓冲区满即对上游反压;不配限速时仍是 `proxy_buffering off` 边收边发。
+
+**上传方向没有字节级限速**:`limit_rate`/`proxy_limit_rate` 都只作用于响应,nginx 没有
+限制请求体读取速率的指令(真要做只能在 lua 里自己读 `ngx.req.socket` 加 sleep,会丢掉
+`proxy_request_buffering` 的现成反压)。所以上传靠三道闸:`max_body_size` 卡单条体积、
+`upload_conn_limit` 卡并发、`upload_req_limit` 卡频率 —— 单个来源的入向带宽 ≈ 并发数 × 单条速率。
+
+限速只限**速度不限大小** —— `client_max_body_size` 管的是请求体,和响应无关;
+`proxy_buffering off` 也让响应不落临时文件,所以下载的视频多大都行(1GB 按 200Mbps 约 40 秒)。
+`proxy_read_timeout` 限的是两次数据之间的间隔,不是总时长。
+
+CEL 还会拒掉 `video` + `cart` / `slo` / `monitor`：前两个是 LLM 专用；monitor 的探活与告警
+按 LLM 端点设计，指向视频服务只会产生假告警（用 Prometheus 抓服务自己的指标）。
+
+peers 的优先级在 `video` 下映射成 nginx 的主用/`backup` 两档：优先级最高的一组主用，
+更低的（如 `backend-svc` 这种 VIP 静态兜底）标 `backup`，pod-IP 那层全挂了才顶上。
+
+**下发通道与 llm 完全一致**:同样写进 `nginx.outputConfigMap` 的 `session_route_<route>.conf` 键,
+同样由 reload sidecar 监听挂载目录 → `SIGHUP` 生效,没有第二条通道。
+(sidecar 还靠 conf 里的 `listen unix:.../<route>.sock;` 判断哪些 socket 仍在用,
+video 模板保持同样的 listen 行格式，有用例守着。)
+
+样例见 [`config/samples/modelroute-minimax-h3.yaml`](config/samples/modelroute-minimax-h3.yaml)。
 
 **`spec.discovery`** —— 一桶后端怎么发现
 

@@ -1,0 +1,100 @@
+{{- /* autoconfig openresty 视频生成路由模板(nginx.mode: video)。
+
+     和 route.tmpl(LLM)的根本差别:这里**不进 lua 引擎**。LLM 那套要解析请求体取 model、
+     做会话亲和、按 TTFT/TPS 限流、自适应并发;而 H3 这类服务是「异步建任务 + 轮询 + 大文件下载」,
+     请求体可能是 64MB 的 base64 图,响应可能是几十 MB 的视频流,上面每一条都不适用甚至有害。
+     所以退化成一个直白的反向代理:轮询 upstream、放开超时、关响应缓冲、补转发头。
+
+     路径:dispatch(8080)按 /<Route>/ 分发到本 socket **并剥掉前缀**,后端收到的是干净路径。
+     因此对外地址是 https://<域名>/<Route>/v2/...,下游若要自己拼下载 URL(H3 的
+     content.url),必须把 /<Route> 前缀算进去 —— H3 用 H3_PUBLIC_BASE_URL 配。 */ -}}
+# {{.Route}} 视频生成路由(autoconfig 模板生成,勿手改;改模板或 ModelRoute)
+# mode: video —— 纯反向代理,不走 lua 路由引擎(无会话亲和/TPS 限流/自适应并发)
+
+# 转发头:优先透传外层网关给的值,没有才用本机看到的。
+# 下游(如 H3)按 X-Forwarded-Host/Proto 拼对外 URL;这里若无条件写 $scheme,
+# TLS 在更外层终止时会拼出 http:// 的地址。
+map $http_x_forwarded_proto $fwdproto_{{.Var}} {
+    default $http_x_forwarded_proto;
+    ""      $scheme;
+}
+map $http_x_forwarded_host $fwdhost_{{.Var}} {
+    default $http_x_forwarded_host;
+    ""      $host;
+}
+
+{{- if .UploadConnLimit}}
+# 每 IP 并发连接上限。上传方向 nginx 没有字节级限速指令(limit_rate/proxy_limit_rate 只作用于响应),
+# 能控的是「同时有几条在传」—— 单条的速率由客户端和网卡决定,但总量 = 并发数 × 单条速率,
+# 卡住并发就卡住了单个来源能占的入向带宽。真要按字节限只能在 lua 里自己读 body 加 sleep,
+# 那样会丢掉 proxy_request_buffering 的现成反压,不值当。
+limit_conn_zone $binary_remote_addr zone=upconn_{{.Var}}:10m;
+{{- end}}
+{{- if .UploadReqLimit}}
+# 每 IP 请求速率上限(令牌桶)。挡的是"狂刷建任务"这类,和并发限一起用。
+limit_req_zone $binary_remote_addr zone=upreq_{{.Var}}:10m rate={{.UploadReqLimit}};
+{{- end}}
+
+upstream backend_{{.Route}} {
+{{- range .Peers}}
+    server {{.IP}}:{{.Port}}{{if .Backup}} backup{{end}};   # {{.Name}}
+{{- end}}
+    keepalive 16;
+}
+
+server {
+    listen unix:/usr/local/openresty/nginx/sock/{{.Route}}.sock;   # 路径路由:dispatch(8080)按 /{{.Route}}/ 分发到此 socket
+    server_name _;
+
+    # I2V 允许 base64 传图,上游自己在 64MB 处拒;这里放到 64m,别提前 413。
+    client_max_body_size {{.MaxBodySize}};
+    client_body_buffer_size 1m;
+{{- if .UploadConnLimit}}
+    limit_conn upconn_{{.Var}} {{.UploadConnLimit}};
+{{- end}}
+{{- if .UploadReqLimit}}
+    limit_req  zone=upreq_{{.Var}}{{if .UploadReqBurst}} burst={{.UploadReqBurst}}{{end}};
+{{- end}}
+
+    location / {
+        proxy_pass http://backend_{{.Route}};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host  $fwdhost_{{.Var}};
+        proxy_set_header X-Forwarded-Proto $fwdproto_{{.Var}};
+        # Range 必须原样带过去:下载接口支持断点续传,漏了就只能整段下。
+        proxy_set_header Range             $http_range;
+        proxy_set_header If-Range          $http_if_range;
+
+        # 生成一条视频要 1~3 分钟,下载几十 MB 也可能很慢 —— 超时按小时给。
+        proxy_connect_timeout {{.ConnectTimeout}};
+        proxy_send_timeout    {{.ProxyTimeout}};
+        proxy_read_timeout    {{.ProxyTimeout}};
+
+{{- if .RateLimit}}
+        # 单连接下载限速(仅在 ModelRoute 配了 rate_limit 时渲染;不配 = 不限速)。
+        # limit_rate 单位是字节/秒,值由 autoconfig 从 200Mbps 这类比特口径换算而来;
+        # limit_rate_after 之前的部分全速 —— 建任务/查询这些小 JSON 不受影响。
+        limit_rate_after {{.RateLimitAfter}};
+        limit_rate       {{.RateLimit}};
+
+        # 限速必须配合开缓冲:**proxy_buffering off 时 limit_rate 完全不生效**
+        # (50MB 实测:静态文件 4.99s / buffering on 4.61s / buffering off 0.089s;
+        #  proxy_limit_rate 同样只在开缓冲时有效)。
+        # proxy_max_temp_file_size 0 = 开缓冲但不落临时文件:缓冲区满就对上游反压,
+        # 内存里过一手就发走,几十 MB 的视频不会写盘(实测 4.76s,限速照常生效)。
+        proxy_buffering on;
+        proxy_max_temp_file_size 0;
+{{- else}}
+
+        # 没配限速:响应不缓冲,大视频边收边发,不落磁盘、不吃内存。
+        proxy_buffering off;
+{{- end}}
+        # 请求缓冲保持默认 on:客户端慢时先收完再转给后端,免得占着后端连接。
+        proxy_request_buffering on;
+    }
+}
