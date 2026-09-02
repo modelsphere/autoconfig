@@ -492,6 +492,9 @@ func conflictFixture(t *testing.T) (*ModelRouteReconciler, client.Client, types.
 					Route: "shared-route", OutputConfigMap: "llm-route/openresty-conf", // ← 同一个 key
 					Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
 				},
+				// monitor 与 SLO 都配上:冲突只该拦住 openresty 那一次写,不该殃及这两项
+				Monitor: &routingv1.MonitorSpec{OutputConfigMap: "monitoring/monitor-conf", Model: name, GPUType: "H100"},
+				SLO:     &routingv1.SLOSpec{Name: "slo-" + name},
 			},
 		}
 	}
@@ -499,9 +502,12 @@ func conflictFixture(t *testing.T) (*ModelRouteReconciler, client.Client, types.
 	oldMR := mk("ns-old", "old", t0, "10.1.0.1")
 	newMR := mk("ns-new", "new", t0.Add(24*time.Hour), "10.2.0.1")
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+	moncm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "monitor-conf", Namespace: "monitoring"}}
 
 	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(oldMR, newMR, cm).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+		WithObjects(oldMR, newMR, cm, moncm,
+			sloReq("ns-new", "slo-new", "x", 20, 15), sloReq("ns-old", "slo-old", "x", 20, 15)).
+		WithStatusSubresource(&routingv1.ModelRoute{}).Build()
 	pod := func(ns, name, ip string) *corev1.Pod {
 		return &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: name + "-0", Namespace: ns, Labels: map[string]string{"app": name}},
@@ -734,4 +740,42 @@ func TestRouteRename_NoOrphanWhenTakenOver(t *testing.T) {
 	if len(rb.Status.OrphanRouteKeys) != 0 {
 		t.Errorf("orphanRouteKeys 应为空,得到 %v", rb.Status.OrphanRouteKeys)
 	}
+}
+
+// 冲突输家:openresty 写入被拦,但 **monitor 照常同步**。
+// monitor 探的是后端 IP,与 route key 撞名毫无关系;后端还在跑却因为改名撞车丢掉监控是本末倒置,
+// 而且冲突可能挂很久(等人来改名),那段时间恰恰最需要监控。
+func TestRouteKeyConflict_LoserStillSyncsMonitor(t *testing.T) {
+	_, cl, _, _ := conflictFixture(t)
+
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "monitoring", Name: "monitor-conf"}, &cm); err != nil {
+		t.Fatalf("get monitor cm: %v", err)
+	}
+	v, ok := cm.Data["new.monitor.conf"]
+	if !ok {
+		t.Fatalf("输家的 monitor key 缺失(被冲突早退跳过了),现有 keys=%v", keysOf(cm.Data))
+	}
+	if !strings.Contains(v, "10.2.0.1") {
+		t.Errorf("输家的 monitor 行应含自己的后端\n%s", v)
+	}
+}
+
+// 冲突输家不该报 SLOSynced=Synced —— 这一轮根本没写 conf,
+// 说"已下发"会和 Ready=RouteKeyConflict 直接打架,排查时不知道该信哪条。
+func TestRouteKeyConflict_LoserDoesNotClaimSLOSynced(t *testing.T) {
+	_, cl, _, nnNew := conflictFixture(t)
+	if c := condOf(t, cl, nnNew, "SLOSynced"); c != nil && c.Reason == "Synced" {
+		t.Errorf("冲突输家不该声称 SLO 已下发(conf 根本没写),得到 %+v", c)
+	}
+}
+
+func keysOf(m map[string]string) []string {
+	var ks []string
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }

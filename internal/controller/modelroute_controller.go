@@ -201,64 +201,74 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc, ProbePath: probePath})
 	}
 	route := nginxRoute(&rb)
-	// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
-	// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
-	extra := rb.Spec.Nginx.Values
-	if usesBackendSvc(rb.Spec.Nginx.Peers) {
-		extra = withDefaults(extra, map[string]string{"cross_tier_fallback": "true", "max_more_tries": "3"})
-	}
-	// SLO(可选):把匹配本路由的 LLMSLORequirement 翻译成 ttft_metrics / tps_metrics,
-	// 与其它调优项一起渲染进同一份 conf(改 CRD → 重写 conf → reload sidecar SIGHUP)。
-	// 翻译失败**不阻塞 peers 下发** —— peers 才是"不下发就断流"的东西;SLO 缺席只是让
-	// 引擎回落到 conf 里的静态阈值(与接 CRD 前一致)。结果写进 SLOSynced condition
-	// (见 syncSLOCondition:为什么不打 Ready=false、以及为什么不能只打日志)。
-	raw := map[string]string(nil)
-	if s := rb.Spec.SLO; s != nil {
-		m, warns, found, serr := r.sloMetricsFor(ctx, &rb, s)
-		for _, w := range warns {
-			log.Info("SLO: " + w)
-		}
-		if serr != nil {
-			log.Error(serr, "翻译 LLMSLORequirement 失败,本轮不下发 SLO(openresty 回落静态阈值)")
-		} else if !m.Empty() {
-			raw = sink.WithSLOMetrics(nil, m)
-		}
-		r.syncSLOCondition(ctx, &rb, m, warns, found, serr)
-	} else {
-		// spec.slo 被移除:摘掉 SLOSynced —— 否则曾经的 False/TranslateError 会永久留在
-		// status 上,describe 一直显示一个吓人的失败态,而这条路由早就不用 SLO 了。
-		r.clearSLOCondition(ctx, &rb)
-	}
-	conf, err := sink.RenderRoute(sink.RouteData{
-		Route: route,
-		Extra: extra, // 任意调优项,原样渲染
-		Raw:   raw,   // 已是 lua 字面量的片段(SLO 指标表)
-		Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("render route: %w", err)
-	}
+
 	// 多条 ModelRoute 渲染同一个 openresty key 时,**只有归属者能写**。
 	// 不判的话两边每轮 resync 互相覆盖,而两边的 status 都是 Ready/Synced —— 表现为
 	// "某条路由的后端时多时少",且从任何一条 MR 上都看不出异常。
 	// (2026-09-01 线上真实发生:modelforge-02-kimi 与 modelforge/fallback-modelforge-01
 	//  都用 route=fallback-modelforge-0.1,该路由在 8 后端与 1 后端之间来回翻,每翻一次还带一次 reload。)
-	if owner, conflict, err := r.routeKeyOwner(ctx, &rb); err != nil {
+	//
+	// 判定放在**渲染与 SLO 之前**:输家这一轮什么都不会写,那就别去算 SLO ——
+	// 否则 SLOSynced 会写成 "已下发",而 conf 根本没落盘,两条 condition 自相矛盾。
+	// 冲突**只跳过 openresty 这一次写入**,后面的 monitor 照常同步:monitor 探的是后端 IP,
+	// 与 route key 撞名毫无关系,后端还在跑却因为改名撞车丢掉监控是本末倒置 ——
+	// 而且冲突可能挂很久(等人来改名),那段时间恰恰最需要监控。
+	owner, keyConflict, err := r.routeKeyOwner(ctx, &rb)
+	if err != nil {
 		return ctrl.Result{}, err
-	} else if conflict {
-		// **在位者赢**(见 routeKeyOwner):新加的错配置永远抢不走一条正在服务的路由。
-		r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "RouteKeyConflict",
-			fmt.Sprintf("openresty key %s 已归属 %s(创建更早)——本路由拒绝写入以免互相覆盖;改 spec.nginx.route 换个名字", openrestyKey(route), owner))
-		return ctrl.Result{RequeueAfter: resyncEvery}, nil
 	}
-	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Nginx.OutputConfigMap,
-		map[string]string{openrestyKey(route): conf}); err != nil {
-		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
-	}
-	// 改名收尾:新 key 写成功后,把上一次写的旧 key 摘掉,并记账本次写的是哪个。
-	// 顺序是**先写新、再删旧** —— 反过来的话中间有一段时间这条路由在 openresty 里根本不存在。
-	if err := r.reconcileRenamedKey(ctx, &rb, route); err != nil {
-		return ctrl.Result{}, err
+
+	// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
+	// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
+	if keyConflict {
+		// 输家:不渲染、不写 conf。SLOSynced 一并摘掉 —— 这一轮没有下发任何 conf,
+		// 留着上一次的 "已下发" 会和 Ready=RouteKeyConflict 直接打架。冲突解除后自然恢复。
+		r.clearSLOCondition(ctx, &rb)
+	} else {
+		extra := rb.Spec.Nginx.Values
+		if usesBackendSvc(rb.Spec.Nginx.Peers) {
+			extra = withDefaults(extra, map[string]string{"cross_tier_fallback": "true", "max_more_tries": "3"})
+		}
+		// SLO(可选):把匹配本路由的 LLMSLORequirement 翻译成 ttft_metrics / tps_metrics,
+		// 与其它调优项一起渲染进同一份 conf(改 CRD → 重写 conf → reload sidecar SIGHUP)。
+		// 翻译失败**不阻塞 peers 下发** —— peers 才是"不下发就断流"的东西;SLO 缺席只是让
+		// 引擎回落到 conf 里的静态阈值(与接 CRD 前一致)。结果写进 SLOSynced condition
+		// (见 syncSLOCondition:为什么不打 Ready=false、以及为什么不能只打日志)。
+		raw := map[string]string(nil)
+		if s := rb.Spec.SLO; s != nil {
+			m, warns, found, serr := r.sloMetricsFor(ctx, &rb)
+			for _, w := range warns {
+				log.Info("SLO: " + w)
+			}
+			if serr != nil {
+				log.Error(serr, "翻译 LLMSLORequirement 失败,本轮不下发 SLO(openresty 回落静态阈值)")
+			} else if !m.Empty() {
+				raw = sink.WithSLOMetrics(nil, m)
+			}
+			r.syncSLOCondition(ctx, &rb, m, warns, found, serr)
+		} else {
+			// spec.slo 被移除:摘掉 SLOSynced —— 否则曾经的 False/TranslateError 会永久留在
+			// status 上,describe 一直显示一个吓人的失败态,而这条路由早就不用 SLO 了。
+			r.clearSLOCondition(ctx, &rb)
+		}
+		conf, err := sink.RenderRoute(sink.RouteData{
+			Route: route,
+			Extra: extra, // 任意调优项,原样渲染
+			Raw:   raw,   // 已是 lua 字面量的片段(SLO 指标表)
+			Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("render route: %w", err)
+		}
+		if err := r.writeConfigMap(ctx, &rb, rb.Spec.Nginx.OutputConfigMap,
+			map[string]string{openrestyKey(route): conf}); err != nil {
+			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
+		}
+		// 改名收尾:新 key 写成功后,把上一次写的旧 key 摘掉,并记账本次写的是哪个。
+		// 顺序是**先写新、再删旧** —— 反过来的话中间有一段时间这条路由在 openresty 里根本不存在。
+		if err := r.reconcileRenamedKey(ctx, &rb, route); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 4) monitor(可选):service(后端)+ nginx(openresty 入口)+ router(CART)行(共享 ConfigMap,每模型一个 key)
@@ -298,6 +308,13 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// 5) 回写 status
+	if keyConflict {
+		// **在位者赢**(见 routeKeyOwner):新加的错配置永远抢不走一条正在服务的路由。
+		// 放在最后写:monitor 该同步的已经同步完,status 只反映 openresty 那一项没写成。
+		r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "RouteKeyConflict",
+			fmt.Sprintf("openresty key %s 已归属 %s(创建更早)——本路由拒绝写入以免互相覆盖;改 spec.nginx.route 换个名字(monitor 仍照常同步)", openrestyKey(route), owner))
+		return ctrl.Result{RequeueAfter: resyncEvery}, nil
+	}
 	r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), true, "Synced", "synced")
 	return ctrl.Result{RequeueAfter: resyncEvery}, nil
 }
@@ -312,7 +329,7 @@ func sloName(rb *routingv1.ModelRoute) string {
 	return rb.Spec.SLO.Name
 }
 
-// sloMetricsFor 查同 ns 里 serviceId 匹配的 LLMSLORequirement,翻译成 lua 指标表。
+// sloMetricsFor 按 spec.slo.name 取 LLMSLORequirement(支持 ns/name 跨 ns),翻译成 lua 指标表。
 // 找不到 → 返回空(引擎回落静态阈值)。这一点必须是"空"而不是"保留上次的值":
 // CRD 被删之后如果还留着旧指标,阈值会永久冻结在删除前那一版。
 // 这里天然满足 —— conf 每轮都整份重渲染,没写进去就是没有。
@@ -320,7 +337,7 @@ func sloName(rb *routingv1.ModelRoute) string {
 // (比如只写了 ranges —— 本期不支持)。两者都回落静态阈值,但排查方向完全相反,
 // 混成一个 "NoRequirement" 会把人指向错误的地方(去查 serviceId 对不对,而真正的原因
 // 是"你写的是 ranges")。
-func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute, s *routingv1.SLOSpec) (m sink.SLOMetrics, warns []string, found bool, err error) {
+func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute) (m sink.SLOMetrics, warns []string, found bool, err error) {
 	ref := sloName(rb)
 	if ref == "" {
 		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.name 为空 —— 必须显式声明要读哪个 LLMSLORequirement")
@@ -345,7 +362,7 @@ func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.
 //
 // 为什么**不能只打日志**:本文件其余所有失败路径(DiscoverError / NoBackends /
 // ConfigMapMissing)都写 status,理由同一条 —— 让 kubectl describe 看得到。而 SLO 这里最常见
-// 的失败是**永久性**的:selector 发现的路由推不出 serviceId(没有 Service 名可截),
+// 的失败是**永久性**的(不会自愈、也不随重试变好):spec.slo.name 没写、或写了个不存在的名字。
 // 只进 operator 日志的话,用户会看到一个 Ready=true、却永远没有 SLO 的路由,毫无线索。
 //
 // 只在**内容真的变了**时才写 —— 否则每 10s resync 都会打一次 status update。
@@ -367,7 +384,7 @@ func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routing
 	case m.Empty():
 		// CRD **存在**,但没产出可用指标 —— 最典型的就是只写了 ranges(本期不支持)。
 		// 这一条以前和上面那条共用 "NoRequirement" + 「没有匹配的 LLMSLORequirement」,
-		// 会把人指去查名字对不对,而真正的原因写在 warns 里。
+		// 会把人指去查 spec.slo.name 对不对,而真正的原因写在 warns 里。
 		cond.Reason = "NothingApplicable"
 		ns, name := splitNSName(sloName(rb), rb.Namespace)
 		cond.Message = fmt.Sprintf("LLMSLORequirement %s/%s 存在,但没有可用的 default metrics,使用静态阈值", ns, name)
@@ -456,8 +473,13 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 	return reqs
 }
 
-// reconcileRenamedKey 处理 spec.nginx.route(或 outputConfigMap)改名:把本次写的 key 记进
+// reconcileRenamedKey 处理 spec.nginx.route(或 nginx.outputConfigMap)改名:把本次写的 key 记进
 // status,并**报告**(不删除)上一次写的那个已经没人认领的旧 key。
+//
+// 范围:**只覆盖 openresty key,有意不覆盖 monitor**。monitor 的 key 是 monitorKey(rb.Name),
+// 而 metadata.name 不可变 → 改名不会遗留 monitor 孤儿;只有改 monitor.outputConfigMap
+// (换一整个 ConfigMap,罕见)才会,那种情况没记账、也不报。要覆盖的话照本函数加一组
+// appliedMonitorKey/ConfigMap 即可 —— 现在不做是权衡,不是漏了。
 //
 // 为什么需要记账:finalizer 和清理逻辑只能看到**当前** spec,推不出改名前叫什么。
 // 不记的话改一次名就泄漏一个 key,而 openresty 会继续加载那条陈旧路由 —— 它指向改名前的 peers,
