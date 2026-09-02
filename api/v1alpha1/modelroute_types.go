@@ -76,6 +76,12 @@ type NginxSpec struct {
 	OutputConfigMap string `json:"outputConfigMap"`
 	// Values:任意调优项,原样渲染进 lua register_route 返回表(key = value)。nginx 加新调优项无需改代码。
 	// 常用:ttft_limit_ms、tps_limit_tps、adaptive_cc_min、default_max。值按 lua 字面量原样写(数字不加引号)。
+	//
+	// ⚠️ 这里的值全部走 luaVal:非数字/非布尔会被**加引号当字符串**。所以不能在这里手写
+	// ttft_metrics / tps_metrics 这类**嵌套 table** —— 写了会渲染成字符串,引擎的
+	// util.validate_metrics 直接整份丢弃。那两个键由 spec.slo 从 LLMSLORequirement 生成,
+	// 且渲染在本段之后 → **配了 spec.slo 时,这里手写的同名键会被静默覆盖**(实测确认)。
+	// 要调 SLO 阈值请改 LLMSLORequirement,不要在这里写。
 	Values map[string]string `json:"values,omitempty"`
 	// Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
 	// 端口取 Service 的 dispatch 命名端口(8080,路径路由统一入口)。与 selector 二选一(都配则 service 优先)。
@@ -113,6 +119,37 @@ type ModelRouteSpec struct {
 	Nginx NginxSpec `json:"nginx"`
 	// Monitor:可选;有 = 把发现的后端也写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)。
 	Monitor *MonitorSpec `json:"monitor,omitempty"`
+	// SLO:可选;有 = 把同 ns 里匹配本路由的 LLMSLORequirement 翻译成 ttft_metrics / tps_metrics,
+	// 渲染进本路由的 session_route_<route>.conf(与其它调优项同一条通道,reload 生效)。
+	// 没有 = 完全不碰 SLO(openresty 回落 nginx.values 里的静态 ttft_limit_ms / tps_limit_tps)。
+	SLO *SLOSpec `json:"slo,omitempty"`
+}
+
+// SLOSpec:把 LLMSLORequirement(inference.x-k8s.io,别人的 CRD)下发给 openresty。
+// 空对象 `slo: {}` 就够用 —— serviceId 默认从 discovery.service 推导。
+//
+// 与 nginx.values 的关系:**两个来源,不冲突**。values.ttft_limit_ms / tps_limit_tps 继续作为
+// **静态默认值**渲染进 conf;CRD 在 openresty 的优先级链里排在它前面
+// (手工 override > CRD > factory opts > 全局默认)。CRD 没覆盖到的 route 用 values 的值。
+//
+// 唯一的例外是**同名键**:本 spec 生成的 ttft_metrics / tps_metrics 渲染在 nginx.values 之后,
+// 用户若在 values 里手写同名键会被静默覆盖(见 NginxSpec.Values 的说明)。
+type SLOSpec struct {
+	// Name:要读哪个 LLMSLORequirement,按 **metadata.name** 取。必填,不做任何推导。
+	// 支持 "ns/name" 跨 ns 引用;裸名默认用 ModelRoute 自己的 ns
+	// (与 discovery.service、nginx.outputConfigMap 同一套写法)。
+	//
+	// 用 name 而不是 spec.serviceId,有两个原因:
+	//
+	//  1. **唯一性由 k8s 保证**。serviceId 只是个自由字符串,同 ns 里两个对象写同一个
+	//     serviceId 完全能 apply,那时"用哪份"就由 List 的顺序(informer 缓存,无序保证)
+	//     决定,阈值会在两份之间漂,而两份 CRD 看上去都正常。按 name 是直接 Get,不存在这问题。
+	//  2. **不含糊**。一个服务在不同地方叫 glm 和 glm-leader,serviceId 写哪个要靠猜;
+	//     name 是这个对象唯一的、写在 yaml 上的身份。
+	//
+	// 早先还有一版是从 discovery.service 截掉 "-leader" 后缀推 serviceId(LWS 惯例)。
+	// 一并删了:那是按命名规则猜关联,猜错不报错——要么静默回落静态阈值,要么套用别人的 SLO。
+	Name string `json:"name"`
 }
 
 // ModelRouteStatus 是 controller 回写的观测状态。
@@ -122,6 +159,14 @@ type ModelRouteStatus struct {
 	CartPeers          int                `json:"cartPeers"`
 	Ready              bool               `json:"ready"`
 	LastSyncTime       *metav1.Time       `json:"lastSyncTime,omitempty"`
+	// AppliedRouteKey / AppliedRouteConfigMap:**上一次真正写进去的** openresty key 及其 ConfigMap。
+	// 用来在 spec.nginx.route 改名后删掉旧 key —— 只看当前 spec 是推不出旧名字的,
+	// 结果就是改一次名泄漏一个 key,而 openresty 会继续加载那条陈旧路由(指向改名前的 peers)。
+	AppliedRouteKey       string `json:"appliedRouteKey,omitempty"`
+	AppliedRouteConfigMap string `json:"appliedRouteConfigMap,omitempty"`
+	// OrphanRouteKeys:改名后遗留、已无任何 ModelRoute 声明的 openresty key(格式 "ns/cm:key")。
+	// **只报不删** —— 见 reportOrphanKeys 里为什么不能由 operator 自动删。
+	OrphanRouteKeys []string `json:"orphanRouteKeys,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 

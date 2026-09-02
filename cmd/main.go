@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	slov1 "autoconfig/api/inference/v1alpha1"
 	routingv1 "autoconfig/api/v1alpha1"
 	"autoconfig/internal/controller"
 )
@@ -40,6 +41,9 @@ func runController(leaderElect bool) error {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(routingv1.AddToScheme(scheme))
+	// LLMSLORequirement 是别人的 CRD,我们只读(翻译成 openresty route conf 里的
+	// ttft_metrics / tps_metrics,与 peers 走同一条 ConfigMap + reload 通道)。
+	utilruntime.Must(slov1.AddToScheme(scheme))
 
 	cfg, err := ctrl.GetConfig()
 	if err != nil {

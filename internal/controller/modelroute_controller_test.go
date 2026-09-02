@@ -2,8 +2,10 @@ package controller
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -15,6 +17,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	slov1 "autoconfig/api/inference/v1alpha1"
 	routingv1 "autoconfig/api/v1alpha1"
 )
 
@@ -194,5 +199,664 @@ func TestReferencesPodBySelector(t *testing.T) {
 		if got := referencesPodBySelector(c.mr, c.podNS, c.labels); got != c.want {
 			t.Errorf("%s: got %v want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// ── SLO(LLMSLORequirement → ttft_metrics / tps_metrics + SLOSynced condition)──
+
+func sloReq(ns, name, serviceID string, ttftSec, otpsTPS float64) *slov1.LLMSLORequirement {
+	return &slov1.LLMSLORequirement{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: slov1.LLMSLORequirementSpec{
+			ServiceID: serviceID,
+			TTFT:      &slov1.SLOTarget{Default: &slov1.SLODefault{Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: ttftSec}}}},
+			OTPS:      &slov1.SLOTarget{Default: &slov1.SLODefault{Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: otpsTPS}}}},
+		},
+	}
+}
+
+// sloFixture 搭一条最小可 reconcile 的 ModelRoute(service 发现 + 直连后端,无 cart/monitor)。
+func sloFixture(t *testing.T, slo *routingv1.SLOSpec, discovery routingv1.Discovery,
+	objs ...client.Object) (*ModelRouteReconciler, types.NamespacedName, client.Client) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+	_ = slov1.AddToScheme(scheme)
+
+	rb := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "kimi-k2.5", Namespace: "kimi"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: discovery,
+			Nginx: routingv1.NginxSpec{
+				Route: "kimi-k2.5", OutputConfigMap: "llm-route/openresty-conf",
+				Values: map[string]string{"ttft_limit_ms": "30000"},
+				Peers:  []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+			},
+			SLO: slo,
+		},
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(append([]client.Object{rb, cm}, objs...)...).
+		WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	// selector 路径要有 pod 才发现得到后端 —— 否则 reconcile 在 len(backends)==0 就 return,
+	// 根本走不到 SLO 那一步(第一版测试就是这么假绿的)。
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "kimi-0", Namespace: "kimi", Labels: map[string]string{"app": "kimi"}},
+		Status: corev1.PodStatus{PodIP: "10.1.0.1", Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	}
+	cs := k8sfake.NewSimpleClientset(
+		epslice("kimi-k25-leader-1", "kimi-k25-leader", "kimi", "10.1.0.1"), pod)
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nn := types.NamespacedName{Namespace: "kimi", Name: "kimi-k2.5"}
+	for i := 0; i < 2; i++ { // 第一次加 finalizer 并 requeue,第二次真正干活
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+			t.Fatalf("reconcile %d: %v", i+1, err)
+		}
+	}
+	return r, nn, cl
+}
+
+func routeConf(t *testing.T, cl client.Client) string {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("get openresty-conf: %v", err)
+	}
+	return cm.Data["session_route_kimi-k2.5.conf"]
+}
+
+func condOf(t *testing.T, cl client.Client, nn types.NamespacedName, typ string) *metav1.Condition {
+	t.Helper()
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("get mr: %v", err)
+	}
+	for i := range rb.Status.Conditions {
+		if rb.Status.Conditions[i].Type == typ {
+			return &rb.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// 线上 kimi 的形状:ModelRoute 引用同 ns 的 LLMSLORequirement "kimi-k25"。
+//
+// CRD 的 spec.serviceId 这里**故意写成别的值**:匹配只看 metadata.name,
+// serviceId 是给 autoscaler 用的、与路由层无关。写成同值的话,这个用例在
+// 「改回按 serviceId 匹配」时照样会绿,就测不住这件事了。
+func TestReconcileSLO_Rendered(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("kimi", "kimi-k25", "some-other-service-id", 20, 15))
+
+	conf := routeConf(t, cl)
+	for _, want := range []string{
+		`ttft_metrics = { { metric = "p80", q = 0.8, threshold = 20000 }, },`, // 秒 → 毫秒
+		`tps_metrics = { { metric = "p80", q = 0.2, threshold = 15 }, },`,     // 覆盖率 0.8 → 低尾 q=0.2
+		"ttft_limit_ms = 30000,", // 静态默认不被挤掉
+	} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("conf 缺少 %s\n%s", want, conf)
+		}
+	}
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Synced" {
+		t.Errorf("SLOSynced 应为 True/Synced,得到 %+v", c)
+	}
+}
+
+// 没有匹配的 CRD:不是错误(引擎回落静态),但要能从 status 看出来 ——
+// 否则「配了 slo 却没生效」和「CRD 本来就没写」分不开。
+func TestReconcileSLO_NoRequirement(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+
+	if strings.Contains(routeConf(t, cl), "ttft_metrics") {
+		t.Errorf("没有 CRD 时不该渲染 ttft_metrics\n%s", routeConf(t, cl))
+	}
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "NoRequirement" {
+		t.Errorf("应为 True/NoRequirement,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "kimi-k25") {
+		t.Errorf("message 应带上推导出的 serviceId 便于排查,得到 %q", c.Message)
+	}
+}
+
+// CRD **存在**但只写了 ranges(本期不支持)→ 必须与「CRD 不存在」区分开。
+// 共用 NoRequirement + 「没有匹配的 LLMSLORequirement」会把人指去查 serviceId 对不对,
+// 而真正的原因(ranges 不支持)只在 warns 里、以前被整个丢掉了。
+func TestReconcileSLO_OnlyRanges(t *testing.T) {
+	onlyRanges := &slov1.LLMSLORequirement{
+		ObjectMeta: metav1.ObjectMeta{Name: "kimi-k25", Namespace: "kimi"},
+		Spec: slov1.LLMSLORequirementSpec{
+			ServiceID: "kimi-k25",
+			TTFT: &slov1.SLOTarget{Ranges: []slov1.SLORange{
+				{ContextLengthRangeLow: 0, Metrics: []slov1.SLOMetric{{Type: "p80", Threshold: 20}}}}},
+		},
+	}
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050}, onlyRanges)
+
+	if strings.Contains(routeConf(t, cl), "ttft_metrics") {
+		t.Errorf("ranges 不支持,不该渲染 ttft_metrics\n%s", routeConf(t, cl))
+	}
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Reason != "NothingApplicable" {
+		t.Fatalf("应为 NothingApplicable(不是 NoRequirement),得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "ranges") {
+		t.Errorf("message 必须带上 ranges 被忽略这条 warn —— 那就是「为什么没生效」的答案,得到 %q", c.Message)
+	}
+}
+
+// spec.slo 从"有"变成"没有":SLOSynced 必须被摘掉,不能永久残留一个失败态。
+func TestReconcileSLO_RemovedClearsCondition(t *testing.T) {
+	r, nn, cl := sloFixture(t, &routingv1.SLOSpec{}, // serviceId 留空 → False
+		routingv1.Discovery{Selector: "app=kimi", Port: 8050})
+	if c := condOf(t, cl, nn, "SLOSynced"); c == nil || c.Status != metav1.ConditionFalse {
+		t.Fatalf("前置条件:应先有一个 False 的 SLOSynced,得到 %+v", c)
+	}
+
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	rb.Spec.SLO = nil
+	if err := cl.Update(context.Background(), &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if c := condOf(t, cl, nn, "SLOSynced"); c != nil {
+		t.Errorf("移除 spec.slo 后 SLOSynced 应被摘掉,得到 %+v", c)
+	}
+}
+
+// 配了 spec.slo 却没写 name —— **永久性**失败(不会自愈、也不会随重试变好)。
+// 以前只进 operator 日志,用户会看到一个 Ready=true 却永远没有 SLO 的路由,毫无线索。
+// 用 selector 发现构造,因为这条路由连 Service 名都没有,是最没法"猜"的形状。
+func TestReconcileSLO_MissingName(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{},
+		routingv1.Discovery{Selector: "app=kimi", Port: 8050})
+
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "TranslateError" {
+		t.Fatalf("应为 False/TranslateError,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "slo.name") {
+		t.Errorf("message 应指出补救办法,得到 %q", c.Message)
+	}
+	// SLO 失败**不该**把 Ready 打成 false —— peers 照常下发,转发是好的
+	if ready := condOf(t, cl, nn, "Ready"); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Errorf("Ready 不该被 SLO 失败带下去,得到 %+v", ready)
+	}
+}
+
+// spec.slo == nil:完全不碰 SLO,连 condition 都不该出现。
+func TestReconcileSLO_Disabled(t *testing.T) {
+	_, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("kimi", "kimi-k25", "kimi-k25", 20, 15))
+
+	if strings.Contains(routeConf(t, cl), "metrics") {
+		t.Errorf("没配 spec.slo 时不该渲染任何 metrics\n%s", routeConf(t, cl))
+	}
+	if c := condOf(t, cl, nn, "SLOSynced"); c != nil {
+		t.Errorf("没配 spec.slo 不该产生 SLOSynced condition,得到 %+v", c)
+	}
+}
+
+// 跨 ns 引用:slo.name 写 "ns/name" 时应到那个 ns 去取。
+// 与 discovery.service / nginx.outputConfigMap 同一套写法。
+func TestReconcileSLO_CrossNamespace(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "slo-shared/kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("slo-shared", "kimi-k25", "whatever", 20, 15))
+
+	if c := condOf(t, cl, nn, "SLOSynced"); c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Synced" {
+		t.Fatalf("跨 ns 引用应正常下发,得到 %+v", c)
+	}
+	if conf := routeConf(t, cl); !strings.Contains(conf, `ttft_metrics = { { metric = "p80", q = 0.8, threshold = 20000 }, },`) {
+		t.Errorf("跨 ns 的 SLO 没渲染进 conf\n%s", conf)
+	}
+}
+
+// 裸名不该跑到别的 ns 去找:CRD 在 slo-shared,ModelRoute 在 kimi,写裸名就应该找不到。
+// 这条守的是「裸名 = ModelRoute 自己的 ns」这个默认,别哪天被改成全 ns 搜。
+func TestReconcileSLO_BareNameDoesNotCrossNamespace(t *testing.T) {
+	_, nn, cl := sloFixture(t, &routingv1.SLOSpec{Name: "kimi-k25"},
+		routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050},
+		sloReq("slo-shared", "kimi-k25", "whatever", 20, 15))
+
+	c := condOf(t, cl, nn, "SLOSynced")
+	if c == nil || c.Reason != "NoRequirement" {
+		t.Fatalf("裸名应只在本 ns 找 → NoRequirement,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "kimi/kimi-k25") {
+		t.Errorf("message 应显示解析后的 ns/name 便于排查,得到 %q", c.Message)
+	}
+}
+
+func TestSLOName(t *testing.T) {
+	mk := func(slo *routingv1.SLOSpec, svc string) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kimi"},
+			Spec:       routingv1.ModelRouteSpec{Discovery: routingv1.Discovery{Service: svc}, SLO: slo},
+		}
+	}
+	// 只读显式字段。**这个用例的重点是"不推导"**:早先这里会把 kimi/kimi-k25-leader
+	// 截成 kimi-k25,现在给了 Service 名也必须原样为空 —— 否则就是推导又被加回来了。
+	if got := sloName(mk(&routingv1.SLOSpec{}, "kimi/kimi-k25-leader")); got != "" {
+		t.Errorf("name 空时不该从 Service 名推导,得到 %q", got)
+	}
+	if got := sloName(mk(&routingv1.SLOSpec{Name: "x"}, "kimi/kimi-k25-leader")); got != "x" {
+		t.Errorf("应原样返回显式 name,得到 %q", got)
+	}
+	// ns/name 原样返回,拆分由调用点的 splitNSName 做
+	if got := sloName(mk(&routingv1.SLOSpec{Name: "other/x"}, "")); got != "other/x" {
+		t.Errorf("ns/name 应原样返回,得到 %q", got)
+	}
+	// spec.slo == nil 不该 panic
+	if got := sloName(mk(nil, "kimi/kimi-k25-leader")); got != "" {
+		t.Errorf("slo==nil 应返回空,得到 %q", got)
+	}
+}
+
+// ── openresty key 冲突 ──────────────────────────────────────────────────────
+//
+// 两条 ModelRoute 用同一个 nginx.route,就会渲染同一个 ConfigMap key,互相覆盖。
+// 这不是假想:2026-09-01 线上 modelforge-02-kimi 与 modelforge/fallback-modelforge-01
+// 都用 route=fallback-modelforge-0.1,该路由在 8 后端与 1 后端之间来回翻(每翻一次带一次 reload),
+// 而两条的 status 都是 Ready/Synced —— 从任何一条上都看不出异常。
+
+// conflictFixture 搭两条抢同一个 key 的 ModelRoute;old 创建更早。
+func conflictFixture(t *testing.T) (*ModelRouteReconciler, client.Client, types.NamespacedName, types.NamespacedName) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+	_ = slov1.AddToScheme(scheme)
+
+	mk := func(ns, name string, created time.Time, podIP string) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+				CreationTimestamp: metav1.NewTime(created)},
+			Spec: routingv1.ModelRouteSpec{
+				Discovery: routingv1.Discovery{Selector: "app=" + name, Port: 8050},
+				Nginx: routingv1.NginxSpec{
+					Route: "shared-route", OutputConfigMap: "llm-route/openresty-conf", // ← 同一个 key
+					Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+				},
+				// monitor 与 SLO 都配上:冲突只该拦住 openresty 那一次写,不该殃及这两项
+				Monitor: &routingv1.MonitorSpec{OutputConfigMap: "monitoring/monitor-conf", Model: name, GPUType: "H100"},
+				SLO:     &routingv1.SLOSpec{Name: "slo-" + name},
+			},
+		}
+	}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	oldMR := mk("ns-old", "old", t0, "10.1.0.1")
+	newMR := mk("ns-new", "new", t0.Add(24*time.Hour), "10.2.0.1")
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+	moncm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "monitor-conf", Namespace: "monitoring"}}
+
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(oldMR, newMR, cm, moncm,
+			sloReq("ns-new", "slo-new", "x", 20, 15), sloReq("ns-old", "slo-old", "x", 20, 15)).
+		WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	pod := func(ns, name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-0", Namespace: ns, Labels: map[string]string{"app": name}},
+			Status: corev1.PodStatus{PodIP: ip, Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+	}
+	cs := k8sfake.NewSimpleClientset(pod("ns-old", "old", "10.1.0.1"), pod("ns-new", "new", "10.2.0.1"))
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nnOld := types.NamespacedName{Namespace: "ns-old", Name: "old"}
+	nnNew := types.NamespacedName{Namespace: "ns-new", Name: "new"}
+	for i := 0; i < 2; i++ {
+		for _, nn := range []types.NamespacedName{nnOld, nnNew} {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("reconcile %s: %v", nn, err)
+			}
+		}
+	}
+	return r, cl, nnOld, nnNew
+}
+
+func sharedKey(t *testing.T, cl client.Client) (string, bool) {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	v, ok := cm.Data["session_route_shared-route.conf"]
+	return v, ok
+}
+
+// 在位者(创建更早)赢;后来者拒绝写入并把冲突写进 status。
+func TestRouteKeyConflict_IncumbentWins(t *testing.T) {
+	_, cl, nnOld, nnNew := conflictFixture(t)
+
+	conf, ok := sharedKey(t, cl)
+	if !ok {
+		t.Fatal("共享 key 应由在位者写入")
+	}
+	// 内容必须是 old 的后端(10.1.0.1),不能被 new 覆盖成 10.2.0.1
+	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
+		t.Errorf("key 被后来者覆盖了\n%s", conf)
+	}
+	if c := condOf(t, cl, nnOld, "Ready"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("在位者应正常,得到 %+v", c)
+	}
+	c := condOf(t, cl, nnNew, "Ready")
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "RouteKeyConflict" {
+		t.Fatalf("后来者应为 False/RouteKeyConflict,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "ns-old/old") || !strings.Contains(c.Message, "spec.nginx.route") {
+		t.Errorf("message 应指出归属者和补救办法,得到 %q", c.Message)
+	}
+}
+
+// 删掉冲突的输家时,**不能**顺手删掉赢家的 key。
+// 输家从没写过这个 key;它一删就是把一条正在服务的路由的配置删掉,
+// 而现场只剩"key 凭空消失",几乎无法归因。
+func TestRouteKeyConflict_LoserDeletionKeepsWinnerKey(t *testing.T) {
+	r, cl, _, nnNew := conflictFixture(t)
+	if _, ok := sharedKey(t, cl); !ok {
+		t.Fatal("前置:赢家的 key 应存在")
+	}
+
+	var loser routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nnNew, &loser); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if err := cl.Delete(context.Background(), &loser); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nnNew}); err != nil {
+		t.Fatalf("reconcile(删除): %v", err)
+	}
+
+	conf, ok := sharedKey(t, cl)
+	if !ok {
+		t.Fatal("赢家的 key 被输家的 finalizer 删掉了")
+	}
+	if !strings.Contains(conf, "10.1.0.1") {
+		t.Errorf("赢家的内容被动过\n%s", conf)
+	}
+}
+
+// 归属规则必须与 reconcile 顺序无关:先 reconcile 后来者,结果不变。
+// 否则"谁赢"随时间漂移,和不判几乎一样糟。
+func TestRouteKeyConflict_OrderIndependent(t *testing.T) {
+	r, cl, nnOld, nnNew := conflictFixture(t)
+	for i := 0; i < 3; i++ {
+		for _, nn := range []types.NamespacedName{nnNew, nnOld, nnNew} { // 故意让后来者多跑
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%v", err)
+			}
+		}
+	}
+	conf, _ := sharedKey(t, cl)
+	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
+		t.Errorf("归属随 reconcile 顺序漂移了\n%s", conf)
+	}
+}
+
+// ── route 改名 ────────────────────────────────────────────────────────────
+//
+// finalizer 和清理逻辑只看得到**当前** spec,推不出改名前叫什么,所以改一次名就会
+// 泄漏一个 key,而 openresty 会继续加载那条陈旧路由(指向改名前的 peers,且再没人更新它)。
+// 2026-09-02 线上 modelforge-0.2 → modelforge-0.2-kimi 改名后就实际留下了一个。
+
+func cmKeys(t *testing.T, cl client.Client) []string {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	var ks []string
+	for k := range cm.Data {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+func renameRoute(t *testing.T, r *ModelRouteReconciler, cl client.Client, nn types.NamespacedName, to string) {
+	t.Helper()
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	rb.Spec.Nginx.Route = to
+	if err := cl.Update(context.Background(), &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("reconcile(改名后): %v", err)
+	}
+}
+
+// 改名后旧 key **保留**(operator 不删:它无法知道还有没有调用方在打旧路径),
+// 但必须被报出来 —— 孤儿不可见正是线上那次问题的本质。
+func TestRouteRename_ReportsOrphanButKeepsIt(t *testing.T) {
+	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+	if got := cmKeys(t, cl); len(got) != 1 || got[0] != "session_route_kimi-k2.5.conf" {
+		t.Fatalf("前置:应只有一个 key,得到 %v", got)
+	}
+
+	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
+
+	got := cmKeys(t, cl)
+	if len(got) != 2 {
+		t.Fatalf("旧 key 不该被 operator 删掉(可能仍在承接流量),期望两个 key,得到 %v", got)
+	}
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if rb.Status.AppliedRouteKey != "session_route_kimi-k2.5-v2.conf" {
+		t.Errorf("status.appliedRouteKey = %q", rb.Status.AppliedRouteKey)
+	}
+	want := "llm-route/openresty-conf:session_route_kimi-k2.5.conf"
+	if len(rb.Status.OrphanRouteKeys) != 1 || rb.Status.OrphanRouteKeys[0] != want {
+		t.Errorf("orphanRouteKeys = %v; want [%s]", rb.Status.OrphanRouteKeys, want)
+	}
+	c := condOf(t, cl, nn, "OrphanRouteKey")
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("应挂 OrphanRouteKey condition,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "session_route_kimi-k2.5.conf") || !strings.Contains(c.Message, "手工") {
+		t.Errorf("message 应指明是哪个 key、且要人工处理,得到 %q", c.Message)
+	}
+}
+
+// 人手工删掉孤儿 key 之后,condition 必须自动摘掉 —— 不然 status 上永久挂着一条已解决的告警,
+// 久了就没人看了。
+func TestRouteRename_OrphanConditionClearsAfterCleanup(t *testing.T) {
+	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
+	if c := condOf(t, cl, nn, "OrphanRouteKey"); c == nil {
+		t.Fatal("前置:应先有 OrphanRouteKey")
+	}
+
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("%v", err)
+	}
+	delete(cm.Data, "session_route_kimi-k2.5.conf") // 模拟人工清理
+	if err := cl.Update(context.Background(), &cm); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	if c := condOf(t, cl, nn, "OrphanRouteKey"); c != nil {
+		t.Errorf("孤儿已清理,condition 应被摘掉,得到 %+v", c)
+	}
+	var rb routingv1.ModelRoute
+	_ = cl.Get(context.Background(), nn, &rb)
+	if len(rb.Status.OrphanRouteKeys) != 0 {
+		t.Errorf("orphanRouteKeys 应清空,得到 %v", rb.Status.OrphanRouteKeys)
+	}
+}
+
+// 改名腾位给别人接手:不是孤儿,不该报。
+func TestRouteRename_NoOrphanWhenTakenOver(t *testing.T) {
+	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+
+	// 另一条路由接手 kimi-k2.5 这个名字(它自己的后端)
+	taker := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "taker", Namespace: "kimi"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: routingv1.Discovery{Selector: "app=kimi", Port: 8050},
+			Nginx: routingv1.NginxSpec{
+				Route: "kimi-k2.5", OutputConfigMap: "llm-route/openresty-conf",
+				Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+			},
+		},
+	}
+	if err := cl.Create(context.Background(), taker); err != nil {
+		t.Fatalf("%v", err)
+	}
+	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
+
+	if c := condOf(t, cl, nn, "OrphanRouteKey"); c != nil {
+		t.Errorf("旧 key 已被别的 ModelRoute 接手,不是孤儿,不该报,得到 %+v", c)
+	}
+	var rb routingv1.ModelRoute
+	_ = cl.Get(context.Background(), nn, &rb)
+	if len(rb.Status.OrphanRouteKeys) != 0 {
+		t.Errorf("orphanRouteKeys 应为空,得到 %v", rb.Status.OrphanRouteKeys)
+	}
+}
+
+// 冲突输家:openresty 写入被拦,但 **monitor 照常同步**。
+// monitor 探的是后端 IP,与 route key 撞名毫无关系;后端还在跑却因为改名撞车丢掉监控是本末倒置,
+// 而且冲突可能挂很久(等人来改名),那段时间恰恰最需要监控。
+func TestRouteKeyConflict_LoserStillSyncsMonitor(t *testing.T) {
+	_, cl, _, _ := conflictFixture(t)
+
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "monitoring", Name: "monitor-conf"}, &cm); err != nil {
+		t.Fatalf("get monitor cm: %v", err)
+	}
+	v, ok := cm.Data["new.monitor.conf"]
+	if !ok {
+		t.Fatalf("输家的 monitor key 缺失(被冲突早退跳过了),现有 keys=%v", keysOf(cm.Data))
+	}
+	if !strings.Contains(v, "10.2.0.1") {
+		t.Errorf("输家的 monitor 行应含自己的后端\n%s", v)
+	}
+}
+
+// 冲突输家不该报 SLOSynced=Synced —— 这一轮根本没写 conf,
+// 说"已下发"会和 Ready=RouteKeyConflict 直接打架,排查时不知道该信哪条。
+func TestRouteKeyConflict_LoserDoesNotClaimSLOSynced(t *testing.T) {
+	_, cl, _, nnNew := conflictFixture(t)
+	if c := condOf(t, cl, nnNew, "SLOSynced"); c != nil && c.Reason == "Synced" {
+		t.Errorf("冲突输家不该声称 SLO 已下发(conf 根本没写),得到 %+v", c)
+	}
+}
+
+func keysOf(m map[string]string) []string {
+	var ks []string
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// 归属必须看**谁实际持有这个 key**,不能只看创建时间。
+//
+// 反例(修复前会踩):MR-A 较新但一直在写 route "x";MR-B 较老,把自己的 route 改成 "x"。
+// 只按 creationTimestamp 判的话 MR-B 赢 —— **一条更老的 ModelRoute 改个名就抢走了一条
+// 正在服务的路由**,连人带流量。这正是这套机制要防的事故,只是入口从"新建"变成"改名"。
+func TestRouteKeyOwner_IncumbentBeatsOlderRenamer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+	_ = slov1.AddToScheme(scheme)
+
+	mk := func(ns, name, route string, created time.Time) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, CreationTimestamp: metav1.NewTime(created)},
+			Spec: routingv1.ModelRouteSpec{
+				Discovery: routingv1.Discovery{Selector: "app=" + name, Port: 8050},
+				Nginx: routingv1.NginxSpec{
+					Route: route, OutputConfigMap: "llm-route/openresty-conf",
+					Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+				},
+			},
+		}
+	}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	incumbent := mk("ns-a", "a", "x", t0.Add(24*time.Hour)) // 较新,但在位
+	older := mk("ns-b", "b", "y", t0)                       // 较老,稍后改名撞过来
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+	pod := func(ns, name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-0", Namespace: ns, Labels: map[string]string{"app": name}},
+			Status: corev1.PodStatus{PodIP: ip, Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+	}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(incumbent, older, cm).
+		WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	cs := k8sfake.NewSimpleClientset(pod("ns-a", "a", "10.1.0.1"), pod("ns-b", "b", "10.2.0.1"))
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nnA := types.NamespacedName{Namespace: "ns-a", Name: "a"}
+	nnB := types.NamespacedName{Namespace: "ns-b", Name: "b"}
+	for i := 0; i < 2; i++ {
+		for _, nn := range []types.NamespacedName{nnA, nnB} {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%v", err)
+			}
+		}
+	}
+	// 前置:A 在位(status 记着 x),conf 是 A 的后端
+	var a routingv1.ModelRoute
+	_ = cl.Get(context.Background(), nnA, &a)
+	if a.Status.AppliedRouteKey != "session_route_x.conf" {
+		t.Fatalf("前置:A 应持有 x,得到 %q", a.Status.AppliedRouteKey)
+	}
+
+	renameRoute(t, r, cl, nnB, "x") // 更老的 B 改名撞过来
+	for i := 0; i < 2; i++ {
+		for _, nn := range []types.NamespacedName{nnA, nnB} {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%v", err)
+			}
+		}
+	}
+
+	var cm2 corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm2); err != nil {
+		t.Fatalf("%v", err)
+	}
+	conf := cm2.Data["session_route_x.conf"]
+	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
+		t.Errorf("在位者 A 的路由被更老的 B 改名抢走了\n%s", conf)
+	}
+	if c := condOf(t, cl, nnA, "Ready"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("在位者应不受影响,得到 %+v", c)
+	}
+	c := condOf(t, cl, nnB, "Ready")
+	if c == nil || c.Reason != "RouteKeyConflict" {
+		t.Errorf("改名撞过来的 B 应判冲突,得到 %+v", c)
 	}
 }

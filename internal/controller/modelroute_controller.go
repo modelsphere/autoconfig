@@ -25,6 +25,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	slov1 "autoconfig/api/inference/v1alpha1"
 	routingv1 "autoconfig/api/v1alpha1"
 	"autoconfig/internal/config"
 	"autoconfig/internal/discovery"
@@ -39,6 +40,10 @@ const (
 	// 要探 dispatch 口 + /<route> 路径(路径路由),autoconfig 按此名从 openresty Service 取端口号
 	//(端口数字只存在于 chart Service,autoconfig 不硬编码)。per-model 路由 conf 只监听 unix socket、不涉端口。
 	dispatchPortName = "dispatch"
+	// sloCondType:SLO 下发结果的 condition 类型(与 "Ready" 分开 —— SLO 下发不了不影响转发)
+	sloCondType = "SLOSynced"
+	// orphanCondType:改名遗留的 openresty key(只报不删)
+	orphanCondType = "OrphanRouteKey"
 )
 
 // ModelRouteReconciler 调谐 ModelRoute。
@@ -56,6 +61,7 @@ type ModelRouteReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
+// +kubebuilder:rbac:groups=inference.x-k8s.io,resources=llmslorequirements,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -195,23 +201,80 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		sources = append(sources, config.RouteSource{Target: s.Use, Priority: s.Priority, MaxConcurrency: mc, ProbePath: probePath})
 	}
 	route := nginxRoute(&rb)
-	// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
-	// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
-	extra := rb.Spec.Nginx.Values
-	if usesBackendSvc(rb.Spec.Nginx.Peers) {
-		extra = withDefaults(extra, map[string]string{"cross_tier_fallback": "true", "max_more_tries": "3"})
-	}
-	conf, err := sink.RenderRoute(sink.RouteData{
-		Route: route,
-		Extra: extra, // 任意调优项,原样渲染
-		Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
-	})
+
+	// 多条 ModelRoute 渲染同一个 openresty key 时,**只有归属者能写**。
+	// 不判的话两边每轮 resync 互相覆盖,而两边的 status 都是 Ready/Synced —— 表现为
+	// "某条路由的后端时多时少",且从任何一条 MR 上都看不出异常。
+	// (2026-09-01 线上真实发生:modelforge-02-kimi 与 modelforge/fallback-modelforge-01
+	//  都用 route=fallback-modelforge-0.1,该路由在 8 后端与 1 后端之间来回翻,每翻一次还带一次 reload。)
+	//
+	// 判定放在**渲染与 SLO 之前**:输家这一轮什么都不会写,那就别去算 SLO ——
+	// 否则 SLOSynced 会写成 "已下发",而 conf 根本没落盘,两条 condition 自相矛盾。
+	// 冲突**只跳过 openresty 这一次写入**,后面的 monitor 照常同步:monitor 探的是后端 IP,
+	// 与 route key 撞名毫无关系,后端还在跑却因为改名撞车丢掉监控是本末倒置 ——
+	// 而且冲突可能挂很久(等人来改名),那段时间恰恰最需要监控。
+	owner, keyConflict, err := r.routeKeyOwner(ctx, &rb)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("render route: %w", err)
+		return ctrl.Result{}, err
 	}
-	if err := r.writeConfigMap(ctx, &rb, rb.Spec.Nginx.OutputConfigMap,
-		map[string]string{openrestyKey(route): conf}); err != nil {
-		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
+
+	if keyConflict {
+		// 输家:不渲染、不写 conf。SLOSynced 一并摘掉 —— 这一轮没有下发任何 conf,
+		// 留着上一次的 "已下发" 会和 Ready=RouteKeyConflict 直接打架。冲突解除后自然恢复。
+		r.clearSLOCondition(ctx, &rb)
+		// 孤儿 condition 仍要维护:它挂在 reconcileRenamedKey 里,而那条路径这一轮被跳过了。
+		// 不补的话,一条"既有孤儿、又处于 key 冲突"的路由,孤儿被人清掉后 condition 也摘不掉,
+		// 要一直等到冲突解决 —— 自愈机制留一个盲区。
+		if err := r.syncOrphanCondition(ctx, &rb); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
+		// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
+		extra := rb.Spec.Nginx.Values
+		if usesBackendSvc(rb.Spec.Nginx.Peers) {
+			extra = withDefaults(extra, map[string]string{"cross_tier_fallback": "true", "max_more_tries": "3"})
+		}
+		// SLO(可选):把匹配本路由的 LLMSLORequirement 翻译成 ttft_metrics / tps_metrics,
+		// 与其它调优项一起渲染进同一份 conf(改 CRD → 重写 conf → reload sidecar SIGHUP)。
+		// 翻译失败**不阻塞 peers 下发** —— peers 才是"不下发就断流"的东西;SLO 缺席只是让
+		// 引擎回落到 conf 里的静态阈值(与接 CRD 前一致)。结果写进 SLOSynced condition
+		// (见 syncSLOCondition:为什么不打 Ready=false、以及为什么不能只打日志)。
+		raw := map[string]string(nil)
+		if s := rb.Spec.SLO; s != nil {
+			m, warns, found, serr := r.sloMetricsFor(ctx, &rb)
+			for _, w := range warns {
+				log.Info("SLO: " + w)
+			}
+			if serr != nil {
+				log.Error(serr, "翻译 LLMSLORequirement 失败,本轮不下发 SLO(openresty 回落静态阈值)")
+			} else if !m.Empty() {
+				raw = sink.WithSLOMetrics(nil, m)
+			}
+			r.syncSLOCondition(ctx, &rb, m, warns, found, serr)
+		} else {
+			// spec.slo 被移除:摘掉 SLOSynced —— 否则曾经的 False/TranslateError 会永久留在
+			// status 上,describe 一直显示一个吓人的失败态,而这条路由早就不用 SLO 了。
+			r.clearSLOCondition(ctx, &rb)
+		}
+		conf, err := sink.RenderRoute(sink.RouteData{
+			Route: route,
+			Extra: extra, // 任意调优项,原样渲染
+			Raw:   raw,   // 已是 lua 字面量的片段(SLO 指标表)
+			Peers: sink.ResolveSources(peersByTarget, sources, "backend"),
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("render route: %w", err)
+		}
+		if err := r.writeConfigMap(ctx, &rb, rb.Spec.Nginx.OutputConfigMap,
+			map[string]string{openrestyKey(route): conf}); err != nil {
+			return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
+		}
+		// 改名收尾:新 key 写成功后,把上一次写的旧 key 摘掉,并记账本次写的是哪个。
+		// 顺序是**先写新、再删旧** —— 反过来的话中间有一段时间这条路由在 openresty 里根本不存在。
+		if err := r.reconcileRenamedKey(ctx, &rb, route); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 4) monitor(可选):service(后端)+ nginx(openresty 入口)+ router(CART)行(共享 ConfigMap,每模型一个 key)
@@ -251,8 +314,411 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// 5) 回写 status
+	if keyConflict {
+		// **在位者赢**(见 routeKeyOwner):新加的错配置永远抢不走一条正在服务的路由。
+		// 放在最后写:monitor 该同步的已经同步完,status 只反映 openresty 那一项没写成。
+		r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "RouteKeyConflict",
+			fmt.Sprintf("openresty key %s 已归属 %s(创建更早)——本路由拒绝写入以免互相覆盖;改 spec.nginx.route 换个名字(monitor 仍照常同步)", openrestyKey(route), owner))
+		return ctrl.Result{RequeueAfter: resyncEvery}, nil
+	}
 	r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), true, "Synced", "synced")
 	return ctrl.Result{RequeueAfter: resyncEvery}, nil
+}
+
+// ── SLO(LLMSLORequirement → session_route_<route>.conf 的 ttft_metrics / tps_metrics)──
+
+// sloName 读本路由声明的 LLMSLORequirement 名字。**只读显式字段,不做推导。**
+func sloName(rb *routingv1.ModelRoute) string {
+	if rb.Spec.SLO == nil {
+		return "" // 防御:两个现有调用点都已 guard,但别让第三个调用点踩 nil panic
+	}
+	return rb.Spec.SLO.Name
+}
+
+// sloMetricsFor 按 spec.slo.name 取 LLMSLORequirement(支持 ns/name 跨 ns),翻译成 lua 指标表。
+// 找不到 → 返回空(引擎回落静态阈值)。这一点必须是"空"而不是"保留上次的值":
+// CRD 被删之后如果还留着旧指标,阈值会永久冻结在删除前那一版。
+// 这里天然满足 —— conf 每轮都整份重渲染,没写进去就是没有。
+// found 区分两种「没有指标」:CRD 压根不存在 vs CRD 存在但没产出可用的 default metrics
+// (比如只写了 ranges —— 本期不支持)。两者都回落静态阈值,但排查方向完全相反,
+// 混成一个 "NoRequirement" 会把人指向错误的地方(去查 serviceId 对不对,而真正的原因
+// 是"你写的是 ranges")。
+func (r *ModelRouteReconciler) sloMetricsFor(ctx context.Context, rb *routingv1.ModelRoute) (m sink.SLOMetrics, warns []string, found bool, err error) {
+	ref := sloName(rb)
+	if ref == "" {
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("spec.slo.name 为空 —— 必须显式声明要读哪个 LLMSLORequirement")
+	}
+	// 按 name 直接 Get:唯一性由 k8s 保证,不会出现"多份匹配、用哪份看 List 顺序"。
+	ns, name := splitNSName(ref, rb.Namespace)
+	var req slov1.LLMSLORequirement
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &req); err != nil {
+		if apierrors.IsNotFound(err) {
+			return sink.SLOMetrics{}, nil, false, nil // 不存在 → 回落静态,由 condition 说明
+		}
+		return sink.SLOMetrics{}, nil, false, fmt.Errorf("get LLMSLORequirement %s/%s: %w", ns, name, err)
+	}
+	m, warns, err = sink.RenderSLOMetrics(req.Spec)
+	return m, warns, true, err
+}
+
+// syncSLOCondition 把 SLO 下发结果写进 status 的 SLOSynced condition。
+//
+// 为什么**不**把 Ready 打成 false:SLO 下发不了不影响转发 —— peers 照常下发,引擎回落到
+// conf 里的静态阈值。把 Ready 打成 false 会让「这条路由通不通」这个信号失真。
+//
+// 为什么**不能只打日志**:本文件其余所有失败路径(DiscoverError / NoBackends /
+// ConfigMapMissing)都写 status,理由同一条 —— 让 kubectl describe 看得到。而 SLO 这里最常见
+// 的失败是**永久性**的(不会自愈、也不随重试变好):spec.slo.name 没写、或写了个不存在的名字。
+// 只进 operator 日志的话,用户会看到一个 Ready=true、却永远没有 SLO 的路由,毫无线索。
+//
+// 只在**内容真的变了**时才写 —— 否则每 10s resync 都会打一次 status update。
+func (r *ModelRouteReconciler) syncSLOCondition(ctx context.Context, rb *routingv1.ModelRoute,
+	m sink.SLOMetrics, warns []string, found bool, serr error) {
+
+	cond := metav1.Condition{Type: sloCondType, Status: metav1.ConditionTrue, Reason: "Synced"}
+	switch {
+	case serr != nil:
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionFalse, "TranslateError", serr.Error()
+	case !found:
+		// 压根没有这个 LLMSLORequirement。不是错误(引擎回落静态),但要能看出来 ——
+		// 否则「配了 slo 却没生效」和「CRD 本来就没建」分不开。
+		// 消息里带上**解析后的 ns/name**,而不是原样的 ref:裸名默认落到 ModelRoute 自己的 ns,
+		// 而跨 ns 引用写错 ns 时,"找不到 glm"和"在 a 这个 ns 里找不到 glm"排查方向完全不同。
+		ns, name := splitNSName(sloName(rb), rb.Namespace)
+		cond.Reason = "NoRequirement"
+		cond.Message = fmt.Sprintf("找不到 LLMSLORequirement %s/%s,使用静态阈值", ns, name)
+	case m.Empty():
+		// CRD **存在**,但没产出可用指标 —— 最典型的就是只写了 ranges(本期不支持)。
+		// 这一条以前和上面那条共用 "NoRequirement" + 「没有匹配的 LLMSLORequirement」,
+		// 会把人指去查 spec.slo.name 对不对,而真正的原因写在 warns 里。
+		cond.Reason = "NothingApplicable"
+		ns, name := splitNSName(sloName(rb), rb.Namespace)
+		cond.Message = fmt.Sprintf("LLMSLORequirement %s/%s 存在,但没有可用的 default metrics,使用静态阈值", ns, name)
+	default:
+		cond.Message = "ttft_metrics/tps_metrics 已下发"
+	}
+	// warns(如 ranges 被忽略)在**所有**分支都带上 —— 它往往就是"为什么没生效"的答案
+	if len(warns) > 0 {
+		cond.Message += ";" + strings.Join(warns, ";")
+	}
+
+	// 与已有的 condition 比对,一致就不写(避免 resync 每轮一次 status update)
+	for _, c := range rb.Status.Conditions {
+		if c.Type == cond.Type && c.Status == cond.Status &&
+			c.Reason == cond.Reason && c.Message == cond.Message {
+			return
+		}
+	}
+	r.updateStatus(ctx, rb, "写 SLOSynced condition 失败", func(cur *routingv1.ModelRoute) {
+		cond.LastTransitionTime = metav1.Now()
+		cond.ObservedGeneration = cur.Generation
+		setCondition(&cur.Status.Conditions, cond)
+	})
+}
+
+// clearSLOCondition 在 spec.slo 被移除后摘掉 SLOSynced。
+// 不做的话,之前留下的 False/TranslateError 会永久挂在 status 上,describe 一直显示失败态,
+// 而这条路由早就不用 SLO 了。只在确实存在时才写。
+func (r *ModelRouteReconciler) clearSLOCondition(ctx context.Context, rb *routingv1.ModelRoute) {
+	present := false
+	for _, c := range rb.Status.Conditions {
+		if c.Type == sloCondType {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return
+	}
+	r.updateStatus(ctx, rb, "摘 SLOSynced condition 失败", func(cur *routingv1.ModelRoute) {
+		removeCondition(&cur.Status.Conditions, sloCondType)
+	})
+}
+
+// updateStatus 读-改-写 status 的公共壳(RetryOnConflict 内重新 Get,避免拿陈旧对象覆盖)。
+func (r *ModelRouteReconciler) updateStatus(ctx context.Context, rb *routingv1.ModelRoute, failMsg string, mutate func(*routingv1.ModelRoute)) {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur routingv1.ModelRoute
+		if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}, &cur); err != nil {
+			return err
+		}
+		mutate(&cur)
+		return r.Status().Update(ctx, &cur)
+	})
+	if err != nil {
+		logf.FromContext(ctx).Error(err, failMsg)
+	}
+}
+
+// modelRoutesForSLO:LLMSLORequirement 变化 → 找出引用了它的 ModelRoute 入队。
+// 没有它,改 CRD 阈值要等 10s resync 才生效(能接受,但事件驱动几乎零成本)。
+//
+// **必须列全 ns**,不能只列 CRD 自己那个 ns:slo.name 支持 "ns/name" 跨 ns 引用,
+// 引用方 ModelRoute 可以在任何 ns 里。只列同 ns 的话,跨 ns 引用会静默退化成
+// "只有 10s resync 才更新"—— 能用,但和同 ns 的行为不一致,排查时极难想到。
+func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client.Object) []reconcile.Request {
+	slo, ok := obj.(*slov1.LLMSLORequirement)
+	if !ok {
+		return nil
+	}
+	var mrs routingv1.ModelRouteList
+	if err := r.List(ctx, &mrs); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range mrs.Items {
+		if mrs.Items[i].Spec.SLO == nil {
+			continue
+		}
+		ns, name := splitNSName(sloName(&mrs.Items[i]), mrs.Items[i].Namespace)
+		if ns == slo.GetNamespace() && name == slo.GetName() {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: mrs.Items[i].Namespace, Name: mrs.Items[i].Name}})
+		}
+	}
+	return reqs
+}
+
+// reconcileRenamedKey 处理 spec.nginx.route(或 nginx.outputConfigMap)改名:把本次写的 key 记进
+// status,并**报告**(不删除)上一次写的那个已经没人认领的旧 key。
+//
+// 范围:**只覆盖 openresty key,有意不覆盖 monitor**。monitor 的 key 是 monitorKey(rb.Name),
+// 而 metadata.name 不可变 → 改名不会遗留 monitor 孤儿;只有改 monitor.outputConfigMap
+// (换一整个 ConfigMap,罕见)才会,那种情况没记账、也不报。要覆盖的话照本函数加一组
+// appliedMonitorKey/ConfigMap 即可 —— 现在不做是权衡,不是漏了。
+//
+// 为什么需要记账:finalizer 和清理逻辑只能看到**当前** spec,推不出改名前叫什么。
+// 不记的话改一次名就泄漏一个 key,而 openresty 会继续加载那条陈旧路由 —— 它指向改名前的 peers,
+// 且没有任何东西再更新它(2026-09-02 线上 modelforge-0.2 → modelforge-0.2-kimi 改名后实际留下了一个)。
+//
+// ⚠️⚠️ **为什么只报不删。** 曾经这里是直接删的,判据是"没有别的 ModelRoute 声明这个 key"。
+// 那个判据不成立:openresty 的 route key 是**面向流量**的,它还有没有人用,取决于
+// phanrouter / 调用方还在不在打 /<旧 route 名>,与 k8s 里有没有对象声明它**毫无关系**。
+// 把"没有对象声明"当成"没人在用",就是在无人看管的情况下删掉一条可能仍在承接流量的路由:
+//
+//	泄漏旧 key → 该路由继续服务,但 peers 陈旧(可能 502)
+//	删掉旧 key → 该路由立刻不存在(必然 404)
+//
+// 哪个更糟取决于还有没有人调它,而 operator 无从知道 —— 这种判断不该由它替人做。
+// 所以改成:挂 OrphanRouteKey condition + 打日志,由人确认无流量后手工删。
+// 孤儿本身不可见才是这次线上问题的本质,让它可见就已经解决了主要矛盾。
+func (r *ModelRouteReconciler) reconcileRenamedKey(ctx context.Context, rb *routingv1.ModelRoute, route string) error {
+	key := openrestyKey(route)
+	cmRef := rb.Spec.Nginx.OutputConfigMap
+	oldKey, oldCM := rb.Status.AppliedRouteKey, rb.Status.AppliedRouteConfigMap
+
+	if oldKey != "" && (oldKey != key || oldCM != cmRef) {
+		claimed, err := r.keyClaimedByOther(ctx, rb, oldCM, oldKey)
+		if err != nil {
+			return err
+		}
+		if claimed {
+			// 改名腾位、别人接手了:没有孤儿,什么都不用做
+			logf.FromContext(ctx).Info("旧 key 已被别的 ModelRoute 接手", "key", oldKey, "cm", oldCM)
+		} else {
+			ns, name := splitNSName(oldCM, rb.Namespace)
+			ref := ns + "/" + name + ":" + oldKey
+			logf.FromContext(ctx).Info("route 改名遗留了一个无人认领的 openresty key,确认无流量后请手工删除", "orphan", ref)
+			r.updateStatus(ctx, rb, "记录孤儿 key 失败", func(cur *routingv1.ModelRoute) {
+				cur.Status.OrphanRouteKeys = appendUnique(cur.Status.OrphanRouteKeys, ref)
+			})
+		}
+	}
+	if oldKey != key || oldCM != cmRef {
+		// 记账失败不阻塞本轮(updateStatus 内部已打日志):status 里还是旧值,下一轮重来,收敛。
+		r.updateStatus(ctx, rb, "记录已写入的 openresty key 失败", func(cur *routingv1.ModelRoute) {
+			cur.Status.AppliedRouteKey, cur.Status.AppliedRouteConfigMap = key, cmRef
+		})
+	}
+	return r.syncOrphanCondition(ctx, rb)
+}
+
+// syncOrphanCondition 维护 OrphanRouteKey condition,并**在孤儿真的消失后自动摘掉** ——
+// 人手工删掉那个 key(或它被别的 ModelRoute 接手)之后,status 上不该继续挂着一条已解决的告警。
+func (r *ModelRouteReconciler) syncOrphanCondition(ctx context.Context, rb *routingv1.ModelRoute) error {
+	var cur routingv1.ModelRoute
+	if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}, &cur); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	var live []string
+	for _, ref := range cur.Status.OrphanRouteKeys {
+		cmRef, key, ok := splitOrphanRef(ref)
+		if !ok {
+			continue // 格式不认识就丢掉,不要卡住
+		}
+		exists, err := r.configMapHasKey(ctx, cmRef, key, rb.Namespace)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue // 已被清理
+		}
+		claimed, err := r.keyClaimedByOther(ctx, rb, cmRef, key)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			live = append(live, ref)
+		}
+	}
+	if len(live) == len(cur.Status.OrphanRouteKeys) && (len(live) > 0) == hasCondition(cur.Status.Conditions, orphanCondType) {
+		return nil // 无变化,别每 10s resync 写一次 status
+	}
+	r.updateStatus(ctx, rb, "更新 OrphanRouteKey condition 失败", func(c *routingv1.ModelRoute) {
+		c.Status.OrphanRouteKeys = live
+		if len(live) == 0 {
+			removeCondition(&c.Status.Conditions, orphanCondType)
+			return
+		}
+		setCondition(&c.Status.Conditions, metav1.Condition{
+			Type: orphanCondType, Status: metav1.ConditionTrue, Reason: "Orphaned",
+			LastTransitionTime: metav1.Now(), ObservedGeneration: c.Generation,
+			Message: fmt.Sprintf("route 改名遗留了无人认领的 openresty key:%s。"+
+				"openresty 仍在加载它(peers 已陈旧,不再更新)。**确认没有流量再打旧路由后**手工从 ConfigMap 删除 —— "+
+				"operator 不自动删:它无法知道还有没有调用方在用旧路径", strings.Join(live, ", ")),
+		})
+	})
+	return nil
+}
+
+// configMapHasKey:ConfigMap(不存在视为无)里有没有这个 key。
+func (r *ModelRouteReconciler) configMapHasKey(ctx context.Context, ref, key, defaultNS string) (bool, error) {
+	ns, name := splitNSName(ref, defaultNS)
+	var cm corev1.ConfigMap
+	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, ok := cm.Data[key]
+	return ok, nil
+}
+
+// splitOrphanRef 拆 "ns/cm:key"。key 里含 ":" 不合法(ConfigMap key 字符集不含冒号),按首个冒号切。
+func splitOrphanRef(ref string) (cmRef, key string, ok bool) {
+	i := strings.Index(ref, ":")
+	if i < 0 {
+		return "", "", false
+	}
+	return ref[:i], ref[i+1:], true
+}
+
+func appendUnique(list []string, v string) []string {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
+func hasCondition(cs []metav1.Condition, t string) bool {
+	for i := range cs {
+		if cs[i].Type == t {
+			return true
+		}
+	}
+	return false
+}
+
+// keyClaimedByOther:除 rb 之外,是否还有(未在删除中的)ModelRoute 渲染 cmRef/key 这一对。
+func (r *ModelRouteReconciler) keyClaimedByOther(ctx context.Context, rb *routingv1.ModelRoute, cmRef, key string) (bool, error) {
+	ns, name := splitNSName(cmRef, rb.Namespace)
+	var all routingv1.ModelRouteList
+	if err := r.List(ctx, &all); err != nil {
+		return false, fmt.Errorf("list ModelRoute(旧 key 归属检查): %w", err)
+	}
+	for i := range all.Items {
+		o := &all.Items[i]
+		if (o.Namespace == rb.Namespace && o.Name == rb.Name) || !o.DeletionTimestamp.IsZero() {
+			continue
+		}
+		ons, oname := splitNSName(o.Spec.Nginx.OutputConfigMap, o.Namespace)
+		if ons == ns && oname == name && openrestyKey(nginxRoute(o)) == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// routeKeyOwner 判断 rb 是不是「目标 ConfigMap + openresty key」这一对的归属者。
+// 返回 (归属者标识, rb 是否为冲突输家, error);无冲突时 conflict=false。
+//
+// 归属规则,按优先级:
+//
+//  1. **真正的在位者赢** —— status.appliedRouteKey 指向这个 key 的那条,也就是"现在正在
+//     服务这条路由的人"。
+//  2. 没人持有(全新的 key,或都是升级前建的老对象没记账)→ **创建更早的赢**,
+//     同刻按 ns/name 字典序。
+//
+// 第 1 条不能省。曾经只有第 2 条,注释还写着"在位者赢",但两者会分叉:一条**创建更早**的
+// ModelRoute 只要把自己的 route 改成别人正在用的名字,就会被判为归属者,把一条**正在服务的**
+// 路由连人带流量抢过去 —— 正是这套机制想防的事故,只是入口从"新建"变成了"改名"。
+// 按谁实际持有 key 来判,才真的是"在位者赢"。
+//
+// 两条规则都与 reconcile 顺序、informer 缓存顺序无关(确定性),否则"谁赢"会随时间漂移,
+// 和不判几乎一样糟。正在删除的(DeletionTimestamp 非空)不参与竞争 —— 它马上就走了。
+func (r *ModelRouteReconciler) routeKeyOwner(ctx context.Context, rb *routingv1.ModelRoute) (string, bool, error) {
+	cmNS, cmName := splitNSName(rb.Spec.Nginx.OutputConfigMap, rb.Namespace)
+	key := openrestyKey(nginxRoute(rb))
+
+	var all routingv1.ModelRouteList
+	if err := r.List(ctx, &all); err != nil {
+		return "", false, fmt.Errorf("list ModelRoute(key 冲突检测): %w", err)
+	}
+	// 候选 = 所有渲染这一对(cm,key)的 ModelRoute,含 rb 自己
+	cands := []*routingv1.ModelRoute{rb}
+	for i := range all.Items {
+		o := &all.Items[i]
+		if (o.Namespace == rb.Namespace && o.Name == rb.Name) || !o.DeletionTimestamp.IsZero() {
+			continue
+		}
+		ns, name := splitNSName(o.Spec.Nginx.OutputConfigMap, o.Namespace)
+		if ns == cmNS && name == cmName && openrestyKey(nginxRoute(o)) == key {
+			cands = append(cands, o)
+		}
+	}
+
+	best := (*routingv1.ModelRoute)(nil)
+	for _, c := range cands { // ① 在位者(实际持有该 key)优先
+		if !holdsKey(c, cmNS, cmName, key) {
+			continue
+		}
+		if best == nil || earlierThan(c, best) { // 理论上只会有一个;真有多个也要确定性
+			best = c
+		}
+	}
+	if best == nil { // ② 无人持有 → 创建更早的赢
+		for _, c := range cands {
+			if best == nil || earlierThan(c, best) {
+				best = c
+			}
+		}
+	}
+	if best == rb {
+		return rb.Namespace + "/" + rb.Name, false, nil
+	}
+	return best.Namespace + "/" + best.Name, true, nil
+}
+
+// holdsKey:这条 ModelRoute 的 status 是否记录着"我上次写的就是这个 key"。
+// 记账从加入 appliedRouteKey 的版本才有,升级前建的老对象一律返回 false → 退回按创建时间判。
+func holdsKey(rb *routingv1.ModelRoute, cmNS, cmName, key string) bool {
+	if rb.Status.AppliedRouteKey != key {
+		return false
+	}
+	ns, name := splitNSName(rb.Status.AppliedRouteConfigMap, rb.Namespace)
+	return ns == cmNS && name == cmName
+}
+
+// earlierThan:创建更早的排前;同刻按 ns/name 字典序(确定性 tie-break)。
+func earlierThan(a, b *routingv1.ModelRoute) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.Namespace+"/"+a.Name < b.Namespace+"/"+b.Name
 }
 
 // openrestyKey 是这条路由在 openresty ConfigMap 里的 key(= 文件名)。
@@ -315,8 +781,26 @@ func (r *ModelRouteReconciler) configMapWriteResult(ctx context.Context, nn type
 // → cart 只接受「仅 workers 变化」的 reload → 整包拒绝 → workers 永久冻结(2026-08-13 mf-fallback 因 route
 // 改名 delete+readd MR 踩坑)。MR 删掉后 cart 也随之下线,残留的 workers 无害;MR 若再加回,base 原样保留。
 func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routingv1.ModelRoute) error {
-	if err := r.removeConfigMapKey(ctx, rb.Spec.Nginx.OutputConfigMap, openrestyKey(nginxRoute(rb)), rb.Namespace); err != nil {
+	// ⚠️ 只删**自己归属**的 key。有 key 冲突时,输家从来没写过这个 key,它删就是把赢家
+	// (一条正在服务的路由)的配置删掉 —— 删掉一个配错的 MR 反而打断线上流量,
+	// 而且现场只剩"key 凭空消失",几乎无法归因。
+	// 删**自己实际写过的**那个 key(status 记账),而不是拿当前 spec 现推 ——
+	// 若删除前刚好改过名、还没轮到 reconcile,现推出来的是新名字,删掉的就是别人的 key。
+	key, cmRef := rb.Status.AppliedRouteKey, rb.Status.AppliedRouteConfigMap
+	if key == "" { // 老对象没有记账(升级前建的),回退到当前 spec
+		key, cmRef = openrestyKey(nginxRoute(rb)), rb.Spec.Nginx.OutputConfigMap
+	}
+	// ⚠️ 只删自己归属的。有 key 冲突时,输家从来没写过这个 key,它删就是把赢家
+	// (一条正在服务的路由)的配置删掉 —— 删掉一个配错的 MR 反而打断线上流量,
+	// 而且现场只剩"key 凭空消失",几乎无法归因。
+	claimed, err := r.keyClaimedByOther(ctx, rb, cmRef, key)
+	if err != nil {
 		return err
+	}
+	if !claimed {
+		if err := r.removeConfigMapKey(ctx, cmRef, key, rb.Namespace); err != nil {
+			return err
+		}
 	}
 	if m := rb.Spec.Monitor; m != nil {
 		if err := r.removeConfigMapKey(ctx, m.OutputConfigMap, monitorKey(rb.Name), rb.Namespace); err != nil {
@@ -372,6 +856,16 @@ func (r *ModelRouteReconciler) setStatus(ctx context.Context, nn types.Namespace
 	if err != nil {
 		log.Error(err, "update status failed")
 	}
+}
+
+func removeCondition(conds *[]metav1.Condition, typ string) {
+	out := (*conds)[:0]
+	for _, c := range *conds {
+		if c.Type != typ {
+			out = append(out, c)
+		}
+	}
+	*conds = out
 }
 
 func setCondition(conds *[]metav1.Condition, c metav1.Condition) {
@@ -449,6 +943,10 @@ func (r *ModelRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&routingv1.ModelRoute{}).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForEndpointSlice), builder.OnlyMetadata).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForPod), builder.OnlyMetadata).
+		// LLMSLORequirement 不能用 OnlyMetadata:映射函数现在只看 name/namespace(够了),
+		// 但 sloMetricsFor 的 typed Get 走的是同一个 informer cache —— cache 只存元数据的话
+		// 就读不到 spec.ttft/otps 了。
+		Watches(&slov1.LLMSLORequirement{}, handler.EnqueueRequestsFromMapFunc(r.modelRoutesForSLO)).
 		Complete(r)
 }
 

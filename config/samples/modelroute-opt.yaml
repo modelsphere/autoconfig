@@ -32,6 +32,9 @@ spec:
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart(并发上限随后端数自动变)
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
     - { use: backend-svc, priority: 1 }                                   # 兜底:后端 Service VIP(operator 挂时靠它)
+  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+    name: opt-13b                       # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
+    # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。
   monitor:                            # 可选:monitor 的 service/nginx/router 行
     model: opt-125m                   # served-model-name(monitor 展示用)
     gpuType: A100

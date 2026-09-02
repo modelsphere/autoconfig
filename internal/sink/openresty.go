@@ -34,6 +34,10 @@ var defaultRouteTmpl string
 type RouteData struct {
 	Route string
 	Extra map[string]string
+	// Raw 是**已经是 lua 字面量**的片段(如 ttft_metrics 的嵌套 table),模板里原样输出、
+	// 不过 luaVal。Extra 走 luaVal 会把非数字值加引号 —— 对 table 而言那就成了字符串,
+	// 引擎读到的类型不对。仅由 operator 自己生成,不承载用户自由文本。
+	Raw   map[string]string
 	Peers []config.Peer
 }
 

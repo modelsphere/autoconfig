@@ -29,6 +29,9 @@ spec:
       - { use: backend-svc, priority: 1 }                                  # 后端 Service ClusterIP【静态兜底】:operator 宕+rollout
                                                                            #   致 pod-IP 层全死时级联到 VIP(kube-proxy 维护)→ 降级不全断
   # (backend-svc 需 discovery.service;selector 模式无 VIP 会被自动跳过)
+  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+    name: glm                           # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
+    # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。
   monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
     outputConfigMap: monitor/monitor-conf   # 【共享】一个 monitor 看所有模型;每模型一个 key(glm-5.1.monitor.conf)
     model: glm-5.1-fp8               # served-model-name;省略则用 metadata.name(glm-5.1)。名字比 CR 详细时在这给
@@ -53,3 +56,6 @@ spec:
     outputConfigMap: openresty/openresty-conf
     peers:
       - { use: backend }
+  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+    name: kimi-k26                      # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
+    # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。

@@ -26,6 +26,18 @@ server {
 {{- range $k, $v := .Extra}}
                 {{$k}} = {{luaVal $v}},
 {{- end}}
+{{- /* Raw:已经是 lua 字面量的片段(如 ttft_metrics 的嵌套 table),原样输出不加引号。
+       只由 operator 自己生成(见 sink/slo.go),不接受用户自由文本 —— 走 luaVal 会被
+       整个当成字符串加引号,引擎读到的就不是 table 了。
+
+       ⚠️⚠️ **这段必须排在 .Extra 之后,顺序有语义**:两边出现同名键时(用户在
+       nginx.values 里手写了 ttft_metrics),lua 表构造式里**后写的赢**。排在后面 →
+       CRD 的 table 生效;若被挪到前面 → 引擎收到的是 Extra 那份加了引号的字符串 →
+       validate_metrics 整份丢弃 → **静默降级成静态阈值**,而且从 source 上看不出异常。
+       TestRenderRoute_RawWinsOverExtra 专门守这个顺序,别绕过它重排。 */}}
+{{- range $k, $v := .Raw}}
+                {{$k}} = {{$v}},
+{{- end}}
             }
         end)
         return ""

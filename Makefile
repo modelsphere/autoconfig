@@ -19,7 +19,10 @@ all: build
 
 .PHONY: manifests
 manifests: ## 生成 CRD + RBAC(从 marker),并同步 CRD + RBAC rules 到 Helm chart(单一来源)。
-	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd/bases
+	@# crd 只扫 ./api/v1alpha1 —— 【不能用 ./api/...】:api/inference/v1alpha1 是别人的 CRD
+	@# (LLMSLORequirement)的只读类型,我们不拥有它、不该发布它的 CRD;扫进来会产出一份
+	@# group/kind 全空的 config/crd/bases/_.yaml 垃圾文件。
+	$(CONTROLLER_GEN) crd paths=./api/v1alpha1 output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=manager-role paths=./... output:rbac:artifacts:config=config/rbac
 	cp config/crd/bases/routing.gpucluster.io_modelroutes.yaml $(HELM_CRD)
 	@# RBAC 单一来源:kubebuilder marker → config/rbac/role.yaml → 抽出 rules 块同步进 helm chart

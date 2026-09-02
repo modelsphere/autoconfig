@@ -54,6 +54,14 @@
   - list
   - watch
 - apiGroups:
+  - inference.x-k8s.io
+  resources:
+  - llmslorequirements
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - routing.gpucluster.io
   resources:
   - modelroutes
