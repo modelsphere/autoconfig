@@ -779,3 +779,84 @@ func keysOf(m map[string]string) []string {
 	sort.Strings(ks)
 	return ks
 }
+
+// 归属必须看**谁实际持有这个 key**,不能只看创建时间。
+//
+// 反例(修复前会踩):MR-A 较新但一直在写 route "x";MR-B 较老,把自己的 route 改成 "x"。
+// 只按 creationTimestamp 判的话 MR-B 赢 —— **一条更老的 ModelRoute 改个名就抢走了一条
+// 正在服务的路由**,连人带流量。这正是这套机制要防的事故,只是入口从"新建"变成"改名"。
+func TestRouteKeyOwner_IncumbentBeatsOlderRenamer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+	_ = slov1.AddToScheme(scheme)
+
+	mk := func(ns, name, route string, created time.Time) *routingv1.ModelRoute {
+		return &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, CreationTimestamp: metav1.NewTime(created)},
+			Spec: routingv1.ModelRouteSpec{
+				Discovery: routingv1.Discovery{Selector: "app=" + name, Port: 8050},
+				Nginx: routingv1.NginxSpec{
+					Route: route, OutputConfigMap: "llm-route/openresty-conf",
+					Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+				},
+			},
+		}
+	}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	incumbent := mk("ns-a", "a", "x", t0.Add(24*time.Hour)) // 较新,但在位
+	older := mk("ns-b", "b", "y", t0)                       // 较老,稍后改名撞过来
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "llm-route"}}
+	pod := func(ns, name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-0", Namespace: ns, Labels: map[string]string{"app": name}},
+			Status: corev1.PodStatus{PodIP: ip, Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+	}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(incumbent, older, cm).
+		WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	cs := k8sfake.NewSimpleClientset(pod("ns-a", "a", "10.1.0.1"), pod("ns-b", "b", "10.2.0.1"))
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nnA := types.NamespacedName{Namespace: "ns-a", Name: "a"}
+	nnB := types.NamespacedName{Namespace: "ns-b", Name: "b"}
+	for i := 0; i < 2; i++ {
+		for _, nn := range []types.NamespacedName{nnA, nnB} {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%v", err)
+			}
+		}
+	}
+	// 前置:A 在位(status 记着 x),conf 是 A 的后端
+	var a routingv1.ModelRoute
+	_ = cl.Get(context.Background(), nnA, &a)
+	if a.Status.AppliedRouteKey != "session_route_x.conf" {
+		t.Fatalf("前置:A 应持有 x,得到 %q", a.Status.AppliedRouteKey)
+	}
+
+	renameRoute(t, r, cl, nnB, "x") // 更老的 B 改名撞过来
+	for i := 0; i < 2; i++ {
+		for _, nn := range []types.NamespacedName{nnA, nnB} {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%v", err)
+			}
+		}
+	}
+
+	var cm2 corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm2); err != nil {
+		t.Fatalf("%v", err)
+	}
+	conf := cm2.Data["session_route_x.conf"]
+	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
+		t.Errorf("在位者 A 的路由被更老的 B 改名抢走了\n%s", conf)
+	}
+	if c := condOf(t, cl, nnA, "Ready"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("在位者应不受影响,得到 %+v", c)
+	}
+	c := condOf(t, cl, nnB, "Ready")
+	if c == nil || c.Reason != "RouteKeyConflict" {
+		t.Errorf("改名撞过来的 B 应判冲突,得到 %+v", c)
+	}
+}

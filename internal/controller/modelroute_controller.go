@@ -218,13 +218,19 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
-	// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
 	if keyConflict {
 		// 输家:不渲染、不写 conf。SLOSynced 一并摘掉 —— 这一轮没有下发任何 conf,
 		// 留着上一次的 "已下发" 会和 Ready=RouteKeyConflict 直接打架。冲突解除后自然恢复。
 		r.clearSLOCondition(ctx, &rb)
+		// 孤儿 condition 仍要维护:它挂在 reconcileRenamedKey 里,而那条路径这一轮被跳过了。
+		// 不补的话,一条"既有孤儿、又处于 key 冲突"的路由,孤儿被人清掉后 condition 也摘不掉,
+		// 要一直等到冲突解决 —— 自愈机制留一个盲区。
+		if err := r.syncOrphanCondition(ctx, &rb); err != nil {
+			return ctrl.Result{}, err
+		}
 	} else {
+		// 有 backend-svc VIP 兜底层时,默认开跨层 retry:高优层(如 cart)返 5xx → proxy_next_upstream 单请求
+		// 即刻兜到低优 VIP,不必等 health-timer ban 掉高优层(省 ~30-45s 空窗)。用户在 nginx.values 显式设则尊重。
 		extra := rb.Spec.Nginx.Values
 		if usesBackendSvc(rb.Spec.Nginx.Peers) {
 			extra = withDefaults(extra, map[string]string{"cross_tier_fallback": "true", "max_more_tries": "3"})
@@ -640,11 +646,20 @@ func (r *ModelRouteReconciler) keyClaimedByOther(ctx context.Context, rb *routin
 // routeKeyOwner 判断 rb 是不是「目标 ConfigMap + openresty key」这一对的归属者。
 // 返回 (归属者标识, rb 是否为冲突输家, error);无冲突时 conflict=false。
 //
-// 归属规则:**创建更早的赢**,同刻则按 ns/name 字典序 —— 必须是与 reconcile 顺序、
-// informer 缓存顺序完全无关的确定性规则,否则"谁赢"会随时间漂移,和不判几乎一样糟。
-// 选"在位者赢"而不是"后来者赢":一条新加的错配置不该能抢走一条正在服务的路由。
+// 归属规则,按优先级:
 //
-// 正在删除的(DeletionTimestamp 非空)不参与竞争 —— 它马上就走了,不该继续压着别人。
+//  1. **真正的在位者赢** —— status.appliedRouteKey 指向这个 key 的那条,也就是"现在正在
+//     服务这条路由的人"。
+//  2. 没人持有(全新的 key,或都是升级前建的老对象没记账)→ **创建更早的赢**,
+//     同刻按 ns/name 字典序。
+//
+// 第 1 条不能省。曾经只有第 2 条,注释还写着"在位者赢",但两者会分叉:一条**创建更早**的
+// ModelRoute 只要把自己的 route 改成别人正在用的名字,就会被判为归属者,把一条**正在服务的**
+// 路由连人带流量抢过去 —— 正是这套机制想防的事故,只是入口从"新建"变成了"改名"。
+// 按谁实际持有 key 来判,才真的是"在位者赢"。
+//
+// 两条规则都与 reconcile 顺序、informer 缓存顺序无关(确定性),否则"谁赢"会随时间漂移,
+// 和不判几乎一样糟。正在删除的(DeletionTimestamp 非空)不参与竞争 —— 它马上就走了。
 func (r *ModelRouteReconciler) routeKeyOwner(ctx context.Context, rb *routingv1.ModelRoute) (string, bool, error) {
 	cmNS, cmName := splitNSName(rb.Spec.Nginx.OutputConfigMap, rb.Namespace)
 	key := openrestyKey(nginxRoute(rb))
@@ -653,27 +668,49 @@ func (r *ModelRouteReconciler) routeKeyOwner(ctx context.Context, rb *routingv1.
 	if err := r.List(ctx, &all); err != nil {
 		return "", false, fmt.Errorf("list ModelRoute(key 冲突检测): %w", err)
 	}
-	best := rb
+	// 候选 = 所有渲染这一对(cm,key)的 ModelRoute,含 rb 自己
+	cands := []*routingv1.ModelRoute{rb}
 	for i := range all.Items {
 		o := &all.Items[i]
-		if o.Namespace == rb.Namespace && o.Name == rb.Name {
-			continue
-		}
-		if !o.DeletionTimestamp.IsZero() {
+		if (o.Namespace == rb.Namespace && o.Name == rb.Name) || !o.DeletionTimestamp.IsZero() {
 			continue
 		}
 		ns, name := splitNSName(o.Spec.Nginx.OutputConfigMap, o.Namespace)
-		if ns != cmNS || name != cmName || openrestyKey(nginxRoute(o)) != key {
+		if ns == cmNS && name == cmName && openrestyKey(nginxRoute(o)) == key {
+			cands = append(cands, o)
+		}
+	}
+
+	best := (*routingv1.ModelRoute)(nil)
+	for _, c := range cands { // ① 在位者(实际持有该 key)优先
+		if !holdsKey(c, cmNS, cmName, key) {
 			continue
 		}
-		if earlierThan(o, best) {
-			best = o
+		if best == nil || earlierThan(c, best) { // 理论上只会有一个;真有多个也要确定性
+			best = c
+		}
+	}
+	if best == nil { // ② 无人持有 → 创建更早的赢
+		for _, c := range cands {
+			if best == nil || earlierThan(c, best) {
+				best = c
+			}
 		}
 	}
 	if best == rb {
 		return rb.Namespace + "/" + rb.Name, false, nil
 	}
 	return best.Namespace + "/" + best.Name, true, nil
+}
+
+// holdsKey:这条 ModelRoute 的 status 是否记录着"我上次写的就是这个 key"。
+// 记账从加入 appliedRouteKey 的版本才有,升级前建的老对象一律返回 false → 退回按创建时间判。
+func holdsKey(rb *routingv1.ModelRoute, cmNS, cmName, key string) bool {
+	if rb.Status.AppliedRouteKey != key {
+		return false
+	}
+	ns, name := splitNSName(rb.Status.AppliedRouteConfigMap, rb.Namespace)
+	return ns == cmNS && name == cmName
 }
 
 // earlierThan:创建更早的排前;同刻按 ns/name 字典序(确定性 tie-break)。

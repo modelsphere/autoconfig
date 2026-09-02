@@ -41,7 +41,8 @@ func runController(leaderElect bool) error {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(routingv1.AddToScheme(scheme))
-	// LLMSLORequirement 是别人的 CRD,我们只读(翻译成 openresty 的 slo.json)。
+	// LLMSLORequirement 是别人的 CRD,我们只读(翻译成 openresty route conf 里的
+	// ttft_metrics / tps_metrics,与 peers 走同一条 ConfigMap + reload 通道)。
 	utilruntime.Must(slov1.AddToScheme(scheme))
 
 	cfg, err := ctrl.GetConfig()

@@ -68,7 +68,9 @@ type SLOTarget struct {
 // LLMSLORequirementSpec 只声明 autoconfig 读的字段。
 // priority / minimumDeployment / maximumDeployment 归 autoscaler,路由层不读,故不在此声明。
 type LLMSLORequirementSpec struct {
-	// ServiceID 指向目标服务;autoconfig 靠它反查 ModelRoute(见 controller 的 sloForModelRoute)。
+	// ServiceID 指向目标服务。**autoconfig 不用它做关联** —— ModelRoute 通过 spec.slo.name
+	// 按 metadata.name 显式引用本对象(见 controller 的 sloMetricsFor)。留着只是为了忠实
+	// 描述这个 CRD 的形状,以及让 kubectl 输出/调试时看得到它。
 	ServiceID string     `json:"serviceId"`
 	TTFT      *SLOTarget `json:"ttft,omitempty"`
 	OTPS      *SLOTarget `json:"otps,omitempty"`
