@@ -326,6 +326,13 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              orphanRouteKeys:
+                description: |-
+                  OrphanRouteKeys:改名后遗留、已无任何 ModelRoute 声明的 openresty key(格式 "ns/cm:key")。
+                  **只报不删** —— 见 reportOrphanKeys 里为什么不能由 operator 自动删。
+                items:
+                  type: string
+                type: array
               ready:
                 type: boolean
             required:

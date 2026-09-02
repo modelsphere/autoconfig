@@ -137,6 +137,11 @@ func (in *ModelRouteStatus) DeepCopyInto(out *ModelRouteStatus) {
 		in, out := &in.LastSyncTime, &out.LastSyncTime
 		*out = (*in).DeepCopy()
 	}
+	if in.OrphanRouteKeys != nil {
+		in, out := &in.OrphanRouteKeys, &out.OrphanRouteKeys
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

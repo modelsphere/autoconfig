@@ -42,6 +42,8 @@ const (
 	dispatchPortName = "dispatch"
 	// sloCondType:SLO 下发结果的 condition 类型(与 "Ready" 分开 —— SLO 下发不了不影响转发)
 	sloCondType = "SLOSynced"
+	// orphanCondType:改名遗留的 openresty key(只报不删)
+	orphanCondType = "OrphanRouteKey"
 )
 
 // ModelRouteReconciler 调谐 ModelRoute。
@@ -454,39 +456,143 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 	return reqs
 }
 
-// reconcileRenamedKey 处理 spec.nginx.route(或 outputConfigMap)改名:删掉上一次写的旧 key,
-// 并把本次写的记进 status。
+// reconcileRenamedKey 处理 spec.nginx.route(或 outputConfigMap)改名:把本次写的 key 记进
+// status,并**报告**(不删除)上一次写的那个已经没人认领的旧 key。
 //
 // 为什么需要记账:finalizer 和清理逻辑只能看到**当前** spec,推不出改名前叫什么。
 // 不记的话改一次名就泄漏一个 key,而 openresty 会继续加载那条陈旧路由 —— 它指向改名前的 peers,
 // 且没有任何东西再更新它(2026-09-02 线上 modelforge-0.2 → modelforge-0.2-kimi 改名后实际留下了一个)。
 //
-// ⚠️ 删旧 key 前必须确认**现在没有别的 ModelRoute 归属它**:我们改名让出这个 key 之后,
-// 另一条路由完全可能合法地接手(改名腾位正是常见动机)。此时删掉就是删别人的配置。
+// ⚠️⚠️ **为什么只报不删。** 曾经这里是直接删的,判据是"没有别的 ModelRoute 声明这个 key"。
+// 那个判据不成立:openresty 的 route key 是**面向流量**的,它还有没有人用,取决于
+// phanrouter / 调用方还在不在打 /<旧 route 名>,与 k8s 里有没有对象声明它**毫无关系**。
+// 把"没有对象声明"当成"没人在用",就是在无人看管的情况下删掉一条可能仍在承接流量的路由:
+//
+//	泄漏旧 key → 该路由继续服务,但 peers 陈旧(可能 502)
+//	删掉旧 key → 该路由立刻不存在(必然 404)
+//
+// 哪个更糟取决于还有没有人调它,而 operator 无从知道 —— 这种判断不该由它替人做。
+// 所以改成:挂 OrphanRouteKey condition + 打日志,由人确认无流量后手工删。
+// 孤儿本身不可见才是这次线上问题的本质,让它可见就已经解决了主要矛盾。
 func (r *ModelRouteReconciler) reconcileRenamedKey(ctx context.Context, rb *routingv1.ModelRoute, route string) error {
 	key := openrestyKey(route)
 	cmRef := rb.Spec.Nginx.OutputConfigMap
 	oldKey, oldCM := rb.Status.AppliedRouteKey, rb.Status.AppliedRouteConfigMap
-	if oldKey == key && oldCM == cmRef {
-		return nil // 没改名,常态,零开销
-	}
-	if oldKey != "" {
+
+	if oldKey != "" && (oldKey != key || oldCM != cmRef) {
 		claimed, err := r.keyClaimedByOther(ctx, rb, oldCM, oldKey)
 		if err != nil {
 			return err
 		}
 		if claimed {
-			logf.FromContext(ctx).Info("旧 key 已被别的 ModelRoute 接手,不删", "key", oldKey, "cm", oldCM)
-		} else if err := r.removeConfigMapKey(ctx, oldCM, oldKey, rb.Namespace); err != nil {
-			return err
+			// 改名腾位、别人接手了:没有孤儿,什么都不用做
+			logf.FromContext(ctx).Info("旧 key 已被别的 ModelRoute 接手", "key", oldKey, "cm", oldCM)
+		} else {
+			ns, name := splitNSName(oldCM, rb.Namespace)
+			ref := ns + "/" + name + ":" + oldKey
+			logf.FromContext(ctx).Info("route 改名遗留了一个无人认领的 openresty key,确认无流量后请手工删除", "orphan", ref)
+			r.updateStatus(ctx, rb, "记录孤儿 key 失败", func(cur *routingv1.ModelRoute) {
+				cur.Status.OrphanRouteKeys = appendUnique(cur.Status.OrphanRouteKeys, ref)
+			})
 		}
 	}
-	// 记账失败不阻塞本轮(updateStatus 内部已打日志):status 里还是旧值,
-	// 下一轮会再删一次旧 key(已不存在,no-op)再记一次账,收敛。
-	r.updateStatus(ctx, rb, "记录已写入的 openresty key 失败", func(cur *routingv1.ModelRoute) {
-		cur.Status.AppliedRouteKey, cur.Status.AppliedRouteConfigMap = key, cmRef
+	if oldKey != key || oldCM != cmRef {
+		// 记账失败不阻塞本轮(updateStatus 内部已打日志):status 里还是旧值,下一轮重来,收敛。
+		r.updateStatus(ctx, rb, "记录已写入的 openresty key 失败", func(cur *routingv1.ModelRoute) {
+			cur.Status.AppliedRouteKey, cur.Status.AppliedRouteConfigMap = key, cmRef
+		})
+	}
+	return r.syncOrphanCondition(ctx, rb)
+}
+
+// syncOrphanCondition 维护 OrphanRouteKey condition,并**在孤儿真的消失后自动摘掉** ——
+// 人手工删掉那个 key(或它被别的 ModelRoute 接手)之后,status 上不该继续挂着一条已解决的告警。
+func (r *ModelRouteReconciler) syncOrphanCondition(ctx context.Context, rb *routingv1.ModelRoute) error {
+	var cur routingv1.ModelRoute
+	if err := r.Get(ctx, types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}, &cur); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	var live []string
+	for _, ref := range cur.Status.OrphanRouteKeys {
+		cmRef, key, ok := splitOrphanRef(ref)
+		if !ok {
+			continue // 格式不认识就丢掉,不要卡住
+		}
+		exists, err := r.configMapHasKey(ctx, cmRef, key, rb.Namespace)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue // 已被清理
+		}
+		claimed, err := r.keyClaimedByOther(ctx, rb, cmRef, key)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			live = append(live, ref)
+		}
+	}
+	if len(live) == len(cur.Status.OrphanRouteKeys) && (len(live) > 0) == hasCondition(cur.Status.Conditions, orphanCondType) {
+		return nil // 无变化,别每 10s resync 写一次 status
+	}
+	r.updateStatus(ctx, rb, "更新 OrphanRouteKey condition 失败", func(c *routingv1.ModelRoute) {
+		c.Status.OrphanRouteKeys = live
+		if len(live) == 0 {
+			removeCondition(&c.Status.Conditions, orphanCondType)
+			return
+		}
+		setCondition(&c.Status.Conditions, metav1.Condition{
+			Type: orphanCondType, Status: metav1.ConditionTrue, Reason: "Orphaned",
+			LastTransitionTime: metav1.Now(), ObservedGeneration: c.Generation,
+			Message: fmt.Sprintf("route 改名遗留了无人认领的 openresty key:%s。"+
+				"openresty 仍在加载它(peers 已陈旧,不再更新)。**确认没有流量再打旧路由后**手工从 ConfigMap 删除 —— "+
+				"operator 不自动删:它无法知道还有没有调用方在用旧路径", strings.Join(live, ", ")),
+		})
 	})
 	return nil
+}
+
+// configMapHasKey:ConfigMap(不存在视为无)里有没有这个 key。
+func (r *ModelRouteReconciler) configMapHasKey(ctx context.Context, ref, key, defaultNS string) (bool, error) {
+	ns, name := splitNSName(ref, defaultNS)
+	var cm corev1.ConfigMap
+	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, ok := cm.Data[key]
+	return ok, nil
+}
+
+// splitOrphanRef 拆 "ns/cm:key"。key 里含 ":" 不合法(ConfigMap key 字符集不含冒号),按首个冒号切。
+func splitOrphanRef(ref string) (cmRef, key string, ok bool) {
+	i := strings.Index(ref, ":")
+	if i < 0 {
+		return "", "", false
+	}
+	return ref[:i], ref[i+1:], true
+}
+
+func appendUnique(list []string, v string) []string {
+	for _, x := range list {
+		if x == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
+func hasCondition(cs []metav1.Condition, t string) bool {
+	for i := range cs {
+		if cs[i].Type == t {
+			return true
+		}
+	}
+	return false
 }
 
 // keyClaimedByOther:除 rb 之外,是否还有(未在删除中的)ModelRoute 渲染 cmRef/key 这一对。

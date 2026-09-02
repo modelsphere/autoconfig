@@ -640,7 +640,9 @@ func renameRoute(t *testing.T, r *ModelRouteReconciler, cl client.Client, nn typ
 	}
 }
 
-func TestRouteRename_RemovesOldKey(t *testing.T) {
+// 改名后旧 key **保留**(operator 不删:它无法知道还有没有调用方在打旧路径),
+// 但必须被报出来 —— 孤儿不可见正是线上那次问题的本质。
+func TestRouteRename_ReportsOrphanButKeepsIt(t *testing.T) {
 	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
 	if got := cmKeys(t, cl); len(got) != 1 || got[0] != "session_route_kimi-k2.5.conf" {
 		t.Fatalf("前置:应只有一个 key,得到 %v", got)
@@ -649,10 +651,9 @@ func TestRouteRename_RemovesOldKey(t *testing.T) {
 	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
 
 	got := cmKeys(t, cl)
-	if len(got) != 1 || got[0] != "session_route_kimi-k2.5-v2.conf" {
-		t.Fatalf("改名后应只剩新 key(旧 key 泄漏会让 openresty 继续服务陈旧路由),得到 %v", got)
+	if len(got) != 2 {
+		t.Fatalf("旧 key 不该被 operator 删掉(可能仍在承接流量),期望两个 key,得到 %v", got)
 	}
-	// status 要记住实际写的是哪个,否则下次改名/删除又推不出来
 	var rb routingv1.ModelRoute
 	if err := cl.Get(context.Background(), nn, &rb); err != nil {
 		t.Fatalf("%v", err)
@@ -660,10 +661,53 @@ func TestRouteRename_RemovesOldKey(t *testing.T) {
 	if rb.Status.AppliedRouteKey != "session_route_kimi-k2.5-v2.conf" {
 		t.Errorf("status.appliedRouteKey = %q", rb.Status.AppliedRouteKey)
 	}
+	want := "llm-route/openresty-conf:session_route_kimi-k2.5.conf"
+	if len(rb.Status.OrphanRouteKeys) != 1 || rb.Status.OrphanRouteKeys[0] != want {
+		t.Errorf("orphanRouteKeys = %v; want [%s]", rb.Status.OrphanRouteKeys, want)
+	}
+	c := condOf(t, cl, nn, "OrphanRouteKey")
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("应挂 OrphanRouteKey condition,得到 %+v", c)
+	}
+	if !strings.Contains(c.Message, "session_route_kimi-k2.5.conf") || !strings.Contains(c.Message, "手工") {
+		t.Errorf("message 应指明是哪个 key、且要人工处理,得到 %q", c.Message)
+	}
 }
 
-// 改名腾位:让出的旧 key 被另一条 ModelRoute 接手时,**不能**顺手删掉 —— 那是别人的配置了。
-func TestRouteRename_KeepsOldKeyWhenTakenOver(t *testing.T) {
+// 人手工删掉孤儿 key 之后,condition 必须自动摘掉 —— 不然 status 上永久挂着一条已解决的告警,
+// 久了就没人看了。
+func TestRouteRename_OrphanConditionClearsAfterCleanup(t *testing.T) {
+	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
+	if c := condOf(t, cl, nn, "OrphanRouteKey"); c == nil {
+		t.Fatal("前置:应先有 OrphanRouteKey")
+	}
+
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("%v", err)
+	}
+	delete(cm.Data, "session_route_kimi-k2.5.conf") // 模拟人工清理
+	if err := cl.Update(context.Background(), &cm); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	if c := condOf(t, cl, nn, "OrphanRouteKey"); c != nil {
+		t.Errorf("孤儿已清理,condition 应被摘掉,得到 %+v", c)
+	}
+	var rb routingv1.ModelRoute
+	_ = cl.Get(context.Background(), nn, &rb)
+	if len(rb.Status.OrphanRouteKeys) != 0 {
+		t.Errorf("orphanRouteKeys 应清空,得到 %v", rb.Status.OrphanRouteKeys)
+	}
+}
+
+// 改名腾位给别人接手:不是孤儿,不该报。
+func TestRouteRename_NoOrphanWhenTakenOver(t *testing.T) {
 	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
 
 	// 另一条路由接手 kimi-k2.5 这个名字(它自己的后端)
@@ -682,8 +726,12 @@ func TestRouteRename_KeepsOldKeyWhenTakenOver(t *testing.T) {
 	}
 	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
 
-	got := cmKeys(t, cl)
-	if len(got) != 2 {
-		t.Fatalf("旧 key 已被接手,不该删;期望两个 key,得到 %v", got)
+	if c := condOf(t, cl, nn, "OrphanRouteKey"); c != nil {
+		t.Errorf("旧 key 已被别的 ModelRoute 接手,不是孤儿,不该报,得到 %+v", c)
+	}
+	var rb routingv1.ModelRoute
+	_ = cl.Get(context.Background(), nn, &rb)
+	if len(rb.Status.OrphanRouteKeys) != 0 {
+		t.Errorf("orphanRouteKeys 应为空,得到 %v", rb.Status.OrphanRouteKeys)
 	}
 }

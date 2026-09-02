@@ -164,6 +164,9 @@ type ModelRouteStatus struct {
 	// 结果就是改一次名泄漏一个 key,而 openresty 会继续加载那条陈旧路由(指向改名前的 peers)。
 	AppliedRouteKey       string `json:"appliedRouteKey,omitempty"`
 	AppliedRouteConfigMap string `json:"appliedRouteConfigMap,omitempty"`
+	// OrphanRouteKeys:改名后遗留、已无任何 ModelRoute 声明的 openresty key(格式 "ns/cm:key")。
+	// **只报不删** —— 见 reportOrphanKeys 里为什么不能由 operator 自动删。
+	OrphanRouteKeys []string `json:"orphanRouteKeys,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 
