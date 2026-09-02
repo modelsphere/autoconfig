@@ -37,7 +37,7 @@ spec:
     # use: backend(可再加一条 backend-svc priority 更低作兜底,会渲染成 nginx 的 backup)。
     peers:
       - use: backend-svc
-    values:                                # video 只认这三个旋钮(其余会被 CEL 拒)
+    values:                                # video 只认这几个旋钮(其余会被 CEL 拒)
       max_body_size: 64m                   # I2V 允许 base64 传图,上游自己在 64MB 处拒
       proxy_timeout: 3600s                 # 生成 + 大文件下载,超时按小时给
       connect_timeout: 10s
@@ -45,11 +45,11 @@ spec:
       # 这类比特口径,自动换算成 nginx 的字节/秒;也接受 25m/512k 的 nginx 原生写法)。
       # rate_limit: 200Mbps
       # rate_limit_after: 1m               # 前 N 字节全速,默认 1m,只在配了 rate_limit 时有意义
+      # 上传方向的闸门(可选,都不配 = 不限)。nginx 没有请求体的字节级限速指令,
+      # 能控的是并发数和请求速率 —— 单个来源的入向带宽 = 并发数 × 单条速率。
+      # upload_conn_limit: "4"      # 每 IP 同时在传的连接数,超出直接 503
+      # upload_req_limit: "10r/s"   # 每 IP 请求速率(nginx 原生写法)
+      # upload_req_burst: "20"      # 允许的突发条数
   # 注意:video 不配 cart / slo / monitor —— 前两个是 LLM 专用;
   # monitor 的探活与告警按 LLM 端点设计,指向 H3 只会产生假告警,
   # 视频服务的可观测走 Prometheus(H3 自己的 /metrics/queue)。
-    # 上传方向的闸门(可选,都不配 = 不限)。nginx 没有请求体的字节级限速指令,
-    # 能控的是并发数和请求速率 —— 单个来源的入向带宽 = 并发数 × 单条速率。
-    # upload_conn_limit: "4"      # 每 IP 同时在传的连接数,超出直接 503
-    # upload_req_limit: "10r/s"   # 每 IP 请求速率(nginx 原生写法)
-    # upload_req_burst: "20"      # 允许的突发条数
