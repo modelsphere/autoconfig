@@ -222,3 +222,61 @@ func TestRenderRoute_VideoAllowsTwoTiers(t *testing.T) {
 		t.Errorf("低优先级应标 backup:\n%s", got)
 	}
 }
+
+// limit_rate 在 proxy_buffering off 下**完全不生效**(实测 50MB:静态 4.99s /
+// buffering on 4.61s / buffering off 0.089s;proxy_limit_rate 同样只在开缓冲时有效)。
+// 所以配了限速就必须开缓冲,并用 proxy_max_temp_file_size 0 避免落盘。
+// 这两件事必须成对出现,拆开任意一半都会让限速变成死配置。
+func TestRenderRoute_VideoRateLimitRequiresBuffering(t *testing.T) {
+	limited, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "200Mbps"}))
+	if !strings.Contains(limited, "proxy_buffering on;") {
+		t.Errorf("配了限速必须开缓冲,否则 limit_rate 被忽略:\n%s", limited)
+	}
+	if !strings.Contains(limited, "proxy_max_temp_file_size 0;") {
+		t.Errorf("开缓冲时要禁临时文件,免得几十 MB 的视频落盘:\n%s", limited)
+	}
+	if strings.Contains(limited, "proxy_buffering off;") {
+		t.Errorf("同一个 location 里不该又出现 proxy_buffering off:\n%s", limited)
+	}
+
+	plain, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
+	if !strings.Contains(plain, "proxy_buffering off;") {
+		t.Errorf("没配限速时应保持不缓冲(边收边发):\n%s", plain)
+	}
+	if strings.Contains(plain, "proxy_max_temp_file_size") {
+		t.Errorf("没开缓冲就不需要 proxy_max_temp_file_size:\n%s", plain)
+	}
+}
+
+// 上传方向:不配 = 一行闸门都不渲染;配了则 zone 声明(http 级,server 块之外)与
+// 引用(server 内)必须成对出现 —— 只有其中一半 nginx 直接起不来。
+func TestRenderRoute_VideoUploadLimits(t *testing.T) {
+	plain, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
+	for _, s := range []string{"limit_conn", "limit_req"} {
+		if strings.Contains(plain, s) {
+			t.Errorf("没配上传闸门时不该出现 %s:\n%s", s, plain)
+		}
+	}
+
+	out, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, map[string]string{
+		"upload_conn_limit": "4", "upload_req_limit": "10r/s", "upload_req_burst": "20",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"limit_conn_zone $binary_remote_addr zone=upconn_minimax_h3:10m;",
+		"limit_conn upconn_minimax_h3 4;",
+		"limit_req_zone $binary_remote_addr zone=upreq_minimax_h3:10m rate=10r/s;",
+		"limit_req  zone=upreq_minimax_h3 burst=20;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("缺 %q:\n%s", want, out)
+		}
+	}
+	// zone 是 http 级指令,必须落在 server 块之前,否则 nginx 报 "not allowed here"
+	if strings.Index(out, "limit_conn_zone") > strings.Index(out, "server {") {
+		t.Errorf("limit_conn_zone 必须在 server 块之外:\n%s", out)
+	}
+}

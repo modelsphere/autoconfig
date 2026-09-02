@@ -23,6 +23,18 @@ map $http_x_forwarded_host $fwdhost_{{.Var}} {
     ""      $host;
 }
 
+{{- if .UploadConnLimit}}
+# 每 IP 并发连接上限。上传方向 nginx 没有字节级限速指令(limit_rate/proxy_limit_rate 只作用于响应),
+# 能控的是「同时有几条在传」—— 单条的速率由客户端和网卡决定,但总量 = 并发数 × 单条速率,
+# 卡住并发就卡住了单个来源能占的入向带宽。真要按字节限只能在 lua 里自己读 body 加 sleep,
+# 那样会丢掉 proxy_request_buffering 的现成反压,不值当。
+limit_conn_zone $binary_remote_addr zone=upconn_{{.Var}}:10m;
+{{- end}}
+{{- if .UploadReqLimit}}
+# 每 IP 请求速率上限(令牌桶)。挡的是"狂刷建任务"这类,和并发限一起用。
+limit_req_zone $binary_remote_addr zone=upreq_{{.Var}}:10m rate={{.UploadReqLimit}};
+{{- end}}
+
 upstream backend_{{.Route}} {
 {{- range .Peers}}
     server {{.IP}}:{{.Port}}{{if .Backup}} backup{{end}};   # {{.Name}}
@@ -37,6 +49,12 @@ server {
     # I2V 允许 base64 传图,上游自己在 64MB 处拒;这里放到 64m,别提前 413。
     client_max_body_size {{.MaxBodySize}};
     client_body_buffer_size 1m;
+{{- if .UploadConnLimit}}
+    limit_conn upconn_{{.Var}} {{.UploadConnLimit}};
+{{- end}}
+{{- if .UploadReqLimit}}
+    limit_req  zone=upreq_{{.Var}}{{if .UploadReqBurst}} burst={{.UploadReqBurst}}{{end}};
+{{- end}}
 
     location / {
         proxy_pass http://backend_{{.Route}};
@@ -59,13 +77,23 @@ server {
 
 {{- if .RateLimit}}
         # 单连接下载限速(仅在 ModelRoute 配了 rate_limit 时渲染;不配 = 不限速)。
-        # limit_rate 的单位是字节/秒,值由 autoconfig 从 200Mbps 这类比特口径换算而来。
-        # limit_rate_after 之前的部分全速 —— 建任务/查询这些几百字节的 JSON 不受影响。
+        # limit_rate 单位是字节/秒,值由 autoconfig 从 200Mbps 这类比特口径换算而来;
+        # limit_rate_after 之前的部分全速 —— 建任务/查询这些小 JSON 不受影响。
         limit_rate_after {{.RateLimitAfter}};
         limit_rate       {{.RateLimit}};
-{{end}}
-        # 响应不缓冲:大视频边收边发,不落磁盘、不吃内存。
+
+        # 限速必须配合开缓冲:**proxy_buffering off 时 limit_rate 完全不生效**
+        # (50MB 实测:静态文件 4.99s / buffering on 4.61s / buffering off 0.089s;
+        #  proxy_limit_rate 同样只在开缓冲时有效)。
+        # proxy_max_temp_file_size 0 = 开缓冲但不落临时文件:缓冲区满就对上游反压,
+        # 内存里过一手就发走,几十 MB 的视频不会写盘(实测 4.76s,限速照常生效)。
+        proxy_buffering on;
+        proxy_max_temp_file_size 0;
+{{- else}}
+
+        # 没配限速:响应不缓冲,大视频边收边发,不落磁盘、不吃内存。
         proxy_buffering off;
+{{- end}}
         # 请求缓冲保持默认 on:客户端慢时先收完再转给后端,免得占着后端连接。
         proxy_request_buffering on;
     }

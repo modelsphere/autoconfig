@@ -122,9 +122,9 @@ type MonitorSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.modelType) || self.modelType != 'video' || !has(self.monitor)",message="modelType: video 不支持 monitor(它的探活与告警是按 LLM 端点设计的,会产生假告警;视频服务用 Prometheus 抓自己的指标)"
 // video 只认自己的调优项;LLM 那些(ttft/tps/自适应并发/会话亲和)在纯反代里根本没人读,
 // 与其静默忽略,不如直接拒 —— 配了以为生效才是最坑的。
-// +kubebuilder:validation:XValidation:rule="!has(self.modelType) || self.modelType != 'video' || !has(self.nginx.values) || self.nginx.values.all(k, k in ['max_body_size','proxy_timeout','connect_timeout','rate_limit','rate_limit_after'])",message="modelType: video 的 nginx.values 只支持 max_body_size / proxy_timeout / connect_timeout / rate_limit / rate_limit_after(TTFT/TPS/自适应并发等是 LLM 引擎的调优项,video 是纯反向代理,配了不会生效)"
+// +kubebuilder:validation:XValidation:rule="!has(self.modelType) || self.modelType != 'video' || !has(self.nginx.values) || self.nginx.values.all(k, k in ['max_body_size','proxy_timeout','connect_timeout','rate_limit','rate_limit_after','upload_conn_limit','upload_req_limit','upload_req_burst'])",message="modelType: video 的 nginx.values 只支持 max_body_size / proxy_timeout / connect_timeout / rate_limit / rate_limit_after / upload_conn_limit / upload_req_limit / upload_req_burst(TTFT/TPS/自适应并发等是 LLM 引擎的调优项,video 是纯反向代理,配了不会生效)"
 // 反过来:llm 路由里写 video 的旋钮同样是无效配置(它们只在 video 模板里渲染)。
-// +kubebuilder:validation:XValidation:rule="(has(self.modelType) && self.modelType == 'video') || !has(self.nginx.values) || self.nginx.values.all(k, !(k in ['max_body_size','proxy_timeout','connect_timeout','rate_limit','rate_limit_after']))",message="max_body_size / proxy_timeout / connect_timeout / rate_limit / rate_limit_after 只对 modelType: video 生效,llm 路由请用 ttft_limit_ms / tps_limit_tps / adaptive_cc_min 等"
+// +kubebuilder:validation:XValidation:rule="(has(self.modelType) && self.modelType == 'video') || !has(self.nginx.values) || self.nginx.values.all(k, !(k in ['max_body_size','proxy_timeout','connect_timeout','rate_limit','rate_limit_after','upload_conn_limit','upload_req_limit','upload_req_burst']))",message="max_body_size / proxy_timeout / connect_timeout / rate_limit / rate_limit_after / upload_conn_limit / upload_req_limit / upload_req_burst 只对 modelType: video 生效,llm 路由请用 ttft_limit_ms / tps_limit_tps / adaptive_cc_min 等"
 // +kubebuilder:validation:XValidation:rule="!self.nginx.peers.exists(s, s.use == 'cart') || has(self.cart)",message="nginx.peers 用了 cart,但没配 spec.cart"
 // +kubebuilder:validation:XValidation:rule="!self.nginx.peers.exists(s, s.use == 'cart' && has(s.maxConcurrencyFromBackend) && s.maxConcurrencyFromBackend) || self.nginx.peers.exists(s, s.use == 'backend' && has(s.maxConcurrency) && s.maxConcurrency > 0)",message="cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(> 0)作乘数"
 type ModelRouteSpec struct {
@@ -187,11 +187,11 @@ type SLOSpec struct {
 
 // ModelRouteStatus 是 controller 回写的观测状态。
 type ModelRouteStatus struct {
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	Backends           int                `json:"backends"`
-	CartPeers          int                `json:"cartPeers"`
-	Ready              bool               `json:"ready"`
-	LastSyncTime       *metav1.Time       `json:"lastSyncTime,omitempty"`
+	ObservedGeneration int64        `json:"observedGeneration,omitempty"`
+	Backends           int          `json:"backends"`
+	CartPeers          int          `json:"cartPeers"`
+	Ready              bool         `json:"ready"`
+	LastSyncTime       *metav1.Time `json:"lastSyncTime,omitempty"`
 	// AppliedRouteKey / AppliedRouteConfigMap:**上一次真正写进去的** openresty key 及其 ConfigMap。
 	// 用来在 spec.nginx.route 改名后删掉旧 key —— 只看当前 spec 是推不出旧名字的,
 	// 结果就是改一次名泄漏一个 key,而 openresty 会继续加载那条陈旧路由(指向改名前的 peers)。
@@ -199,8 +199,8 @@ type ModelRouteStatus struct {
 	AppliedRouteConfigMap string `json:"appliedRouteConfigMap,omitempty"`
 	// OrphanRouteKeys:改名后遗留、已无任何 ModelRoute 声明的 openresty key(格式 "ns/cm:key")。
 	// **只报不删** —— 见 reportOrphanKeys 里为什么不能由 operator 自动删。
-	OrphanRouteKeys []string `json:"orphanRouteKeys,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	OrphanRouteKeys []string           `json:"orphanRouteKeys,omitempty"`
+	Conditions      []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true

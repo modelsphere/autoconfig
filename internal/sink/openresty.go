@@ -147,6 +147,12 @@ type videoRouteData struct {
 	ConnectTimeout string
 	RateLimit      string
 	RateLimitAfter string
+	// 上传方向的闸门。nginx 没有请求体的字节级限速,只能靠"并发数 + 请求速率 + 体积上限"三道:
+	// UploadConnLimit = 每 IP 同时在传的连接数;UploadReqLimit = 每 IP 请求速率(nginx 原生写法
+	// 如 10r/s、30r/m);UploadReqBurst = 允许的突发条数。都不配 = 不限。
+	UploadConnLimit string
+	UploadReqLimit  string
+	UploadReqBurst  string
 }
 
 // toVideoPeers 把发现结果翻成 upstream 行:优先级最高的一组是主用,更低的全部标 backup。
@@ -217,14 +223,17 @@ func renderVideoRoute(d RouteData) (string, error) {
 		rateAfter = firstNonEmpty(d.Extra["rate_limit_after"], defaultVideoRateLimitAfter)
 	}
 	v := videoRouteData{
-		Route:          d.Route,
-		Var:            nginxVarName(d.Route),
-		Peers:          toVideoPeers(d.Peers),
-		MaxBodySize:    firstNonEmpty(d.Extra["max_body_size"], defaultVideoMaxBodySize),
-		ProxyTimeout:   firstNonEmpty(d.Extra["proxy_timeout"], defaultVideoProxyTimeout),
-		ConnectTimeout: firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
-		RateLimit:      rate,
-		RateLimitAfter: rateAfter,
+		Route:           d.Route,
+		Var:             nginxVarName(d.Route),
+		Peers:           toVideoPeers(d.Peers),
+		MaxBodySize:     firstNonEmpty(d.Extra["max_body_size"], defaultVideoMaxBodySize),
+		ProxyTimeout:    firstNonEmpty(d.Extra["proxy_timeout"], defaultVideoProxyTimeout),
+		ConnectTimeout:  firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
+		RateLimit:       rate,
+		RateLimitAfter:  rateAfter,
+		UploadConnLimit: d.Extra["upload_conn_limit"],
+		UploadReqLimit:  d.Extra["upload_req_limit"],
+		UploadReqBurst:  d.Extra["upload_req_burst"],
 	}
 	tmpl, terr := template.New("route_video").Parse(videoRouteTmpl)
 	if err := terr; err != nil {
