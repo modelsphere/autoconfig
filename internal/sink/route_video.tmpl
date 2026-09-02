@@ -57,6 +57,12 @@ server {
         proxy_send_timeout    {{.ProxyTimeout}};
         proxy_read_timeout    {{.ProxyTimeout}};
 
+        # 单连接下载限速:视频是几十 MB 的大文件,不限速几个客户端就能把节点网卡吃满,
+        # 波及同一台机上的别的服务(openresty 是共享入口)。limit_rate 的单位是字节/秒。
+        # limit_rate_after 之前的部分全速 —— 建任务/查询这些几百字节的 JSON 不受影响。
+        limit_rate_after {{.RateLimitAfter}};
+        limit_rate       {{.RateLimit}};
+
         # 响应不缓冲:大视频边收边发,不落磁盘、不吃内存。
         proxy_buffering off;
         # 请求缓冲保持默认 on:客户端慢时先收完再转给后端,免得占着后端连接。

@@ -134,3 +134,78 @@ func TestRenderRoute_VideoSingleVipPeerIsNotBackup(t *testing.T) {
 		t.Errorf("单 peer 应是主用(不带 backup):\n%s", got)
 	}
 }
+
+// 限速:默认 200Mbps,换算成 nginx limit_rate 认的字节/秒(200e6/8 = 25,000,000)。
+// limit_rate_after 让小响应全速 —— 建任务/查询这些几百字节的 JSON 不该被下载限速拖慢。
+func TestRenderRoute_VideoRateLimitDefault(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{"limit_rate       25000000;", "limit_rate_after 1m;"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("缺少 %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderRoute_VideoRateLimitOverride(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"1Gbps", "limit_rate       125000000;"}, // 1e9/8
+		{"400mbps", "limit_rate       50000000;"},
+		{"25m", "limit_rate       25m;"}, // nginx 原生写法原样透传
+		{"512k", "limit_rate       512k;"},
+	}
+	for _, c := range cases {
+		got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+			map[string]string{"rate_limit": c.in, "rate_limit_after": "4m"}))
+		if err != nil {
+			t.Fatalf("rate_limit=%q: %v", c.in, err)
+		}
+		if !strings.Contains(got, c.want) {
+			t.Errorf("rate_limit=%q 期望 %q,实际:\n%s", c.in, c.want, got)
+		}
+		if !strings.Contains(got, "limit_rate_after 4m;") {
+			t.Errorf("rate_limit_after 覆盖未生效")
+		}
+	}
+}
+
+func TestRenderRoute_VideoRateLimitRejectsGarbage(t *testing.T) {
+	_, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "很快Mbps"}))
+	if err == nil {
+		t.Fatal("非法限速值应报错,而不是渲染出坏 conf")
+	}
+}
+
+// nginx upstream 只有主用/backup 两档,表达不了三层降级。
+// 静默压扁会让中间层(pod IP)和最低层(VIP)混为一谈 —— 主用挂掉后流量可能直接落到 VIP,
+// 所以必须报错让人改配置。
+func TestRenderRoute_VideoRejectsThreeTiers(t *testing.T) {
+	_, err := RenderRoute(videoData([]config.Peer{
+		{IP: "10.0.0.1", Port: 8080, Name: "cart-0", Priority: 3},
+		{IP: "10.0.0.2", Port: 8080, Name: "backend-0", Priority: 2},
+		{IP: "10.96.0.9", Port: 8080, Name: "backend-svc-0", Priority: 1},
+	}, nil))
+	if err == nil {
+		t.Fatal("三档优先级应被拒绝(nginx 只有主用/backup 两档)")
+	}
+	if !strings.Contains(err.Error(), "最多两档优先级") {
+		t.Errorf("错误信息应说清原因,实际:%v", err)
+	}
+}
+
+// 两档仍然正常(主用 + backup),这是 video 允许的最复杂形态。
+func TestRenderRoute_VideoAllowsTwoTiers(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{
+		{IP: "10.0.0.1", Port: 8080, Name: "backend-0", Priority: 2},
+		{IP: "10.96.0.9", Port: 8080, Name: "backend-svc-0", Priority: 1},
+	}, nil))
+	if err != nil {
+		t.Fatalf("两档不该报错:%v", err)
+	}
+	if !strings.Contains(got, "server 10.96.0.9:8080 backup;") {
+		t.Errorf("低优先级应标 backup:\n%s", got)
+	}
+}

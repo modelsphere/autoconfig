@@ -94,6 +94,12 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 | `max_body_size` | `64m` | 请求体上限（I2V 允许 base64 传图） |
 | `proxy_timeout` | `3600s` | 读/写超时（生成 + 大文件下载） |
 | `connect_timeout` | `10s` | 连后端超时 |
+| `rate_limit` | `200Mbps` | **单连接**下载限速。接受 `200Mbps`/`1.5Gbps`(比特口径,自动换算成字节)或 nginx 原生写法(`25m`/`512k`)。视频是几十 MB 的大文件,不限速几个客户端就能把节点网卡吃满,而 openresty 是所有模型共享的入口 |
+| `rate_limit_after` | `1m` | 前 N 字节全速。建任务/查询/删除都是几百字节的 JSON,不该被下载限速拖慢 |
+
+限速只限**速度不限大小** —— `client_max_body_size` 管的是请求体,和响应无关;
+`proxy_buffering off` 也让响应不落临时文件,所以下载的视频多大都行(1GB 按 200Mbps 约 40 秒)。
+`proxy_read_timeout` 限的是两次数据之间的间隔,不是总时长。
 
 CEL 还会拒掉 `video` + `cart` / `slo` / `monitor`：前两个是 LLM 专用；monitor 的探活与告警
 按 LLM 端点设计，指向视频服务只会产生假告警（用 Prometheus 抓服务自己的指标）。

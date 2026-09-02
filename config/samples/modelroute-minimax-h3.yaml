@@ -41,6 +41,8 @@ spec:
       max_body_size: 64m                   # I2V 允许 base64 传图,上游自己在 64MB 处拒
       proxy_timeout: 3600s                 # 生成 + 大文件下载,超时按小时给
       connect_timeout: 10s
+      rate_limit: 200Mbps                  # 单连接下载限速(默认值,写出来便于对照)
+      rate_limit_after: 1m                 # 前 1MB 全速:建任务/查询这些小 JSON 不受影响
   # 注意:video 不配 cart / slo / monitor —— 前两个是 LLM 专用;
   # monitor 的探活与告警按 LLM 端点设计,指向 H3 只会产生假告警,
   # 视频服务的可观测走 Prometheus(H3 自己的 /metrics/queue)。

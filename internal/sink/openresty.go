@@ -4,6 +4,7 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -46,6 +47,12 @@ const (
 	defaultVideoMaxBodySize    = "64m"
 	defaultVideoProxyTimeout   = "3600s"
 	defaultVideoConnectTimeout = "10s"
+	// 单连接下载限速。视频是几十 MB 的大文件,不限速时几个客户端就能把节点网卡吃满,
+	// 波及同一台机上的别的服务(openresty 是共享入口)。200Mbps = 25MB/s。
+	defaultVideoRateLimit = "200Mbps"
+	// 限速的豁免额度:前 N 字节全速。建任务/查询/删除都是几百字节的 JSON,
+	// 不该被下载限速拖慢 —— 只有真正的大响应才会触发限速。
+	defaultVideoRateLimitAfter = "1m"
 )
 
 // videoPeer 是 video 模板看到的 peer:nginx upstream 的一行。
@@ -76,6 +83,58 @@ func nginxVarName(route string) string {
 	return b.String()
 }
 
+// parseRate 把限速值翻成 nginx limit_rate 认的「字节/秒」。
+//
+// 接受两种写法:
+//   - "200Mbps" / "1.5Gbps"(比特/秒,运维口径)→ 换算成字节/秒;
+//   - nginx 原生写法("25m"、"512k"、纯数字)→ 原样透传。
+//
+// 换算按 1 Mbps = 1000000 bit/s(网络口径,不是 1024),再除以 8。
+func parseRate(v string) (string, error) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return "", nil
+	}
+	low := strings.ToLower(s)
+	mult := 0.0
+	switch {
+	case strings.HasSuffix(low, "gbps"):
+		mult, low = 1e9, strings.TrimSuffix(low, "gbps")
+	case strings.HasSuffix(low, "mbps"):
+		mult, low = 1e6, strings.TrimSuffix(low, "mbps")
+	case strings.HasSuffix(low, "kbps"):
+		mult, low = 1e3, strings.TrimSuffix(low, "kbps")
+	default:
+		// nginx 原生写法,交给 nginx 自己校验(写错了 openresty -t 会报,不至于静默)。
+		return s, nil
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(low), 64)
+	if err != nil || n <= 0 {
+		return "", fmt.Errorf("限速值 %q 解析失败:期望形如 200Mbps / 1.5Gbps,或 nginx 原生写法 25m", v)
+	}
+	return strconv.FormatInt(int64(n*mult/8), 10), nil
+}
+
+// checkVideoTiers:nginx upstream 只有「主用 / backup」两档,表达不了三层降级。
+// 配了三档时不能静默压扁(中间那层会和最低层混为一谈,主用挂掉后流量可能直接落到 VIP),
+// 直接报错让人改配置。
+func checkVideoTiers(peers []config.Peer) error {
+	seen := map[int]bool{}
+	for _, p := range peers {
+		seen[p.Priority] = true
+	}
+	if len(seen) <= 2 {
+		return nil
+	}
+	tiers := make([]int, 0, len(seen))
+	for p := range seen {
+		tiers = append(tiers, p)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(tiers)))
+	return fmt.Errorf("modelType: video 的 peers 最多两档优先级(nginx upstream 只有主用/backup),当前有 %d 档:%v;"+
+		"请合并中间层,或直接只用一个 backend-svc(推荐)", len(tiers), tiers)
+}
+
 // videoRouteData 喂给 route_video.tmpl。
 type videoRouteData struct {
 	Route string
@@ -86,6 +145,8 @@ type videoRouteData struct {
 	MaxBodySize    string
 	ProxyTimeout   string
 	ConnectTimeout string
+	RateLimit      string
+	RateLimitAfter string
 }
 
 // toVideoPeers 把发现结果翻成 upstream 行:优先级最高的一组是主用,更低的全部标 backup。
@@ -142,6 +203,13 @@ func RenderRoute(d RouteData) (string, error) {
 // renderVideoRoute 渲染 modelType=video 的路由:纯反向代理,不生成 lua 路由表。
 // Extra 在这里不是 lua 调优项,而是模板旋钮(CRD 侧已用 CEL 限定了可用 key)。
 func renderVideoRoute(d RouteData) (string, error) {
+	if err := checkVideoTiers(d.Peers); err != nil {
+		return "", err
+	}
+	rate, err := parseRate(firstNonEmpty(d.Extra["rate_limit"], defaultVideoRateLimit))
+	if err != nil {
+		return "", err
+	}
 	v := videoRouteData{
 		Route:          d.Route,
 		Var:            nginxVarName(d.Route),
@@ -149,9 +217,11 @@ func renderVideoRoute(d RouteData) (string, error) {
 		MaxBodySize:    firstNonEmpty(d.Extra["max_body_size"], defaultVideoMaxBodySize),
 		ProxyTimeout:   firstNonEmpty(d.Extra["proxy_timeout"], defaultVideoProxyTimeout),
 		ConnectTimeout: firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
+		RateLimit:      rate,
+		RateLimitAfter: firstNonEmpty(d.Extra["rate_limit_after"], defaultVideoRateLimitAfter),
 	}
-	tmpl, err := template.New("route_video").Parse(videoRouteTmpl)
-	if err != nil {
+	tmpl, terr := template.New("route_video").Parse(videoRouteTmpl)
+	if err := terr; err != nil {
 		return "", fmt.Errorf("parse video template: %w", err)
 	}
 	var buf bytes.Buffer
