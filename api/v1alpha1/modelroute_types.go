@@ -159,6 +159,11 @@ type ModelRouteStatus struct {
 	CartPeers          int                `json:"cartPeers"`
 	Ready              bool               `json:"ready"`
 	LastSyncTime       *metav1.Time       `json:"lastSyncTime,omitempty"`
+	// AppliedRouteKey / AppliedRouteConfigMap:**上一次真正写进去的** openresty key 及其 ConfigMap。
+	// 用来在 spec.nginx.route 改名后删掉旧 key —— 只看当前 spec 是推不出旧名字的,
+	// 结果就是改一次名泄漏一个 key,而 openresty 会继续加载那条陈旧路由(指向改名前的 peers)。
+	AppliedRouteKey       string `json:"appliedRouteKey,omitempty"`
+	AppliedRouteConfigMap string `json:"appliedRouteConfigMap,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 

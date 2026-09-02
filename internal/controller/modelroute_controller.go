@@ -253,6 +253,11 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		map[string]string{openrestyKey(route): conf}); err != nil {
 		return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), len(cartPeers), rb.Spec.Nginx.OutputConfigMap, err)
 	}
+	// 改名收尾:新 key 写成功后,把上一次写的旧 key 摘掉,并记账本次写的是哪个。
+	// 顺序是**先写新、再删旧** —— 反过来的话中间有一段时间这条路由在 openresty 里根本不存在。
+	if err := r.reconcileRenamedKey(ctx, &rb, route); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// 4) monitor(可选):service(后端)+ nginx(openresty 入口)+ router(CART)行(共享 ConfigMap,每模型一个 key)
 	if m := rb.Spec.Monitor; m != nil {
@@ -449,6 +454,61 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 	return reqs
 }
 
+// reconcileRenamedKey 处理 spec.nginx.route(或 outputConfigMap)改名:删掉上一次写的旧 key,
+// 并把本次写的记进 status。
+//
+// 为什么需要记账:finalizer 和清理逻辑只能看到**当前** spec,推不出改名前叫什么。
+// 不记的话改一次名就泄漏一个 key,而 openresty 会继续加载那条陈旧路由 —— 它指向改名前的 peers,
+// 且没有任何东西再更新它(2026-09-02 线上 modelforge-0.2 → modelforge-0.2-kimi 改名后实际留下了一个)。
+//
+// ⚠️ 删旧 key 前必须确认**现在没有别的 ModelRoute 归属它**:我们改名让出这个 key 之后,
+// 另一条路由完全可能合法地接手(改名腾位正是常见动机)。此时删掉就是删别人的配置。
+func (r *ModelRouteReconciler) reconcileRenamedKey(ctx context.Context, rb *routingv1.ModelRoute, route string) error {
+	key := openrestyKey(route)
+	cmRef := rb.Spec.Nginx.OutputConfigMap
+	oldKey, oldCM := rb.Status.AppliedRouteKey, rb.Status.AppliedRouteConfigMap
+	if oldKey == key && oldCM == cmRef {
+		return nil // 没改名,常态,零开销
+	}
+	if oldKey != "" {
+		claimed, err := r.keyClaimedByOther(ctx, rb, oldCM, oldKey)
+		if err != nil {
+			return err
+		}
+		if claimed {
+			logf.FromContext(ctx).Info("旧 key 已被别的 ModelRoute 接手,不删", "key", oldKey, "cm", oldCM)
+		} else if err := r.removeConfigMapKey(ctx, oldCM, oldKey, rb.Namespace); err != nil {
+			return err
+		}
+	}
+	// 记账失败不阻塞本轮(updateStatus 内部已打日志):status 里还是旧值,
+	// 下一轮会再删一次旧 key(已不存在,no-op)再记一次账,收敛。
+	r.updateStatus(ctx, rb, "记录已写入的 openresty key 失败", func(cur *routingv1.ModelRoute) {
+		cur.Status.AppliedRouteKey, cur.Status.AppliedRouteConfigMap = key, cmRef
+	})
+	return nil
+}
+
+// keyClaimedByOther:除 rb 之外,是否还有(未在删除中的)ModelRoute 渲染 cmRef/key 这一对。
+func (r *ModelRouteReconciler) keyClaimedByOther(ctx context.Context, rb *routingv1.ModelRoute, cmRef, key string) (bool, error) {
+	ns, name := splitNSName(cmRef, rb.Namespace)
+	var all routingv1.ModelRouteList
+	if err := r.List(ctx, &all); err != nil {
+		return false, fmt.Errorf("list ModelRoute(旧 key 归属检查): %w", err)
+	}
+	for i := range all.Items {
+		o := &all.Items[i]
+		if (o.Namespace == rb.Namespace && o.Name == rb.Name) || !o.DeletionTimestamp.IsZero() {
+			continue
+		}
+		ons, oname := splitNSName(o.Spec.Nginx.OutputConfigMap, o.Namespace)
+		if ons == ns && oname == name && openrestyKey(nginxRoute(o)) == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // routeKeyOwner 判断 rb 是不是「目标 ConfigMap + openresty key」这一对的归属者。
 // 返回 (归属者标识, rb 是否为冲突输家, error);无冲突时 conflict=false。
 //
@@ -559,12 +619,21 @@ func (r *ModelRouteReconciler) cleanupSharedKeys(ctx context.Context, rb *routin
 	// ⚠️ 只删**自己归属**的 key。有 key 冲突时,输家从来没写过这个 key,它删就是把赢家
 	// (一条正在服务的路由)的配置删掉 —— 删掉一个配错的 MR 反而打断线上流量,
 	// 而且现场只剩"key 凭空消失",几乎无法归因。
-	_, conflict, err := r.routeKeyOwner(ctx, rb)
+	// 删**自己实际写过的**那个 key(status 记账),而不是拿当前 spec 现推 ——
+	// 若删除前刚好改过名、还没轮到 reconcile,现推出来的是新名字,删掉的就是别人的 key。
+	key, cmRef := rb.Status.AppliedRouteKey, rb.Status.AppliedRouteConfigMap
+	if key == "" { // 老对象没有记账(升级前建的),回退到当前 spec
+		key, cmRef = openrestyKey(nginxRoute(rb)), rb.Spec.Nginx.OutputConfigMap
+	}
+	// ⚠️ 只删自己归属的。有 key 冲突时,输家从来没写过这个 key,它删就是把赢家
+	// (一条正在服务的路由)的配置删掉 —— 删掉一个配错的 MR 反而打断线上流量,
+	// 而且现场只剩"key 凭空消失",几乎无法归因。
+	claimed, err := r.keyClaimedByOther(ctx, rb, cmRef, key)
 	if err != nil {
 		return err
 	}
-	if !conflict {
-		if err := r.removeConfigMapKey(ctx, rb.Spec.Nginx.OutputConfigMap, openrestyKey(nginxRoute(rb)), rb.Namespace); err != nil {
+	if !claimed {
+		if err := r.removeConfigMapKey(ctx, cmRef, key, rb.Namespace); err != nil {
 			return err
 		}
 	}

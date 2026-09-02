@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -600,5 +601,89 @@ func TestRouteKeyConflict_OrderIndependent(t *testing.T) {
 	conf, _ := sharedKey(t, cl)
 	if !strings.Contains(conf, "10.1.0.1") || strings.Contains(conf, "10.2.0.1") {
 		t.Errorf("归属随 reconcile 顺序漂移了\n%s", conf)
+	}
+}
+
+// ── route 改名 ────────────────────────────────────────────────────────────
+//
+// finalizer 和清理逻辑只看得到**当前** spec,推不出改名前叫什么,所以改一次名就会
+// 泄漏一个 key,而 openresty 会继续加载那条陈旧路由(指向改名前的 peers,且再没人更新它)。
+// 2026-09-02 线上 modelforge-0.2 → modelforge-0.2-kimi 改名后就实际留下了一个。
+
+func cmKeys(t *testing.T, cl client.Client) []string {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(),
+		types.NamespacedName{Namespace: "llm-route", Name: "openresty-conf"}, &cm); err != nil {
+		t.Fatalf("get cm: %v", err)
+	}
+	var ks []string
+	for k := range cm.Data {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+func renameRoute(t *testing.T, r *ModelRouteReconciler, cl client.Client, nn types.NamespacedName, to string) {
+	t.Helper()
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	rb.Spec.Nginx.Route = to
+	if err := cl.Update(context.Background(), &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("reconcile(改名后): %v", err)
+	}
+}
+
+func TestRouteRename_RemovesOldKey(t *testing.T) {
+	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+	if got := cmKeys(t, cl); len(got) != 1 || got[0] != "session_route_kimi-k2.5.conf" {
+		t.Fatalf("前置:应只有一个 key,得到 %v", got)
+	}
+
+	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
+
+	got := cmKeys(t, cl)
+	if len(got) != 1 || got[0] != "session_route_kimi-k2.5-v2.conf" {
+		t.Fatalf("改名后应只剩新 key(旧 key 泄漏会让 openresty 继续服务陈旧路由),得到 %v", got)
+	}
+	// status 要记住实际写的是哪个,否则下次改名/删除又推不出来
+	var rb routingv1.ModelRoute
+	if err := cl.Get(context.Background(), nn, &rb); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if rb.Status.AppliedRouteKey != "session_route_kimi-k2.5-v2.conf" {
+		t.Errorf("status.appliedRouteKey = %q", rb.Status.AppliedRouteKey)
+	}
+}
+
+// 改名腾位:让出的旧 key 被另一条 ModelRoute 接手时,**不能**顺手删掉 —— 那是别人的配置了。
+func TestRouteRename_KeepsOldKeyWhenTakenOver(t *testing.T) {
+	r, nn, cl := sloFixture(t, nil, routingv1.Discovery{Service: "kimi-k25-leader", Port: 8050})
+
+	// 另一条路由接手 kimi-k2.5 这个名字(它自己的后端)
+	taker := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "taker", Namespace: "kimi"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: routingv1.Discovery{Selector: "app=kimi", Port: 8050},
+			Nginx: routingv1.NginxSpec{
+				Route: "kimi-k2.5", OutputConfigMap: "llm-route/openresty-conf",
+				Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 50}},
+			},
+		},
+	}
+	if err := cl.Create(context.Background(), taker); err != nil {
+		t.Fatalf("%v", err)
+	}
+	renameRoute(t, r, cl, nn, "kimi-k2.5-v2")
+
+	got := cmKeys(t, cl)
+	if len(got) != 2 {
+		t.Fatalf("旧 key 已被接手,不该删;期望两个 key,得到 %v", got)
 	}
 }
