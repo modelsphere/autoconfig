@@ -135,10 +135,23 @@ func TestRenderRoute_VideoSingleVipPeerIsNotBackup(t *testing.T) {
 	}
 }
 
-// 限速:默认 200Mbps,换算成 nginx limit_rate 认的字节/秒(200e6/8 = 25,000,000)。
-// limit_rate_after 让小响应全速 —— 建任务/查询这些几百字节的 JSON 不该被下载限速拖慢。
-func TestRenderRoute_VideoRateLimitDefault(t *testing.T) {
+// 不配 rate_limit = 完全不限速:一行 limit_rate 都不该渲染。
+// 悄悄给一个默认上限会让人查半天"为什么下载只有 25MB/s"。
+func TestRenderRoute_VideoNoRateLimitByDefault(t *testing.T) {
 	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(got, "limit_rate") {
+		t.Errorf("没配 rate_limit 就不该出现 limit_rate:\n%s", got)
+	}
+}
+
+// 配了才限速;换算成 nginx limit_rate 认的字节/秒(200e6/8 = 25,000,000),
+// 并带上伴随默认的 limit_rate_after(让小 JSON 响应全速)。
+func TestRenderRoute_VideoRateLimitWhenConfigured(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "200Mbps"}))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}

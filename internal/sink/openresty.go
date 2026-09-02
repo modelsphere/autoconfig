@@ -206,9 +206,15 @@ func renderVideoRoute(d RouteData) (string, error) {
 	if err := checkVideoTiers(d.Peers); err != nil {
 		return "", err
 	}
-	rate, err := parseRate(firstNonEmpty(d.Extra["rate_limit"], defaultVideoRateLimit))
+	// 不配 = 不限速(渲染时整段跳过),不给默认值 —— 限速是要显式选择的策略,
+	// 悄悄给一个默认上限会让人查半天"为什么下载只有 25MB/s"。
+	rate, err := parseRate(d.Extra["rate_limit"])
 	if err != nil {
 		return "", err
+	}
+	rateAfter := ""
+	if rate != "" {
+		rateAfter = firstNonEmpty(d.Extra["rate_limit_after"], defaultVideoRateLimitAfter)
 	}
 	v := videoRouteData{
 		Route:          d.Route,
@@ -218,7 +224,7 @@ func renderVideoRoute(d RouteData) (string, error) {
 		ProxyTimeout:   firstNonEmpty(d.Extra["proxy_timeout"], defaultVideoProxyTimeout),
 		ConnectTimeout: firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
 		RateLimit:      rate,
-		RateLimitAfter: firstNonEmpty(d.Extra["rate_limit_after"], defaultVideoRateLimitAfter),
+		RateLimitAfter: rateAfter,
 	}
 	tmpl, terr := template.New("route_video").Parse(videoRouteTmpl)
 	if err := terr; err != nil {
