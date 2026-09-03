@@ -29,9 +29,12 @@ map $http_x_forwarded_host $fwdhost_{{.Var}} {
 # 卡住并发就卡住了单个来源能占的入向带宽。真要按字节限只能在 lua 里自己读 body 加 sleep,
 # 那样会丢掉 proxy_request_buffering 的现成反压,不值当。
 #
-# ⚠️ key 选错,粒度就从"每来源"塌成"全局":默认的 $binary_remote_addr 是**直连对端**的 IP,
-# 而经外层网关(如 phanrouter)进来时那是同一个 IP —— 限 4 条就成了整个服务只许 4 条在传。
-# 那种部署要把 key 换成 $http_x_forwarded_for(前提是外层确实透传了这个头)。
+# ⚠️ key 选错,粒度就从"每来源"塌成"全局"。这里**不能用 $binary_remote_addr** ——
+# 本路由挂在 unix socket 上(dispatch 按 /<route>/ 分发过来),那一跳没有 IP,
+# 实测路由层的 $remote_addr 恒为字符串 "unix:",所有请求会落进同一个桶。
+# 默认用 $http_x_real_ip(dispatch 设的 X-Real-IP = openresty 的直连对端)。
+# 要精确到"每真实客户端",把 upload_limit_key 配成取 X-Forwarded-For 最左一跳的变量
+# (前提是外层网关确实透传了这个头)。
 limit_conn_zone {{.UploadLimitKey}} zone=upconn_{{.Var}}:10m;
 {{- end}}
 {{- if .UploadReqLimit}}

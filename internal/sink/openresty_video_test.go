@@ -266,9 +266,9 @@ func TestRenderRoute_VideoUploadLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"limit_conn_zone $binary_remote_addr zone=upconn_minimax_h3:10m;",
+		"limit_conn_zone $http_x_real_ip zone=upconn_minimax_h3:10m;",
 		"limit_conn upconn_minimax_h3 4;",
-		"limit_req_zone $binary_remote_addr zone=upreq_minimax_h3:10m rate=10r/s;",
+		"limit_req_zone $http_x_real_ip zone=upreq_minimax_h3:10m rate=10r/s;",
 		"limit_req  zone=upreq_minimax_h3 burst=20;",
 	} {
 		if !strings.Contains(out, want) {
@@ -287,9 +287,18 @@ func TestRenderRoute_VideoUploadLimits(t *testing.T) {
 func TestRenderRoute_VideoUploadLimitKey(t *testing.T) {
 	def, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
 		map[string]string{"upload_conn_limit": "4", "upload_req_limit": "10r/s"}))
-	if !strings.Contains(def, "limit_conn_zone $binary_remote_addr zone=upconn_minimax_h3") ||
-		!strings.Contains(def, "limit_req_zone $binary_remote_addr zone=upreq_minimax_h3") {
-		t.Errorf("默认 key 应是 $binary_remote_addr:\n%s", def)
+	if !strings.Contains(def, "limit_conn_zone $http_x_real_ip zone=upconn_minimax_h3") ||
+		!strings.Contains(def, "limit_req_zone $http_x_real_ip zone=upreq_minimax_h3") {
+		t.Errorf("默认 key 应是 $http_x_real_ip:\n%s", def)
+	}
+	// $binary_remote_addr 在 unix socket 后面恒为 "unix:",所有请求落同一个桶 ——
+	// 绝不能出现在 zone 指令里(实测见 tools/minimax-h3/tests/t25)。
+	for _, line := range strings.Split(def, "\n") {
+		d := strings.TrimSpace(line)
+		if (strings.HasPrefix(d, "limit_conn_zone") || strings.HasPrefix(d, "limit_req_zone")) &&
+			strings.Contains(d, "$binary_remote_addr") {
+			t.Errorf("zone 不该用 $binary_remote_addr(unix socket 后恒为 unix:): %s", d)
+		}
 	}
 
 	xff, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, map[string]string{
@@ -305,7 +314,7 @@ func TestRenderRoute_VideoUploadLimitKey(t *testing.T) {
 	for _, line := range strings.Split(xff, "\n") {
 		d := strings.TrimSpace(line)
 		if strings.HasPrefix(d, "limit_conn_zone") || strings.HasPrefix(d, "limit_req_zone") {
-			if strings.Contains(d, "$binary_remote_addr") {
+			if strings.Contains(d, "$http_x_real_ip") {
 				t.Errorf("zone 指令还留着默认 key: %s", d)
 			}
 		}

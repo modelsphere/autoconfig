@@ -99,7 +99,7 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 | `upload_conn_limit` | 不配 = 不限 | 每 IP 同时在传的连接数(`limit_conn`),超出直接 503 |
 | `upload_req_limit` | 不配 = 不限 | 每 IP 请求速率(`limit_req`,nginx 原生写法如 `10r/s`) |
 | `upload_req_burst` | 不配 = 无突发 | 配合 `upload_req_limit` 的突发额度 |
-| `upload_limit_key` | `$binary_remote_addr` | 上面两个 zone 按什么分组。默认是**直连对端**的 IP —— 经外层网关进来时所有请求同一个 IP,"每 IP" 会塌成"全局",那种部署要换成 `$http_x_forwarded_for`(前提是外层确实透传) |
+| `upload_limit_key` | `$http_x_real_ip` | 上面两个 zone 按什么分组。**不能用 `$binary_remote_addr`** —— 路由挂在 unix socket 上,那一跳没有 IP,路由层的 `$remote_addr` 恒为 `"unix:"`,所有请求会落进同一个桶(实测,见下)。默认用 dispatch 设的 `X-Real-IP`;要精确到每个真实客户端,配成取 `X-Forwarded-For` 最左一跳的变量 |
 
 **下载限速必须配合开缓冲**:`proxy_buffering off` 时 `limit_rate` 会被 nginx 完全忽略
 (50MB 实测:静态文件 4.99s / 开缓冲 4.61s / 关缓冲 0.089s,`proxy_limit_rate` 同理)。
@@ -332,3 +332,18 @@ docker build -f Dockerfile.hagate -t harbor.4pd.io/hardcore-tech/autoconfig-haga
   `--process nginx: master` 参数会自匹配。规则：argv[0] 相等 / basename 相等 / 以 match 开头（nginx master 的
   argv[0] = `nginx: master process ...`）。
 - **env 名别撞 k8s Service 注入**：若有名为 `cart` 的 Service，k8s 会注入 `CART_PORT=tcp://...`；autoconfig 的 env 前缀统一 `PS_`。
+
+### 为什么默认 key 不是 `$binary_remote_addr`
+
+生产链路是 dispatch(`:8080` TCP)→ `proxy_pass` 到 **unix socket** → 各路由的 server 块。
+在 unix socket 那一跳上没有 IP,实测路由层拿到的是:
+
+```
+经 dispatch → unix socket:  remote_addr=[unix:]  xff=[127.0.0.1]  xrealip=[127.0.0.1]
+客户端带 XFF 时:            remote_addr=[unix:]  xff=[203.0.113.7, 127.0.0.1]
+直连对照(不经 socket):      remote_addr=[127.0.0.1]
+```
+
+`$remote_addr` 恒等于字符串 `unix:` —— 每个请求算出同一个 key,
+`limit_conn 4` 就成了"整个服务同时只许 4 条",而不是"每 IP 4 条"。
+这与外层是不是网关无关,是 dispatch→路由走 unix socket 这个结构决定的。
