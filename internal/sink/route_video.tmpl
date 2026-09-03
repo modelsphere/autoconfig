@@ -8,6 +8,29 @@
      路径:dispatch(8080)按 /<Route>/ 分发到本 socket **并剥掉前缀**,后端收到的是干净路径。
      因此对外地址是 https://<域名>/<Route>/v2/...,下游若要自己拼下载 URL(H3 的
      content.url),必须把 /<Route> 前缀算进去 —— H3 用 H3_PUBLIC_BASE_URL 配。 */ -}}
+{{- /* vproxy:两个 location(通用 / + 下载专用)共用的反向代理指令。nginx 里 location 之间不继承,
+       所以抽成 define 避免两处重复,改一处两边都变。 */ -}}
+{{- define "vproxy"}}
+        proxy_pass http://backend_{{.Route}};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host  $fwdhost_{{.Var}};
+        proxy_set_header X-Forwarded-Proto $fwdproto_{{.Var}};
+        # Range 必须原样带过去:下载接口支持断点续传,漏了就只能整段下。
+        proxy_set_header Range             $http_range;
+        proxy_set_header If-Range          $http_if_range;
+
+        # 生成一条视频要 1~3 分钟,下载几十 MB 也可能很慢 —— 超时按小时给。
+        proxy_connect_timeout {{.ConnectTimeout}};
+        proxy_send_timeout    {{.ProxyTimeout}};
+        proxy_read_timeout    {{.ProxyTimeout}};
+        # 请求缓冲保持默认 on:客户端慢时先收完再转给后端,免得占着后端连接。
+        proxy_request_buffering on;
+{{- end -}}
 # {{.Route}} 视频生成路由(autoconfig 模板生成,勿手改;改模板或 ModelRoute)
 # mode: video —— 纯反向代理,不走 lua 路由引擎(无会话亲和/TPS 限流/自适应并发)
 
@@ -41,6 +64,15 @@ limit_conn_zone {{.UploadLimitKey}} zone=upconn_{{.Var}}:10m;
 # 每 IP 请求速率上限(令牌桶)。挡的是"狂刷建任务"这类,和并发限一起用。
 limit_req_zone {{.UploadLimitKey}} zone=upreq_{{.Var}}:10m rate={{.UploadReqLimit}};
 {{- end}}
+{{- if .DownloadConnLimit}}
+# 下载并发上限 —— **全局(所有客户端合计),不是每客户端**。key 用【常量 {{.Route}}】,所以每个
+# 下载请求都落进同一个桶 → 全局计数。配合下面每连接 limit_rate = 总带宽/并发数,得到:
+#   全局并发下载 ≤ download_conn_limit,且全局下载带宽 ≤ rate_limit(总带宽)。
+map $host $dlkey_{{.Var}} {
+    default "{{.Route}}";   # 恒为常量 → 全局单桶(与 $host 取值无关)
+}
+limit_conn_zone $dlkey_{{.Var}} zone=dlconn_{{.Var}}:10m;
+{{- end}}
 
 upstream backend_{{.Route}} {
 {{- range .Peers}}
@@ -62,6 +94,26 @@ server {
 {{- if .UploadReqLimit}}
     limit_req  zone=upreq_{{.Var}}{{if .UploadReqBurst}} burst={{.UploadReqBurst}}{{end}};
 {{- end}}
+{{- if .DownloadConnLimit}}
+
+    # 下载(/content):更具体的 regex location 优先匹配,提交/查询走下面的 location /。
+    # 这里挂全局 limit_conn + 每连接 limit_rate(= 总带宽 / 并发数)。
+    location ~ ^/v2/video_generation/[^/]+/content$ {
+        limit_conn        dlconn_{{.Var}} {{.DownloadConnLimit}};
+        limit_conn_status 429;   # 超全局并发上限返 429(与 API 限流风格一致;默认是 503)
+        # 下载是免鉴权路径(content.url 交给最终用户,浏览器不带 Authorization),这里不放 guard。
+{{ template "vproxy" . }}
+        # 每连接下载限速 = 总带宽 rate_limit ÷ download_conn_limit,**从第一字节起就限**。
+        # 这里【不设 limit_rate_after】:下载 location 只服务视频(小 JSON 走 location /),给每连接
+        # 1MB 免费全速头会让 N 条连接短暂突破 rate_limit、且 <1MB 的小视频整个逃过限速 —— 削弱
+        # 「全局下载带宽 ≤ rate_limit」。spare 小响应的活由 location / 负责,这里不需要。
+        # 限速必须开缓冲(proxy_buffering off 时 limit_rate 不生效);
+        # proxy_max_temp_file_size 0 = 开缓冲但不落盘,几十 MB 视频内存过一手就发走。
+        limit_rate       {{.DownloadRate}};
+        proxy_buffering on;
+        proxy_max_temp_file_size 0;
+    }
+{{- end}}
 
     location / {
 {{- if .Auth}}
@@ -75,45 +127,11 @@ server {
         */}}
         access_by_lua_block { require("api_keys").guard({{if .AuthPublicPaths}}{{"[=["}}{{.AuthPublicPaths}}{{"]=]"}}{{else}}nil{{end}}) }
 {{- end}}
+{{ template "vproxy" . }}
 
-        proxy_pass http://backend_{{.Route}};
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Host  $fwdhost_{{.Var}};
-        proxy_set_header X-Forwarded-Proto $fwdproto_{{.Var}};
-        # Range 必须原样带过去:下载接口支持断点续传,漏了就只能整段下。
-        proxy_set_header Range             $http_range;
-        proxy_set_header If-Range          $http_if_range;
-
-        # 生成一条视频要 1~3 分钟,下载几十 MB 也可能很慢 —— 超时按小时给。
-        proxy_connect_timeout {{.ConnectTimeout}};
-        proxy_send_timeout    {{.ProxyTimeout}};
-        proxy_read_timeout    {{.ProxyTimeout}};
-
-{{- if .RateLimit}}
-        # 单连接下载限速(仅在 ModelRoute 配了 rate_limit 时渲染;不配 = 不限速)。
-        # limit_rate 单位是字节/秒,值由 autoconfig 从 200Mbps 这类比特口径换算而来;
-        # limit_rate_after 之前的部分全速 —— 建任务/查询这些小 JSON 不受影响。
-        limit_rate_after {{.RateLimitAfter}};
-        limit_rate       {{.RateLimit}};
-
-        # 限速必须配合开缓冲:**proxy_buffering off 时 limit_rate 完全不生效**
-        # (50MB 实测:静态文件 4.99s / buffering on 4.61s / buffering off 0.089s;
-        #  proxy_limit_rate 同样只在开缓冲时有效)。
-        # proxy_max_temp_file_size 0 = 开缓冲但不落临时文件:缓冲区满就对上游反压,
-        # 内存里过一手就发走,几十 MB 的视频不会写盘(实测 4.76s,限速照常生效)。
-        proxy_buffering on;
-        proxy_max_temp_file_size 0;
-{{- else}}
-
-        # 没配限速:响应不缓冲,大视频边收边发,不落磁盘、不吃内存。
+        # 提交/查询是小 JSON,不缓冲。配了 rate_limit 时,大文件下载已在上面的 /content location
+        # 限速(download_conn_limit 只要配了 rate_limit 就必有值,见 openresty.go 里的默认值逻辑,
+        # 所以这里不会再出现"配了 rate_limit 但下载不限并发"的旧行为)。没配 rate_limit = 没选限速策略。
         proxy_buffering off;
-{{- end}}
-        # 请求缓冲保持默认 on:客户端慢时先收完再转给后端,免得占着后端连接。
-        proxy_request_buffering on;
     }
 }
