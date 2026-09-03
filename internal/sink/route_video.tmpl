@@ -28,11 +28,15 @@ map $http_x_forwarded_host $fwdhost_{{.Var}} {
 # 能控的是「同时有几条在传」—— 单条的速率由客户端和网卡决定,但总量 = 并发数 × 单条速率,
 # 卡住并发就卡住了单个来源能占的入向带宽。真要按字节限只能在 lua 里自己读 body 加 sleep,
 # 那样会丢掉 proxy_request_buffering 的现成反压,不值当。
-limit_conn_zone $binary_remote_addr zone=upconn_{{.Var}}:10m;
+#
+# ⚠️ key 选错,粒度就从"每来源"塌成"全局":默认的 $binary_remote_addr 是**直连对端**的 IP,
+# 而经外层网关(如 phanrouter)进来时那是同一个 IP —— 限 4 条就成了整个服务只许 4 条在传。
+# 那种部署要把 key 换成 $http_x_forwarded_for(前提是外层确实透传了这个头)。
+limit_conn_zone {{.UploadLimitKey}} zone=upconn_{{.Var}}:10m;
 {{- end}}
 {{- if .UploadReqLimit}}
 # 每 IP 请求速率上限(令牌桶)。挡的是"狂刷建任务"这类,和并发限一起用。
-limit_req_zone $binary_remote_addr zone=upreq_{{.Var}}:10m rate={{.UploadReqLimit}};
+limit_req_zone {{.UploadLimitKey}} zone=upreq_{{.Var}}:10m rate={{.UploadReqLimit}};
 {{- end}}
 
 upstream backend_{{.Route}} {

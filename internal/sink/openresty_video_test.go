@@ -280,3 +280,34 @@ func TestRenderRoute_VideoUploadLimits(t *testing.T) {
 		t.Errorf("limit_conn_zone 必须在 server 块之外:\n%s", out)
 	}
 }
+
+// upload_limit_key 决定两个 zone 按什么分组。默认 $binary_remote_addr 是**直连对端**的 IP;
+// 经外层网关(如 phanrouter)进来时所有请求同一个 IP,"每 IP 限制"就塌成"全局限制",
+// 那种部署必须能换成 $http_x_forwarded_for —— 这个用例守住这个可配性。
+func TestRenderRoute_VideoUploadLimitKey(t *testing.T) {
+	def, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"upload_conn_limit": "4", "upload_req_limit": "10r/s"}))
+	if !strings.Contains(def, "limit_conn_zone $binary_remote_addr zone=upconn_minimax_h3") ||
+		!strings.Contains(def, "limit_req_zone $binary_remote_addr zone=upreq_minimax_h3") {
+		t.Errorf("默认 key 应是 $binary_remote_addr:\n%s", def)
+	}
+
+	xff, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, map[string]string{
+		"upload_conn_limit": "4", "upload_req_limit": "10r/s",
+		"upload_limit_key": "$http_x_forwarded_for",
+	}))
+	if !strings.Contains(xff, "limit_conn_zone $http_x_forwarded_for zone=upconn_minimax_h3") ||
+		!strings.Contains(xff, "limit_req_zone $http_x_forwarded_for zone=upreq_minimax_h3") {
+		t.Errorf("配了 upload_limit_key 后两个 zone 都要跟着换:\n%s", xff)
+	}
+	// 只看**指令行**:模板的注释里本来就提到 $binary_remote_addr(解释默认值是什么),
+	// 直接 Contains 整份 conf 会把注释也算进去,断言恒假。
+	for _, line := range strings.Split(xff, "\n") {
+		d := strings.TrimSpace(line)
+		if strings.HasPrefix(d, "limit_conn_zone") || strings.HasPrefix(d, "limit_req_zone") {
+			if strings.Contains(d, "$binary_remote_addr") {
+				t.Errorf("zone 指令还留着默认 key: %s", d)
+			}
+		}
+	}
+}

@@ -53,6 +53,9 @@ const (
 	// 限速的豁免额度:前 N 字节全速。建任务/查询/删除都是几百字节的 JSON,
 	// 不该被下载限速拖慢 —— 只有真正的大响应才会触发限速。
 	defaultVideoRateLimitAfter = "1m"
+	// 上传闸门的分组依据。默认按直连对端 IP —— 只在客户端直连时才是"每客户端";
+	// 经网关时所有请求同一个 IP,那种部署要显式配成 $http_x_forwarded_for。
+	defaultVideoUploadLimitKey = "$binary_remote_addr"
 )
 
 // videoPeer 是 video 模板看到的 peer:nginx upstream 的一行。
@@ -153,6 +156,9 @@ type videoRouteData struct {
 	UploadConnLimit string
 	UploadReqLimit  string
 	UploadReqBurst  string
+	// UploadLimitKey:上面两个 zone 按什么分组。默认 $binary_remote_addr(直连对端 IP);
+	// 经外层网关进来时那是同一个 IP,得换成 $http_x_forwarded_for 才有"每客户端"的语义。
+	UploadLimitKey string
 }
 
 // toVideoPeers 把发现结果翻成 upstream 行:优先级最高的一组是主用,更低的全部标 backup。
@@ -231,6 +237,7 @@ func renderVideoRoute(d RouteData) (string, error) {
 		ConnectTimeout:  firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
 		RateLimit:       rate,
 		RateLimitAfter:  rateAfter,
+		UploadLimitKey:  firstNonEmpty(d.Extra["upload_limit_key"], defaultVideoUploadLimitKey),
 		UploadConnLimit: d.Extra["upload_conn_limit"],
 		UploadReqLimit:  d.Extra["upload_req_limit"],
 		UploadReqBurst:  d.Extra["upload_req_burst"],

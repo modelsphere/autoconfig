@@ -50,6 +50,10 @@ spec:
       # upload_conn_limit: "4"      # 每 IP 同时在传的连接数,超出直接 503
       # upload_req_limit: "10r/s"   # 每 IP 请求速率(nginx 原生写法)
       # upload_req_burst: "20"      # 允许的突发条数
+      # ⚠️ 两个 zone 默认按 $binary_remote_addr(**直连对端**的 IP)分组。经外层网关
+      # (如 phanrouter)进来时所有请求都是同一个 IP,"每 IP 限制"会塌成"全局限制" ——
+      # 配 4 就是整个服务同时只许 4 条在传,第 5 个真实用户直接 503。那种部署要换 key:
+      # upload_limit_key: $http_x_forwarded_for   # 前提是外层确实透传了这个头
   # 注意:video 不配 cart / slo / monitor —— 前两个是 LLM 专用;
   # monitor 的探活与告警按 LLM 端点设计,指向 H3 只会产生假告警,
   # 视频服务的可观测走 Prometheus(H3 自己的 /metrics/queue)。

@@ -99,6 +99,7 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 | `upload_conn_limit` | 不配 = 不限 | 每 IP 同时在传的连接数(`limit_conn`),超出直接 503 |
 | `upload_req_limit` | 不配 = 不限 | 每 IP 请求速率(`limit_req`,nginx 原生写法如 `10r/s`) |
 | `upload_req_burst` | 不配 = 无突发 | 配合 `upload_req_limit` 的突发额度 |
+| `upload_limit_key` | `$binary_remote_addr` | 上面两个 zone 按什么分组。默认是**直连对端**的 IP —— 经外层网关进来时所有请求同一个 IP,"每 IP" 会塌成"全局",那种部署要换成 `$http_x_forwarded_for`(前提是外层确实透传) |
 
 **下载限速必须配合开缓冲**:`proxy_buffering off` 时 `limit_rate` 会被 nginx 完全忽略
 (50MB 实测:静态文件 4.99s / 开缓冲 4.61s / 关缓冲 0.089s,`proxy_limit_rate` 同理)。
