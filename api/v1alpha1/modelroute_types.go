@@ -82,6 +82,10 @@ type NginxSpec struct {
 	// util.validate_metrics 直接整份丢弃。那两个键由 spec.slo 从 LLMSLORequirement 生成,
 	// 且渲染在本段之后 → **配了 spec.slo 时,这里手写的同名键会被静默覆盖**(实测确认)。
 	// 要调 SLO 阈值请改 LLMSLORequirement,不要在这里写。
+	// MaxProperties/MaxLength 不只是防呆:CEL 规则的**估算开销**与 map 的可能大小成正比,
+	// 不加上限时 k8s 按"无限大"估,白名单一长就超预算被拒
+	// (estimated rule cost exceeds budget —— 实测加到 9 个键就超了 2.2%)。
+	// +kubebuilder:validation:MaxProperties=32
 	Values map[string]string `json:"values,omitempty"`
 	// Service:可选;nginx 入口自身的 Service("ns/name")→ 供 monitor 的 nginx: 行 + 入口 pod 扩缩事件驱动。
 	// 端口取 Service 的 dispatch 命名端口(8080,路径路由统一入口)。与 selector 二选一(都配则 service 优先)。
