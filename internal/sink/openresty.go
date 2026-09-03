@@ -66,7 +66,7 @@ const (
 	// (前提是外层确实透传 X-Forwarded-For)。
 	defaultVideoUploadLimitKey = "$http_x_real_ip"
 	// 免鉴权路径:下载。任务 id 是 UUID,等于一次性能力 URL。
-	defaultVideoAuthPublicPaths = `~^/v2/video_generation/[^/]+/content$`
+	defaultVideoAuthPublicPaths = `^/v2/video_generation/[^/]+/content$`
 )
 
 // videoPeer 是 video 模板看到的 peer:nginx upstream 的一行。
@@ -170,9 +170,10 @@ type videoRouteData struct {
 	// UploadLimitKey:上面两个 zone 按什么分组。默认 $binary_remote_addr(直连对端 IP);
 	// 经外层网关进来时那是同一个 IP,得换成 $http_x_forwarded_for 才有"每客户端"的语义。
 	UploadLimitKey string
-	// APIKeys:配了就开启 Bearer 鉴权(与 LLM 路由同一套约定);空 = 不校验。
-	APIKeys []string
-	// AuthPublicPaths:免鉴权的路径匹配(nginx map 的左值,如 ~^/v2/.../content$)。
+	// Auth:是否开启 Bearer 鉴权。key 不在这里配 —— 读 openresty 镜像里的
+	// lua/api_keys.lua,与 LLM 路由同一张表(密钥不进 CR / values / git)。
+	Auth bool
+	// AuthPublicPaths:免鉴权路径的正则(ngx.re 语法,不带 ~ 前缀)。
 	// 默认放行下载 —— content.url 交给最终用户,浏览器不会带 Authorization 头。
 	AuthPublicPaths string
 }
@@ -254,7 +255,7 @@ func renderVideoRoute(d RouteData) (string, error) {
 		RateLimit:       rate,
 		RateLimitAfter:  rateAfter,
 		UploadLimitKey:  firstNonEmpty(d.Extra["upload_limit_key"], defaultVideoUploadLimitKey),
-		APIKeys:         splitKeys(d.Extra["api_keys"]),
+		Auth:            d.Extra["auth"] != "false",
 		AuthPublicPaths: authPublicPaths(d.Extra),
 		UploadConnLimit: d.Extra["upload_conn_limit"],
 		UploadReqLimit:  d.Extra["upload_req_limit"],
@@ -278,17 +279,6 @@ func authPublicPaths(extra map[string]string) string {
 		return v
 	}
 	return defaultVideoAuthPublicPaths
-}
-
-// splitKeys 把逗号分隔的 key 列表拆开并去空白;空串返回 nil(= 不开鉴权)。
-func splitKeys(v string) []string {
-	var out []string
-	for _, k := range strings.Split(v, ",") {
-		if k = strings.TrimSpace(k); k != "" {
-			out = append(out, k)
-		}
-	}
-	return out
 }
 
 func firstNonEmpty(values ...string) string {

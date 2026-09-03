@@ -321,35 +321,41 @@ func TestRenderRoute_VideoUploadLimitKey(t *testing.T) {
 	}
 }
 
-// 配了 api_keys 就开 Bearer 鉴权;下载路径默认放行 —— content.url 是交给最终用户的,
-// 浏览器/播放器直接打开不会带 Authorization 头。
-func TestRenderRoute_VideoAPIKeyAuth(t *testing.T) {
-	plain, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
-	if strings.Contains(plain, "401") || strings.Contains(plain, "keyok_") {
-		t.Errorf("没配 api_keys 时不该有鉴权:\n%s", plain)
-	}
-
-	out, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
-		map[string]string{"api_keys": "sk-one, sk-two"}))
+// 鉴权默认开启,key 读 openresty 镜像里的 lua/api_keys.lua(与 LLM 同一张表)——
+// **key 不出现在渲染结果里**,这正是这版改动的目的。下载路径默认放行。
+func TestRenderRoute_VideoAuth(t *testing.T) {
+	out, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`"Bearer sk-one" 1;`,
-		`"Bearer sk-two" 1;`,                       // 逗号分隔 + 去空白
-		`~^/v2/video_generation/[^/]+/content$ 1;`, // 下载默认放行
-		`if ($deny_minimax_h3) {`,
-		`return 401 '{"error":"missing or invalid api key"}';`, // 与 LLM 路由同一句
+		`access_by_lua_block {`,
+		`require("api_keys").check(`,
+		`^/v2/video_generation/[^/]+/content$`,
+		`ngx.status = 401`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("缺 %q:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, "sk-") {
+		t.Errorf("渲染结果里不该出现任何 key:\n%s", out)
+	}
 
-	// 放行路径可关掉(要求连下载也带 key)
+	// 显式关闭
+	off, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"auth": "false"}))
+	if strings.Contains(off, "access_by_lua_block") {
+		t.Errorf("auth=false 时不该渲染鉴权:\n%s", off)
+	}
+
+	// 放行路径可关掉(连下载也要 key)
 	strict, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
-		map[string]string{"api_keys": "sk-one", "auth_public_paths": ""}))
-	if strings.Contains(strict, "/content$ 1;") {
+		map[string]string{"auth_public_paths": ""}))
+	if strings.Contains(strict, "/content$") {
 		t.Errorf("auth_public_paths 置空后不该再放行下载:\n%s", strict)
+	}
+	if !strings.Contains(strict, `require("api_keys").check(`) {
+		t.Errorf("放行路径关掉后鉴权本身仍应在:\n%s", strict)
 	}
 }
