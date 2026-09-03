@@ -329,10 +329,8 @@ func TestRenderRoute_VideoAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`access_by_lua_block {`,
-		`require("api_keys").check(`,
+		`access_by_lua_block { require("api_keys").guard(`,
 		`^/v2/video_generation/[^/]+/content$`,
-		`ngx.status = 401`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("缺 %q:\n%s", want, out)
@@ -355,7 +353,7 @@ func TestRenderRoute_VideoAuth(t *testing.T) {
 	if strings.Contains(strict, "/content$") {
 		t.Errorf("auth_public_paths 置空后不该再放行下载:\n%s", strict)
 	}
-	if !strings.Contains(strict, `require("api_keys").check(`) {
+	if !strings.Contains(strict, `require("api_keys").guard(nil)`) {
 		t.Errorf("放行路径关掉后鉴权本身仍应在:\n%s", strict)
 	}
 }

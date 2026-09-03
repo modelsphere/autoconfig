@@ -73,24 +73,9 @@ server {
           这是本模板唯一一处 lua,只在 access 阶段查一次 header,不解析请求体、
           不参与路由决策 —— "纯反向代理"的性质基本不受影响。
         */}}
-        access_by_lua_block {
-            local uri = ngx.var.uri
-            {{- if .AuthPublicPaths}}
-            -- 免鉴权路径:默认放行下载。content.url 是交给最终用户的,
-            -- 浏览器/播放器不会带 Authorization 头;任务 id 是 UUID,等于一次性能力 URL。
-            if ngx.re.find(uri, {{"[=["}}{{.AuthPublicPaths}}{{"]=]"}}, "jo") then
-                return
-            end
-            {{- end}}
-            local ok = require("api_keys").check(ngx.req.get_headers()["authorization"])
-            if not ok then
-                ngx.status = 401
-                ngx.header["Content-Type"] = "application/json"
-                ngx.say([=[{"error":"missing or invalid api key"}]=])
-                return ngx.exit(401)
-            end
-        }
+        access_by_lua_block { require("api_keys").guard({{if .AuthPublicPaths}}{{"[=["}}{{.AuthPublicPaths}}{{"]=]"}}{{else}}nil{{end}}) }
 {{- end}}
+
         proxy_pass http://backend_{{.Route}};
         proxy_http_version 1.1;
         proxy_set_header Connection "";
