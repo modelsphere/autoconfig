@@ -99,6 +99,8 @@ monitor 单例（`replicas: 1` + `Recreate`），chart 不带 hagate。openresty
 | `upload_conn_limit` | 不配 = 不限 | 每 IP 同时在传的连接数(`limit_conn`),超出直接 503 |
 | `upload_req_limit` | 不配 = 不限 | 每 IP 请求速率(`limit_req`,nginx 原生写法如 `10r/s`) |
 | `upload_req_burst` | 不配 = 无突发 | 配合 `upload_req_limit` 的突发额度 |
+| `api_keys` | 不配 = **不鉴权** | 逗号分隔的 Bearer token,与 LLM 路由同一套约定;不匹配返回 401 `{"error":"missing or invalid api key"}` |
+| `auth_public_paths` | `~^/v2/video_generation/[^/]+/content$` | 免鉴权的路径(nginx map 左值)。默认放行下载:`content.url` 交给最终用户,浏览器不带 Authorization 头,而任务 id 是 UUID、相当于一次性能力 URL。置空 = 连下载也要 key |
 | `upload_limit_key` | `$http_x_real_ip` | 上面两个 zone 按什么分组。**不能用 `$binary_remote_addr`** —— 路由挂在 unix socket 上,那一跳没有 IP,路由层的 `$remote_addr` 恒为 `"unix:"`,所有请求会落进同一个桶(实测,见下)。默认用 dispatch 设的 `X-Real-IP`;要精确到每个真实客户端,配成取 `X-Forwarded-For` 最左一跳的变量 |
 
 **下载限速必须配合开缓冲**:`proxy_buffering off` 时 `limit_rate` 会被 nginx 完全忽略

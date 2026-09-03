@@ -320,3 +320,36 @@ func TestRenderRoute_VideoUploadLimitKey(t *testing.T) {
 		}
 	}
 }
+
+// 配了 api_keys 就开 Bearer 鉴权;下载路径默认放行 —— content.url 是交给最终用户的,
+// 浏览器/播放器直接打开不会带 Authorization 头。
+func TestRenderRoute_VideoAPIKeyAuth(t *testing.T) {
+	plain, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
+	if strings.Contains(plain, "401") || strings.Contains(plain, "keyok_") {
+		t.Errorf("没配 api_keys 时不该有鉴权:\n%s", plain)
+	}
+
+	out, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"api_keys": "sk-one, sk-two"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"Bearer sk-one" 1;`,
+		`"Bearer sk-two" 1;`,                       // 逗号分隔 + 去空白
+		`~^/v2/video_generation/[^/]+/content$ 1;`, // 下载默认放行
+		`if ($deny_minimax_h3) {`,
+		`return 401 '{"error":"missing or invalid api key"}';`, // 与 LLM 路由同一句
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("缺 %q:\n%s", want, out)
+		}
+	}
+
+	// 放行路径可关掉(要求连下载也带 key)
+	strict, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"api_keys": "sk-one", "auth_public_paths": ""}))
+	if strings.Contains(strict, "/content$ 1;") {
+		t.Errorf("auth_public_paths 置空后不该再放行下载:\n%s", strict)
+	}
+}

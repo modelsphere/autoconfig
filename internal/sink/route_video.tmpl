@@ -42,6 +42,37 @@ limit_conn_zone {{.UploadLimitKey}} zone=upconn_{{.Var}}:10m;
 limit_req_zone {{.UploadLimitKey}} zone=upreq_{{.Var}}:10m rate={{.UploadReqLimit}};
 {{- end}}
 
+{{- if .APIKeys}}
+{{/*
+  API key 鉴权(与 LLM 路由同一套 Bearer token 约定)。
+  纯反向代理没有 lua 引擎那层,用 map + 一个 if 实现 —— 只用 set/return,
+  不碰 "if is evil" 的那些坑。
+
+  **下载路径默认放行**:content.url 是交给最终用户的,浏览器/播放器直接打开不会带
+  Authorization 头;任务 id 是 UUID,等于一次性的能力 URL。要连下载也校验就把
+  auth_public_paths 设成空。
+*/}}
+map $http_authorization $keyok_{{.Var}} {
+    default 0;
+{{- range .APIKeys}}
+    "Bearer {{.}}" 1;
+{{- end}}
+}
+map $uri $public_{{.Var}} {
+    default 0;
+{{- if .AuthPublicPaths}}
+    {{.AuthPublicPaths}} 1;
+{{- end}}
+}
+{{/* 拼成两位:key 有效或路径公开,任一成立就放行 */}}
+map "$keyok_{{.Var}}$public_{{.Var}}" $deny_{{.Var}} {
+    default 1;
+    "10" 0;
+    "11" 0;
+    "01" 0;
+}
+{{- end}}
+
 upstream backend_{{.Route}} {
 {{- range .Peers}}
     server {{.IP}}:{{.Port}}{{if .Backup}} backup{{end}};   # {{.Name}}
@@ -64,6 +95,16 @@ server {
 {{- end}}
 
     location / {
+{{- if .APIKeys}}
+        # default_type 必须放在 if **外面** —— 它不允许出现在 if 块里
+        # (nginx: "default_type" directive is not allowed here,配置直接起不来)。
+        # 放 location 级无副作用:它只在响应没有 Content-Type 时兜底,
+        # 反代回来的响应自带 Content-Type,不受影响。
+        default_type application/json;
+        if ($deny_{{.Var}}) {
+            return 401 '{"error":"missing or invalid api key"}';
+        }
+{{- end}}
         proxy_pass http://backend_{{.Route}};
         proxy_http_version 1.1;
         proxy_set_header Connection "";

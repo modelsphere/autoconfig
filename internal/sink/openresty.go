@@ -65,6 +65,8 @@ const (
 	// phanrouter 的 IP。要精确到"每真实客户端",配 upload_limit_key 取 XFF 最左一跳
 	// (前提是外层确实透传 X-Forwarded-For)。
 	defaultVideoUploadLimitKey = "$http_x_real_ip"
+	// 免鉴权路径:下载。任务 id 是 UUID,等于一次性能力 URL。
+	defaultVideoAuthPublicPaths = `~^/v2/video_generation/[^/]+/content$`
 )
 
 // videoPeer 是 video 模板看到的 peer:nginx upstream 的一行。
@@ -168,6 +170,11 @@ type videoRouteData struct {
 	// UploadLimitKey:上面两个 zone 按什么分组。默认 $binary_remote_addr(直连对端 IP);
 	// 经外层网关进来时那是同一个 IP,得换成 $http_x_forwarded_for 才有"每客户端"的语义。
 	UploadLimitKey string
+	// APIKeys:配了就开启 Bearer 鉴权(与 LLM 路由同一套约定);空 = 不校验。
+	APIKeys []string
+	// AuthPublicPaths:免鉴权的路径匹配(nginx map 的左值,如 ~^/v2/.../content$)。
+	// 默认放行下载 —— content.url 交给最终用户,浏览器不会带 Authorization 头。
+	AuthPublicPaths string
 }
 
 // toVideoPeers 把发现结果翻成 upstream 行:优先级最高的一组是主用,更低的全部标 backup。
@@ -247,6 +254,8 @@ func renderVideoRoute(d RouteData) (string, error) {
 		RateLimit:       rate,
 		RateLimitAfter:  rateAfter,
 		UploadLimitKey:  firstNonEmpty(d.Extra["upload_limit_key"], defaultVideoUploadLimitKey),
+		APIKeys:         splitKeys(d.Extra["api_keys"]),
+		AuthPublicPaths: authPublicPaths(d.Extra),
 		UploadConnLimit: d.Extra["upload_conn_limit"],
 		UploadReqLimit:  d.Extra["upload_req_limit"],
 		UploadReqBurst:  d.Extra["upload_req_burst"],
@@ -260,6 +269,26 @@ func renderVideoRoute(d RouteData) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// authPublicPaths 取免鉴权路径。不能用 firstNonEmpty —— 那样分不清"没配"(要默认值)
+// 和"显式置空"(= 连下载也要带 key),后者会被悄悄回落成默认,鉴权范围与配置不符。
+func authPublicPaths(extra map[string]string) string {
+	if v, ok := extra["auth_public_paths"]; ok {
+		return v
+	}
+	return defaultVideoAuthPublicPaths
+}
+
+// splitKeys 把逗号分隔的 key 列表拆开并去空白;空串返回 nil(= 不开鉴权)。
+func splitKeys(v string) []string {
+	var out []string
+	for _, k := range strings.Split(v, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 func firstNonEmpty(values ...string) string {

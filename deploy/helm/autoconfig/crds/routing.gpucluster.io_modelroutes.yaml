@@ -278,16 +278,16 @@ spec:
               rule: '!has(self.modelType) || self.modelType != ''video'' || !has(self.monitor)'
             - message: 'modelType: video 的 nginx.values 只支持 max_body_size / proxy_timeout
                 / connect_timeout / rate_limit / rate_limit_after / upload_conn_limit
-                / upload_req_limit / upload_req_burst / upload_limit_key(TTFT/TPS/自适应并发等是
-                LLM 引擎的调优项,video 是纯反向代理,配了不会生效)'
+                / upload_req_limit / upload_req_burst / upload_limit_key / api_keys
+                / auth_public_paths(TTFT/TPS/自适应并发等是 LLM 引擎的调优项,video 是纯反向代理,配了不会生效)'
               rule: '!has(self.modelType) || self.modelType != ''video'' || !has(self.nginx.values)
-                || self.nginx.values.all(k, k in [''max_body_size'',''proxy_timeout'',''connect_timeout'',''rate_limit'',''rate_limit_after'',''upload_conn_limit'',''upload_req_limit'',''upload_req_burst'',''upload_limit_key''])'
+                || self.nginx.values.all(k, k in [''max_body_size'',''proxy_timeout'',''connect_timeout'',''rate_limit'',''rate_limit_after'',''upload_conn_limit'',''upload_req_limit'',''upload_req_burst'',''upload_limit_key'',''api_keys'',''auth_public_paths''])'
             - message: 'max_body_size / proxy_timeout / connect_timeout / rate_limit
                 / rate_limit_after / upload_conn_limit / upload_req_limit / upload_req_burst
-                / upload_limit_key 只对 modelType: video 生效,llm 路由请用 ttft_limit_ms /
-                tps_limit_tps / adaptive_cc_min 等'
+                / upload_limit_key / api_keys / auth_public_paths 只对 modelType: video
+                生效,llm 路由请用 ttft_limit_ms / tps_limit_tps / adaptive_cc_min 等'
               rule: (has(self.modelType) && self.modelType == 'video') || !has(self.nginx.values)
-                || self.nginx.values.all(k, !(k in ['max_body_size','proxy_timeout','connect_timeout','rate_limit','rate_limit_after','upload_conn_limit','upload_req_limit','upload_req_burst','upload_limit_key']))
+                || self.nginx.values.all(k, !(k in ['max_body_size','proxy_timeout','connect_timeout','rate_limit','rate_limit_after','upload_conn_limit','upload_req_limit','upload_req_burst','upload_limit_key','api_keys','auth_public_paths']))
             - message: nginx.peers 用了 cart,但没配 spec.cart
               rule: '!self.nginx.peers.exists(s, s.use == ''cart'') || has(self.cart)'
             - message: cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(>

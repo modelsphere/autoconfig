@@ -50,6 +50,13 @@ spec:
       # upload_conn_limit: "4"      # 每 IP 同时在传的连接数,超出直接 503
       # upload_req_limit: "10r/s"   # 每 IP 请求速率(nginx 原生写法)
       # upload_req_burst: "20"      # 允许的突发条数
+      #
+      # API key 鉴权(与 LLM 路由同一套 Bearer 约定)。配了才开启,逗号分隔多个 key。
+      # api_keys: sk-xxx,sk-yyy
+      # 免鉴权路径,默认放行下载 —— content.url 交给最终用户,浏览器不会带
+      # Authorization 头,而任务 id 是 UUID、相当于一次性能力 URL。
+      # 置空则连下载也要带 key。
+      # auth_public_paths: ~^/v2/video_generation/[^/]+/content$
       # ⚠️ 两个 zone 默认按 $http_x_real_ip 分组(dispatch 转发时设的 X-Real-IP,
       # = openresty 的直连对端)。**不要用 $binary_remote_addr** —— 路由挂在 unix socket
       # 上,那一跳没有 IP,路由层的 $remote_addr 恒为 "unix:",所有请求会落进同一个桶,
