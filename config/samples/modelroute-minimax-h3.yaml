@@ -41,10 +41,13 @@ spec:
       max_body_size: 64m                   # I2V 允许 base64 传图,上游自己在 64MB 处拒
       proxy_timeout: 3600s                 # 生成 + 大文件下载,超时按小时给
       connect_timeout: 10s
-      # 下载限速是可选的:**不配就不限速**。要限就写 rate_limit(接受 200Mbps/1.5Gbps
-      # 这类比特口径,自动换算成 nginx 的字节/秒;也接受 25m/512k 的 nginx 原生写法)。
+      # 下载限速是可选的:**不配就不限速**。要限就写 rate_limit(**总带宽**,接受 200Mbps/1.5Gbps
+      # 这类比特口径,或纯字节数;**不支持** nginx 原生写法 25m/512k —— 要按 download_conn_limit
+      # 均分到每连接,无法对原生写法做除法)。
       # rate_limit: 200Mbps
-      # rate_limit_after: 1m               # 前 N 字节全速,默认 1m,只在配了 rate_limit 时有意义
+      # download_conn_limit: "10"          # 全局并发下载连接数上限。配了 rate_limit 但不写这项时
+      #                                     # 默认按 10 处理(不会退化成不限并发、总带宽无限放大)。
+      #                                     # 每连接 limit_rate = rate_limit / download_conn_limit。
       # 上传方向的闸门(可选,都不配 = 不限)。nginx 没有请求体的字节级限速指令,
       # 能控的是并发数和请求速率 —— 单个来源的入向带宽 = 并发数 × 单条速率。
       # upload_conn_limit: "4"      # 每 IP 同时在传的连接数,超出直接 503

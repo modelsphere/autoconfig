@@ -50,9 +50,11 @@ const (
 	// 单连接下载限速。视频是几十 MB 的大文件,不限速时几个客户端就能把节点网卡吃满,
 	// 波及同一台机上的别的服务(openresty 是共享入口)。200Mbps = 25MB/s。
 	defaultVideoRateLimit = "200Mbps"
-	// 限速的豁免额度:前 N 字节全速。建任务/查询/删除都是几百字节的 JSON,
-	// 不该被下载限速拖慢 —— 只有真正的大响应才会触发限速。
-	defaultVideoRateLimitAfter = "1m"
+	// download_conn_limit 的默认值。配了 rate_limit 但没显式给并发上限时,
+	// 不能退化成"每连接各占满 rate_limit"——那样总下载带宽会随并发数无限放大,
+	// rate_limit 这个总量上限形同虚设。给个安全默认值(10 并发),配合 rate_limit 均分,
+	// 保住"全局下载带宽 ≤ rate_limit"这个承诺;要更大的并发数,显式配 download_conn_limit。
+	defaultVideoDownloadConnLimit = "10"
 	// 上传闸门的分组依据。
 	//
 	// **不能用 $binary_remote_addr**:路由是挂在 unix socket 上的(dispatch 按 /<route>/
@@ -159,8 +161,6 @@ type videoRouteData struct {
 	MaxBodySize    string
 	ProxyTimeout   string
 	ConnectTimeout string
-	RateLimit      string
-	RateLimitAfter string
 	// 上传方向的闸门。nginx 没有请求体的字节级限速,只能靠"并发数 + 请求速率 + 体积上限"三道:
 	// UploadConnLimit = 每 IP 同时在传的连接数;UploadReqLimit = 每 IP 请求速率(nginx 原生写法
 	// 如 10r/s、30r/m);UploadReqBurst = 允许的突发条数。都不配 = 不限。
@@ -176,6 +176,17 @@ type videoRouteData struct {
 	// AuthPublicPaths:免鉴权路径的正则(ngx.re 语法,不带 ~ 前缀)。
 	// 默认放行下载 —— content.url 交给最终用户,浏览器不会带 Authorization 头。
 	AuthPublicPaths string
+	// DownloadConnLimit:**全局(所有客户端合计)** 下载并发连接上限。配了则:
+	//   ① 下载路径(/content)拆一个独立 location,挂 limit_conn —— key 用【常量】(每 route 一个
+	//      固定值),所以是【单一桶、全局计数】,不是每客户端;超限返 429。
+	//   ② 每连接 limit_rate = 总带宽 rate_limit / DownloadConnLimit(见 DownloadRate) → 全局下载
+	//      带宽 ≤ rate_limit,而非每连接各占满 rate_limit。
+	// 配了 rate_limit 但没显式给这项 = 落默认值(defaultVideoDownloadConnLimit,当前 10),
+	// 不会退化成不限并发——那样总带宽随并发数无限放大,rate_limit 就没意义了。
+	// 完全没配 rate_limit(不限速)时也不会有这个字段:没选限速策略,没有总量上限要保护。
+	DownloadConnLimit string
+	// DownloadRate:下载 location 的每连接 limit_rate(字节/秒)= 总带宽 ÷ DownloadConnLimit。
+	DownloadRate string
 }
 
 // toVideoPeers 把发现结果翻成 upstream 行:优先级最高的一组是主用,更低的全部标 backup。
@@ -241,25 +252,50 @@ func renderVideoRoute(d RouteData) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rateAfter := ""
-	if rate != "" {
-		rateAfter = firstNonEmpty(d.Extra["rate_limit_after"], defaultVideoRateLimitAfter)
+	// download_conn_limit:全局下载并发上限。配了就把 rate_limit(总带宽)按并发数均分到每连接,
+	// 并给下载路径挂全局 limit_conn。
+	// 配了 rate_limit 但没显式给这项时,**不能**退化成"每连接各占满 rate_limit"——总带宽会随
+	// 并发数无限放大,rate_limit 这个总量上限就是摆设,所以落一个安全默认值(见常量注释)。
+	// 完全没配 rate_limit 时不下这个默认值:没选限速策略,谈不上要保护什么总量上限。
+	downloadConnLimit := strings.TrimSpace(d.Extra["download_conn_limit"])
+	if downloadConnLimit == "" && rate != "" {
+		downloadConnLimit = defaultVideoDownloadConnLimit
+	}
+	downloadRate := ""
+	if downloadConnLimit != "" {
+		n, cerr := strconv.Atoi(downloadConnLimit)
+		if cerr != nil || n <= 0 {
+			return "", fmt.Errorf("download_conn_limit %q 无效:需为正整数", downloadConnLimit)
+		}
+		if rate == "" {
+			return "", fmt.Errorf("download_conn_limit 需要同时配 rate_limit(总下载带宽,均分到每连接)")
+		}
+		total, perr := strconv.ParseInt(rate, 10, 64)
+		if perr != nil {
+			// rate 是 nginx 原生写法(如 25m)时无法按连接均分 —— 让运维改成 Mbps/Gbps 或纯字节。
+			return "", fmt.Errorf("download_conn_limit 需要 rate_limit 为 Mbps/Gbps 或纯字节数,当前 %q 无法按连接均分", d.Extra["rate_limit"])
+		}
+		per := total / int64(n)
+		if per < 1 {
+			per = 1 // 均分到 0 会让 nginx 报错;钳到 1 字节/秒(病态配置,但不至于起不来)
+		}
+		downloadRate = strconv.FormatInt(per, 10)
 	}
 	v := videoRouteData{
-		Route:           d.Route,
-		Var:             nginxVarName(d.Route),
-		Peers:           toVideoPeers(d.Peers),
-		MaxBodySize:     firstNonEmpty(d.Extra["max_body_size"], defaultVideoMaxBodySize),
-		ProxyTimeout:    firstNonEmpty(d.Extra["proxy_timeout"], defaultVideoProxyTimeout),
-		ConnectTimeout:  firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
-		RateLimit:       rate,
-		RateLimitAfter:  rateAfter,
-		UploadLimitKey:  firstNonEmpty(d.Extra["upload_limit_key"], defaultVideoUploadLimitKey),
-		Auth:            d.Extra["auth"] != "false",
-		AuthPublicPaths: authPublicPaths(d.Extra),
-		UploadConnLimit: d.Extra["upload_conn_limit"],
-		UploadReqLimit:  d.Extra["upload_req_limit"],
-		UploadReqBurst:  d.Extra["upload_req_burst"],
+		Route:             d.Route,
+		Var:               nginxVarName(d.Route),
+		Peers:             toVideoPeers(d.Peers),
+		MaxBodySize:       firstNonEmpty(d.Extra["max_body_size"], defaultVideoMaxBodySize),
+		ProxyTimeout:      firstNonEmpty(d.Extra["proxy_timeout"], defaultVideoProxyTimeout),
+		ConnectTimeout:    firstNonEmpty(d.Extra["connect_timeout"], defaultVideoConnectTimeout),
+		UploadLimitKey:    firstNonEmpty(d.Extra["upload_limit_key"], defaultVideoUploadLimitKey),
+		Auth:              d.Extra["auth"] != "false",
+		AuthPublicPaths:   authPublicPaths(d.Extra),
+		UploadConnLimit:   d.Extra["upload_conn_limit"],
+		UploadReqLimit:    d.Extra["upload_req_limit"],
+		UploadReqBurst:    d.Extra["upload_req_burst"],
+		DownloadConnLimit: downloadConnLimit,
+		DownloadRate:      downloadRate,
 	}
 	tmpl, terr := template.New("route_video").Parse(videoRouteTmpl)
 	if err := terr; err != nil {

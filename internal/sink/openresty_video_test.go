@@ -147,39 +147,51 @@ func TestRenderRoute_VideoNoRateLimitByDefault(t *testing.T) {
 	}
 }
 
-// 配了才限速;换算成 nginx limit_rate 认的字节/秒(200e6/8 = 25,000,000),
-// 并带上伴随默认的 limit_rate_after(让小 JSON 响应全速)。
+// 配了才限速;换算成 nginx limit_rate 认的字节/秒(200e6/8 = 25,000,000)。
+// 没显式给 download_conn_limit 时落默认值 10,每连接 = 25000000/10 = 2500000。
+// 不再有 limit_rate_after —— rc2 起下载 location 从第一字节就限速。
 func TestRenderRoute_VideoRateLimitWhenConfigured(t *testing.T) {
 	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
 		map[string]string{"rate_limit": "200Mbps"}))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	for _, want := range []string{"limit_rate       25000000;", "limit_rate_after 1m;"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("缺少 %q:\n%s", want, got)
-		}
+	if !strings.Contains(got, "limit_rate       2500000;") {
+		t.Errorf("缺少每连接限速 2500000(200Mbps/默认并发 10):\n%s", got)
+	}
+	if regexp.MustCompile(`(?m)^\s*limit_rate_after\s`).MatchString(got) {
+		t.Errorf("不该再有 limit_rate_after 指令:\n%s", got)
 	}
 }
 
+// Mbps/Gbps/纯字节数都能按 download_conn_limit 均分,nginx 原生写法(25m/512k)不能整除、
+// 现在必须显式报错 —— 不能悄悄退回"不限并发"。
 func TestRenderRoute_VideoRateLimitOverride(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"1Gbps", "limit_rate       125000000;"}, // 1e9/8
-		{"400mbps", "limit_rate       50000000;"},
-		{"25m", "limit_rate       25m;"}, // nginx 原生写法原样透传
-		{"512k", "limit_rate       512k;"},
+		{"1Gbps", "limit_rate       12500000;"},  // 1e9/8/10
+		{"400mbps", "limit_rate       5000000;"}, // 400e6/8/10
 	}
 	for _, c := range cases {
 		got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
-			map[string]string{"rate_limit": c.in, "rate_limit_after": "4m"}))
+			map[string]string{"rate_limit": c.in}))
 		if err != nil {
 			t.Fatalf("rate_limit=%q: %v", c.in, err)
 		}
 		if !strings.Contains(got, c.want) {
 			t.Errorf("rate_limit=%q 期望 %q,实际:\n%s", c.in, c.want, got)
 		}
-		if !strings.Contains(got, "limit_rate_after 4m;") {
-			t.Errorf("rate_limit_after 覆盖未生效")
+	}
+}
+
+// nginx 原生写法(25m/512k)无法按 download_conn_limit 均分。以前(没有 download_conn_limit
+// 概念时)这类写法会原样透传、退化成"每连接各占满带宽";现在只要配了 rate_limit 就必然要均分
+// (要么显式给 download_conn_limit,要么落默认值 10),原生写法直接报错,而不是悄悄不限并发。
+func TestRenderRoute_VideoRateLimitNativeFormatRejected(t *testing.T) {
+	for _, in := range []string{"25m", "512k"} {
+		_, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+			map[string]string{"rate_limit": in}))
+		if err == nil || !strings.Contains(err.Error(), "均分") {
+			t.Errorf("rate_limit=%q(nginx 原生写法)应报错要求改用 Mbps/Gbps,got: %v", in, err)
 		}
 	}
 }
@@ -227,17 +239,24 @@ func TestRenderRoute_VideoAllowsTwoTiers(t *testing.T) {
 // buffering on 4.61s / buffering off 0.089s;proxy_limit_rate 同样只在开缓冲时有效)。
 // 所以配了限速就必须开缓冲,并用 proxy_max_temp_file_size 0 避免落盘。
 // 这两件事必须成对出现,拆开任意一半都会让限速变成死配置。
+// 配了 rate_limit 后渲染出两个 location:/content(下载,限速+开缓冲)和 /(提交/查询,不缓冲)。
+// 两者的 proxy_buffering 取值刻意相反,所以按 location 分别检查,不能对整份输出做全局 Contains
+// (那样两个 location 各自的指令会互相"抵消"看似矛盾,rc2 拆分 location 后旧的全局断言已经不成立)。
 func TestRenderRoute_VideoRateLimitRequiresBuffering(t *testing.T) {
 	limited, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
 		map[string]string{"rate_limit": "200Mbps"}))
-	if !strings.Contains(limited, "proxy_buffering on;") {
-		t.Errorf("配了限速必须开缓冲,否则 limit_rate 被忽略:\n%s", limited)
+	dlLoc, rootLoc := splitVideoLocations(t, limited)
+	if !strings.Contains(dlLoc, "proxy_buffering on;") {
+		t.Errorf("下载 location 配了限速必须开缓冲,否则 limit_rate 被忽略:\n%s", dlLoc)
 	}
-	if !strings.Contains(limited, "proxy_max_temp_file_size 0;") {
-		t.Errorf("开缓冲时要禁临时文件,免得几十 MB 的视频落盘:\n%s", limited)
+	if !strings.Contains(dlLoc, "proxy_max_temp_file_size 0;") {
+		t.Errorf("下载 location 开缓冲时要禁临时文件,免得几十 MB 的视频落盘:\n%s", dlLoc)
 	}
-	if strings.Contains(limited, "proxy_buffering off;") {
-		t.Errorf("同一个 location 里不该又出现 proxy_buffering off:\n%s", limited)
+	if strings.Contains(dlLoc, "proxy_buffering off;") {
+		t.Errorf("下载 location 不该出现 proxy_buffering off:\n%s", dlLoc)
+	}
+	if !strings.Contains(rootLoc, "proxy_buffering off;") {
+		t.Errorf("location / 是提交/查询,应保持不缓冲:\n%s", rootLoc)
 	}
 
 	plain, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
@@ -247,6 +266,16 @@ func TestRenderRoute_VideoRateLimitRequiresBuffering(t *testing.T) {
 	if strings.Contains(plain, "proxy_max_temp_file_size") {
 		t.Errorf("没开缓冲就不需要 proxy_max_temp_file_size:\n%s", plain)
 	}
+}
+
+// splitVideoLocations 把渲染结果切成 /content location 和 / location 两段,便于分别断言。
+func splitVideoLocations(t *testing.T, conf string) (dlLoc, rootLoc string) {
+	t.Helper()
+	rootIdx := strings.Index(conf, "location / {")
+	if rootIdx < 0 {
+		t.Fatalf("找不到 location /:\n%s", conf)
+	}
+	return conf[:rootIdx], conf[rootIdx:]
 }
 
 // 上传方向:不配 = 一行闸门都不渲染;配了则 zone 声明(http 级,server 块之外)与
@@ -355,5 +384,107 @@ func TestRenderRoute_VideoAuth(t *testing.T) {
 	}
 	if !strings.Contains(strict, `require("api_keys").guard(nil)`) {
 		t.Errorf("放行路径关掉后鉴权本身仍应在:\n%s", strict)
+	}
+}
+
+// download_conn_limit:全局下载并发上限 + 每连接 limit_rate = 总带宽 / 并发数。
+func TestRenderRoute_VideoDownloadConnLimit(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "200Mbps", "download_conn_limit": "4"}))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		`map $host $dlkey_minimax_h3 {`, // 常量 key -> 全局单桶
+		`default "minimax-h3";`,
+		"limit_conn_zone $dlkey_minimax_h3 zone=dlconn_minimax_h3:10m;",
+		"location ~ ^/v2/video_generation/[^/]+/content$ {", // 下载单独 location
+		"limit_conn        dlconn_minimax_h3 4;",
+		"limit_conn_status 429;",
+		"limit_rate       6250000;", // 200Mbps=25000000, /4 = 6250000
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("缺少 %q:\n%s", want, got)
+		}
+	}
+	// 配了 download_conn_limit 时,下载 location 不设 limit_rate_after(从第一字节就限,保全局封顶)。
+	// 用正则只匹配【指令行】(行首非 #),避免命中注释里提到的 "limit_rate_after" 字样。
+	if regexp.MustCompile(`(?m)^\s*limit_rate_after\s`).MatchString(got) {
+		t.Errorf("配了 download_conn_limit 后不该有 limit_rate_after 指令(应从第 0 字节限速):\n%s", got)
+	}
+	// 配了 download_conn_limit 时,location / 不再有整带宽 limit_rate(25000000 只会在旧行为里出现)。
+	if strings.Contains(got, "25000000") {
+		t.Errorf("配了 download_conn_limit 后不该出现每连接整带宽 25000000:\n%s", got)
+	}
+}
+
+func TestRenderRoute_VideoDownloadConnLimitDivides(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "200Mbps", "download_conn_limit": "5"}))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(got, "limit_rate       5000000;") { // 25000000/5
+		t.Errorf("每连接限速应为 5000000(200Mbps/5):\n%s", got)
+	}
+}
+
+// 配了 rate_limit 但没显式给 download_conn_limit 时,**不能**退化成"不限并发、每连接各占满
+// rate_limit"——那样总带宽随并发数无限放大,rate_limit 就是摆设。必须落默认值(10)。
+func TestRenderRoute_VideoDownloadConnLimitDefaultsWhenRateSetButAbsent(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "200Mbps"})) // 不显式配 download_conn_limit
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		"location ~ ^/v2/video_generation/[^/]+/content$ {",
+		"limit_conn        dlconn_minimax_h3 10;", // 默认并发上限 10
+		"limit_rate       2500000;",               // 200Mbps/10
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("缺少 %q(应落默认 download_conn_limit=10):\n%s", want, got)
+		}
+	}
+}
+
+// 完全没配 rate_limit(没选限速策略)时,download_conn_limit 也不该有默认值——
+// 没有总量上限要保护,不该凭空生出一个并发限制。
+func TestRenderRoute_VideoNoRateNoDownloadConnLimit(t *testing.T) {
+	got, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}}, nil))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, forbidden := range []string{"dlconn_", "limit_conn_status", "location ~ ^/v2/video_generation", "limit_rate"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("没配 rate_limit 不该出现 %q:\n%s", forbidden, got)
+		}
+	}
+}
+
+func TestRenderRoute_VideoDownloadConnLimitRejectsInvalid(t *testing.T) {
+	for _, bad := range []string{"0", "-1", "abc", "3.5"} {
+		_, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+			map[string]string{"rate_limit": "200Mbps", "download_conn_limit": bad}))
+		if err == nil {
+			t.Errorf("download_conn_limit=%q 应报错", bad)
+		}
+	}
+}
+
+func TestRenderRoute_VideoDownloadConnLimitNeedsRate(t *testing.T) {
+	_, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"download_conn_limit": "4"})) // 没配 rate_limit
+	if err == nil || !strings.Contains(err.Error(), "rate_limit") {
+		t.Errorf("download_conn_limit 无 rate_limit 应报错提示 rate_limit,got: %v", err)
+	}
+}
+
+func TestRenderRoute_VideoDownloadConnLimitRejectsNativeRate(t *testing.T) {
+	// nginx 原生写法(25m)无法按连接均分 -> 报错让运维改成 Mbps/Gbps。
+	_, err := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
+		map[string]string{"rate_limit": "25m", "download_conn_limit": "4"}))
+	if err == nil || !strings.Contains(err.Error(), "均分") {
+		t.Errorf("原生 rate_limit + download_conn_limit 应报错,got: %v", err)
 	}
 }
