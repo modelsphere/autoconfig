@@ -860,3 +860,84 @@ func TestRouteKeyOwner_IncumbentBeatsOlderRenamer(t *testing.T) {
 		t.Errorf("改名撞过来的 B 应判冲突,得到 %+v", c)
 	}
 }
+
+// 同一个模型的多个 ModelRoute(canary baseline/experiment)必须生成**互不相同**的 nginx 名。
+//
+// 2026-09-08 事故:nginx 名按 m.Model 派生,mf-dummpy / -canary-baseline / -canary-experiment
+// 三个 ModelRoute 共用 model=mf-dummpy-test,生成三条同名 `nginx: mf-dummpy-test-nginx-0`,
+// monitor 首载解析失败、拒绝启动,整套 k8s 监控挂掉。三个入口 VIP 各不相同,三条行都该保留,
+// 只是名字必须唯一 —— 用 ModelRoute 名(k8s 对象名天然唯一)。
+func TestMonitorNginxNameUniquePerRoute(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+
+	const model = "mf-dummpy-test"
+	names := []string{"mf-dummpy", "mf-dummpy-canary-baseline", "mf-dummpy-canary-experiment"}
+	seen := map[string]string{} // nginx 名 → 来自哪个 route
+
+	for i, name := range names {
+		rb := &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "llm-route"},
+			Spec: routingv1.ModelRouteSpec{
+				Discovery: routingv1.Discovery{Service: name + "-leader", Port: 8050},
+				Nginx: routingv1.NginxSpec{
+					Route: "mf-dummpy", OutputConfigMap: "openresty/openresty-conf",
+					Service: "openresty/" + name + "-or", // 每个 route 自己的入口 Service → 不同 VIP
+				},
+				Monitor: &routingv1.MonitorSpec{
+					OutputConfigMap: "monitor/monitor-conf", Model: model, GPUType: "A100",
+				},
+			},
+		}
+		cmOR := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "openresty"}}
+		cmMon := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "monitor-conf", Namespace: "monitor"}}
+		cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(rb, cmOR, cmMon).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+		cs := k8sfake.NewSimpleClientset(
+			epslice(name+"-leader-1", name+"-leader", "llm-route", "192.168.28.10"),
+			// 入口 Service 的端口必须**带名字** dispatch —— controller 按名取(端口号在 chart 里)
+			&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-or", Namespace: "openresty"},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "10.96.88.1" + string(rune('0'+i)),
+					Ports:     []corev1.ServicePort{{Name: "dispatch", Port: 8080}},
+				},
+			},
+		)
+		r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+		nn := types.NamespacedName{Namespace: "llm-route", Name: name}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+			t.Fatalf("%s reconcile 1: %v", name, err)
+		}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+			t.Fatalf("%s reconcile 2: %v", name, err)
+		}
+
+		var monCM corev1.ConfigMap
+		if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "monitor", Name: "monitor-conf"}, &monCM); err != nil {
+			t.Fatalf("get monitor-conf: %v", err)
+		}
+		var got string
+		for _, v := range monCM.Data {
+			for _, line := range strings.Split(v, "\n") {
+				if strings.HasPrefix(line, "nginx:") {
+					got = strings.TrimSpace(strings.Split(strings.TrimPrefix(line, "nginx:"), "|")[0])
+				}
+			}
+		}
+		if got == "" {
+			t.Fatalf("%s: 没有生成 nginx 行\n%v", name, monCM.Data)
+		}
+		if strings.Contains(got, model) {
+			t.Errorf("%s: nginx 名 %q 仍按模型名派生 —— 多 route 共模型时必然撞名", name, got)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Fatalf("nginx 名撞车:%q 同时来自 %s 和 %s(正是 2026-09-08 弄挂 monitor 的那个 bug)", got, prev, name)
+		}
+		seen[got] = name
+	}
+	if len(seen) != len(names) {
+		t.Fatalf("期望 %d 个不同的 nginx 名,实得 %d:%v", len(names), len(seen), seen)
+	}
+}
