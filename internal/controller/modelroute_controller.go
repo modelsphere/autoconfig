@@ -299,14 +299,19 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil
 			}
-			// 名字用 **ModelRoute 名**(k8s 对象名,天然唯一),不用 m.Model:
-			// 同一个模型可以有多个 ModelRoute(canary baseline/experiment 就是),它们各自有
-			// 不同的 openresty 入口 VIP —— 三条 nginx 行都该保留,但按模型命名会全部撞成同一个名字。
-			// 2026-09-08 事故:mf-dummpy / -canary-baseline / -canary-experiment 三个 ModelRoute
-			// 共用 model=mf-dummpy-test,生成三条 `nginx: mf-dummpy-test-nginx-0`,monitor 首载
-			// 解析失败拒绝启动,整套 k8s 监控挂掉(monitor 侧已改成去重+WARN,但重名本身该在这里消除,
-			// 否则三个入口里只有一个被探测,另两个是监控盲区)。
-			nginxName = rb.Name
+			// 名字用 **<ns>-<name>**,不用 m.Model,也不只用 rb.Name:
+			//
+			// ① 不用 m.Model:同一个模型可以有多个 ModelRoute(canary baseline/experiment 就是),
+			//    它们各自有不同的 openresty 入口 VIP —— 三条 nginx 行都该保留,但按模型命名会全部
+			//    撞成同一个名字。2026-09-08 事故:mf-dummpy / -canary-baseline / -canary-experiment
+			//    共用 model=mf-dummpy-test,生成三条 `nginx: mf-dummpy-test-nginx-0`,monitor 首载
+			//    解析失败、整套 k8s 监控挂掉。
+			// ② 只用 rb.Name 仍不够:k8s 对象名**只在 namespace 内唯一**,两个 ns 各建一个同名
+			//    ModelRoute(合法且并不罕见,如按 ns 隔离的多套 kimi-k2.6)照样撞。
+			// 带上 ns 才是真正唯一,也与本文件里 service label 的口径一致(那个就是 ns/name)。
+			// 用连字符而非 "/":monitor.conf 是 `名字 | url` 的行格式,名字里带 / 虽不冲突但
+			// 影响可读性与后续按名字做前缀匹配。
+			nginxName = rb.Namespace + "-" + rb.Name
 		}
 		if rb.Spec.Cart != nil && (m.Router == nil || *m.Router) { // 复用已探测的 CART pod 作 router
 			routerPeers = cartPeers

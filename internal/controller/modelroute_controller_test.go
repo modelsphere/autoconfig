@@ -932,6 +932,10 @@ func TestMonitorNginxNameUniquePerRoute(t *testing.T) {
 		if strings.Contains(got, model) {
 			t.Errorf("%s: nginx 名 %q 仍按模型名派生 —— 多 route 共模型时必然撞名", name, got)
 		}
+		if !strings.HasPrefix(got, "llm-route-") {
+			t.Errorf("%s: nginx 名 %q 应带 namespace 前缀 —— 只用对象名的话,"+
+				"两个 ns 各建一个同名 ModelRoute 仍会撞", name, got)
+		}
 		if prev, dup := seen[got]; dup {
 			t.Fatalf("nginx 名撞车:%q 同时来自 %s 和 %s(正是 2026-09-08 弄挂 monitor 的那个 bug)", got, prev, name)
 		}
@@ -939,5 +943,79 @@ func TestMonitorNginxNameUniquePerRoute(t *testing.T) {
 	}
 	if len(seen) != len(names) {
 		t.Fatalf("期望 %d 个不同的 nginx 名,实得 %d:%v", len(names), len(seen), seen)
+	}
+}
+
+// 两个 **不同 namespace** 里的同名 ModelRoute,必须生成不同的 nginx 名。
+//
+// k8s 对象名只在 namespace 内唯一 —— 按 ns 隔离的多套同名部署(如各团队一套 kimi-k2.6)
+// 完全合法。只用 rb.Name 命名的话它们会撞成同一条 nginx 行,重演 2026-09-08 的故障
+// (monitor 侧现在会去重跳过,不再挂,但被跳过的那个入口就成了监控盲区)。
+func TestMonitorNginxNameUniqueAcrossNamespaces(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+
+	const same = "kimi-k2.6" // 两个 ns 里**同名**的 ModelRoute
+	seen := map[string]string{}
+
+	for i, ns := range []string{"team-a", "team-b"} {
+		rb := &routingv1.ModelRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: same, Namespace: ns},
+			Spec: routingv1.ModelRouteSpec{
+				Discovery: routingv1.Discovery{Service: same + "-leader", Port: 8050},
+				Nginx: routingv1.NginxSpec{
+					Route: "kimi", OutputConfigMap: "openresty/openresty-conf",
+					Service: "openresty/" + ns + "-or",
+				},
+				Monitor: &routingv1.MonitorSpec{
+					OutputConfigMap: "monitor/monitor-conf", Model: same, GPUType: "H100",
+				},
+			},
+		}
+		cmOR := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "openresty"}}
+		cmMon := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "monitor-conf", Namespace: "monitor"}}
+		cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(rb, cmOR, cmMon).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+		cs := k8sfake.NewSimpleClientset(
+			epslice(same+"-leader-1", same+"-leader", ns, "192.168.40.10"),
+			&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: ns + "-or", Namespace: "openresty"},
+				Spec: corev1.ServiceSpec{
+					ClusterIP: "10.96.77.1" + string(rune('0'+i)),
+					Ports:     []corev1.ServicePort{{Name: "dispatch", Port: 8080}},
+				},
+			},
+		)
+		r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+		nn := types.NamespacedName{Namespace: ns, Name: same}
+		for range 2 { // 第一次加 finalizer,第二次真正干活
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+				t.Fatalf("%s reconcile: %v", ns, err)
+			}
+		}
+		var monCM corev1.ConfigMap
+		if err := cl.Get(context.Background(),
+			types.NamespacedName{Namespace: "monitor", Name: "monitor-conf"}, &monCM); err != nil {
+			t.Fatalf("get monitor-conf: %v", err)
+		}
+		var got string
+		for _, v := range monCM.Data {
+			for _, line := range strings.Split(v, "\n") {
+				if strings.HasPrefix(line, "nginx:") {
+					got = strings.TrimSpace(strings.Split(strings.TrimPrefix(line, "nginx:"), "|")[0])
+				}
+			}
+		}
+		if got == "" {
+			t.Fatalf("%s: 没有生成 nginx 行\n%v", ns, monCM.Data)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Fatalf("跨 ns 同名撞车:%q 同时来自 %s 和 %s", got, prev, ns)
+		}
+		seen[got] = ns
+	}
+	if len(seen) != 2 {
+		t.Fatalf("期望 2 个不同的 nginx 名,实得 %d:%v", len(seen), seen)
 	}
 }
