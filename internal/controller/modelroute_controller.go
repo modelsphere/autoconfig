@@ -299,19 +299,18 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				r.setStatus(ctx, req.NamespacedName, len(backends), len(cartPeers), false, "DiscoverError", fmt.Sprintf("discover nginx: %v", err))
 				return ctrl.Result{RequeueAfter: resyncEvery}, nil
 			}
-			// 名字用 **ModelRoute 名**(rb.Name),不用 m.Model:
-			// 同一个模型可以有多个 ModelRoute(canary baseline/experiment 就是),它们各自有
-			// 不同的 openresty 入口 VIP —— 三条 nginx 行都该保留,但按模型命名会全部撞成同一个名字。
-			// 2026-09-08 事故:mf-dummpy / -canary-baseline / -canary-experiment 共用
-			// model=mf-dummpy-test,生成三条 `nginx: mf-dummpy-test-nginx-0`,monitor 首载解析失败、
-			// 整套 k8s 监控挂掉。
+			// 名字按 **spec.monitor.model**(部署方在 ModelRoute 里写的 served-model-name),
+			// 省略时回落 metadata.name —— 这是这个字段的既定语义,保持不变。
 			//
-			// ⚠️ 已知边界:k8s 对象名**只在 namespace 内唯一**,两个 ns 各建一个同名 ModelRoute
-			// 仍会撞。试过带上 ns 前缀(0.3.43),但 ns 与 name 常常相同,拼出来是
-			// `modelforge-01-glm-modelforge-01-glm-nginx-0` 这种,可读性太差,已回退。
-			// 现网 7 个 ModelRoute 无跨 ns 同名;真出现时 monitor 侧会去重跳过并打 WARN
-			// (不再拒绝启动),被跳过的入口成为监控盲区 —— 届时再按 ns 区分。
-			nginxName = rb.Name
+			// ⚠️ 已知代价:多个 ModelRoute 填同一个 model 时(canary 场景下是自然写法)会生成
+			// 同名 nginx 条目。2026-09-08 因此让 monitor 拒绝启动、整套 k8s 监控挂掉。
+			// 现在 monitor 侧(llm-monitor 0.1.17+)对 nginx 重名改为**去重保留第一条 + WARN**,
+			// 不再拒绝启动;代价是被跳过的那个入口没有反代探测,成为监控盲区。
+			// 试过改按 rb.Name(0.3.42)和 <ns>-<name>(0.3.43)派生,但那样名字就不再是模型名、
+			// 且 ns 与 name 常相同拼出来很难读,已回退 —— 以 model 为准。
+			if nginxName = m.Model; nginxName == "" {
+				nginxName = rb.Name
+			}
 		}
 		if rb.Spec.Cart != nil && (m.Router == nil || *m.Router) { // 复用已探测的 CART pod 作 router
 			routerPeers = cartPeers
