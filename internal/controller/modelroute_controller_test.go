@@ -860,3 +860,180 @@ func TestRouteKeyOwner_IncumbentBeatsOlderRenamer(t *testing.T) {
 		t.Errorf("改名撞过来的 B 应判冲突,得到 %+v", c)
 	}
 }
+
+// 覆盖层模式(CartSpec.OutputKey 非 config.yaml):autoconfig 只写那一个 key,内容只有 workers;
+// chart 建的 config.yaml 底稿一个字节都不动,且 key 不预先存在也照写(key 空 ≠ 故障)。
+func TestReconcileCartOutputKey(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+
+	const baseYAML = "server:\n  host: \"0.0.0.0\"\n  port: 8071\nproxy:\n  add_routed_peer_header: true\n"
+	rb := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "glm"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: routingv1.Discovery{Service: "glm-leader", Port: 8050},
+			Cart: &routingv1.CartSpec{
+				Service: "cart-glm", Port: 8071,
+				OutputConfigMap: "glm/cart-config", OutputKey: "workers.yaml", MaxLoad: 20,
+			},
+			Nginx: routingv1.NginxSpec{
+				Route: "glm", OutputConfigMap: "openresty/openresty-conf",
+				Peers: []routingv1.RoutePeer{{Use: "cart", Priority: 2}, {Use: "backend", Priority: 1}},
+			},
+		},
+	}
+	// chart 只建 config.yaml 底稿,没有 workers.yaml 这个 key
+	cmCart := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cart-config", Namespace: "glm"},
+		Data:       map[string]string{"config.yaml": baseYAML},
+	}
+	cmOR := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "openresty"}}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(rb, cmCart, cmOR).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	cs := k8sfake.NewSimpleClientset(
+		epslice("glm-leader-1", "glm-leader", "glm", "10.1.0.1", "10.1.0.2"),
+		epslice("cart-glm-1", "cart-glm", "glm", "10.9.0.1"),
+		svcClusterIP("cart-glm", "glm", "10.96.0.71", 8071),
+	)
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nn := types.NamespacedName{Namespace: "glm", Name: "m"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "glm", Name: "cart-config"}, &cm); err != nil {
+		t.Fatalf("get cart-config: %v", err)
+	}
+	if got := cm.Data["config.yaml"]; got != baseYAML {
+		t.Errorf("底稿 config.yaml 被动过了:\nwant %q\ngot  %q", baseYAML, got)
+	}
+	w := cm.Data["workers.yaml"]
+	for _, want := range []string{"workers:", "http://10.1.0.1:8050", "http://10.1.0.2:8050", "max_load: 20"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("workers.yaml 缺 %q\n%s", want, w)
+		}
+	}
+	// 覆盖层只放 workers —— 混进底稿的键会在合并时盖掉 chart 的值
+	for _, bad := range []string{"server:", "proxy:", "10.9.0.1"} {
+		if strings.Contains(w, bad) {
+			t.Errorf("workers.yaml 不该出现 %q\n%s", bad, w)
+		}
+	}
+}
+
+// fail-safe 只挡「ConfigMap 读不到」:CM 不存在时跳过 cart 写入(不 clobber),
+// 但 discovery / openresty 照常推进 —— 不能因为 cart CM 没建好就卡住整条路由。
+func TestReconcileCartConfigMapMissing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+
+	rb := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "glm"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: routingv1.Discovery{Service: "glm-leader", Port: 8050},
+			Cart: &routingv1.CartSpec{
+				Service: "cart-glm", Port: 8071,
+				OutputConfigMap: "glm/nope", OutputKey: "workers.yaml", MaxLoad: 20,
+			},
+			Nginx: routingv1.NginxSpec{
+				Route: "glm", OutputConfigMap: "openresty/openresty-conf",
+				Peers: []routingv1.RoutePeer{{Use: "cart", Priority: 2}, {Use: "backend", Priority: 1}},
+			},
+		},
+	}
+	cmOR := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "openresty"}}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(rb, cmOR).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	cs := k8sfake.NewSimpleClientset(
+		epslice("glm-leader-1", "glm-leader", "glm", "10.1.0.1"),
+		epslice("cart-glm-1", "cart-glm", "glm", "10.9.0.1"),
+		svcClusterIP("cart-glm", "glm", "10.96.0.71", 8071),
+	)
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nn := types.NamespacedName{Namespace: "glm", Name: "m"}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+			t.Fatalf("reconcile %d: %v", i+1, err)
+		}
+	}
+	// cart CM 读不到 → 不创建、不写
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "glm", Name: "nope"}, &cm); err == nil {
+		t.Errorf("autoconfig 只更新不创建,不该建出 %v", cm.Name)
+	}
+	// openresty 那边照样写了
+	var or corev1.ConfigMap
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "openresty", Name: "openresty-conf"}, &or); err != nil {
+		t.Fatalf("get openresty-conf: %v", err)
+	}
+	if len(or.Data) == 0 {
+		t.Error("cart CM 缺失不该拦住 openresty 的写入")
+	}
+}
+
+// 回归:默认 key(outputKey 省略 → config.yaml,独占底稿)下,内容为空仍必须【跳过写入】——
+// 2026-08-13 mf-fallback「clobber base → cart 拒绝 reload → workers 永久冻结」的防线。
+// 与覆盖层模式(显式 outputKey,空 = 首轮起步 → 照写,见 TestReconcileCartOutputKey)区别对待。
+func TestReconcileCart_DefaultKeyStillSkipsOnEmpty(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = routingv1.AddToScheme(scheme)
+
+	rb := &routingv1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "glm"},
+		Spec: routingv1.ModelRouteSpec{
+			Discovery: routingv1.Discovery{Service: "glm-leader", Port: 8050},
+			Cart: &routingv1.CartSpec{
+				Service: "cart-glm", Port: 8071,
+				OutputConfigMap: "glm/cart-config", MaxLoad: 20, // OutputKey 省略 = 独占底稿
+			},
+			Nginx: routingv1.NginxSpec{
+				Route: "glm", OutputConfigMap: "openresty/openresty-conf",
+				Peers: []routingv1.RoutePeer{{Use: "cart", Priority: 2}, {Use: "backend", Priority: 1}},
+			},
+		},
+	}
+	// CM 在,但底稿被清空了(kubectl edit 手滑 / values.baseConfig 置空 / chart 渲出空值)
+	cmCart := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cart-config", Namespace: "glm"},
+		Data:       map[string]string{"config.yaml": ""},
+	}
+	cmOR := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "openresty-conf", Namespace: "openresty"}}
+	cl := ctrlfake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(rb, cmCart, cmOR).WithStatusSubresource(&routingv1.ModelRoute{}).Build()
+	cs := k8sfake.NewSimpleClientset(
+		epslice("glm-leader-1", "glm-leader", "glm", "10.1.0.1", "10.1.0.2"),
+		epslice("cart-glm-1", "cart-glm", "glm", "10.9.0.1"),
+		svcClusterIP("cart-glm", "glm", "10.96.0.71", 8071),
+	)
+	r := &ModelRouteReconciler{Client: cl, Clientset: cs, Scheme: scheme}
+	nn := types.NamespacedName{Namespace: "glm", Name: "m"}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}); err != nil {
+			t.Fatalf("reconcile %d: %v", i+1, err)
+		}
+	}
+
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "glm", Name: "cart-config"}, &cm); err != nil {
+		t.Fatalf("get cart-config: %v", err)
+	}
+	// 关键断言:没有渲染出只剩 workers 的文档写回去
+	if got := cm.Data["config.yaml"]; got != "" {
+		t.Errorf("独占底稿为空时不得写入(会 clobber chart 的 server/cache/proxy/health),得到:\n%s", got)
+	}
+	// 但 openresty 照常推进 —— 不能因为 cart 底稿空了就卡住整条路由
+	var or corev1.ConfigMap
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "openresty", Name: "openresty-conf"}, &or); err != nil {
+		t.Fatalf("get openresty-conf: %v", err)
+	}
+	if len(or.Data) == 0 {
+		t.Error("cart 底稿为空不该拦住 openresty 的写入")
+	}
+}
