@@ -117,22 +117,34 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 2) CART(可选):渲染 workers 写 cart-config,并发现 CART pod 供 openresty 引用
 	var cartPeers []config.Peer
 	if c := rb.Spec.Cart; c != nil {
-		// 底稿(server/cache/health/proxy)来自 chart 建的 cart-config(values.baseConfig);autoconfig 只覆盖 workers 键。
-		// 读现有 config.yaml 当底稿(YAML 解析,替换 workers)。
-		// fail-safe:底稿读空(ConfigMap 缺失 / 瞬时读失败 / config.yaml 空)时【绝不】用内置最小默认去写——
-		// 那会把 chart 的 server.port/proxy.add_routed_peer_header/health.endpoint 整段 clobber 掉,
-		// 与【运行中 cart 启动时读到的 base】不一致 → cart 只接受「仅 workers 变化」的 reload → 整包拒绝 →
-		// workers 永久冻结在启动集合(2026-08-13 mf-fallback 踩坑:live 卡 4 而实际后端 8)。
-		// 保留现有 ConfigMap(base + 上次 workers),本轮跳过 cart 写入、requeue 重试;discovery/nginx 照常走。
-		base := r.readConfigMapKey(ctx, c.OutputConfigMap, "config.yaml", rb.Namespace)
-		if base == "" {
-			log.Info("cart base config.yaml not readable, keep last cart config (fail-safe, no clobber)", "cm", c.OutputConfigMap)
+		// autoconfig 只认「ConfigMap 名 + 可选 key」:把 workers 写进那个 key,key 里其余内容原样保留。
+		// key 省略 = config.yaml(底稿和 workers 同一个 key);指到只放 workers 的 key 则两边各写各的。
+		//
+		// fail-safe 挡两种情况,都是「宁可这轮不写,也不拿空 base 渲染」:
+		//   a) 【ConfigMap 读不到】(缺失 / 瞬时失败)——两种模式都挡;
+		//   b) 【独占底稿模式下那个 key 是空的】——只在 outputKey 省略时挡,见下。
+		// 拿空 base 渲染会吐出只剩 workers 的文档,把 live 的 server/cache/proxy/health 段 clobber 掉 →
+		// cart 只接受「仅 workers 变化」的 reload → 整包拒绝 → workers 永久冻结在启动集合
+		// (2026-08-13 mf-fallback 踩坑:live 卡 4 而实际后端 8)。discovery/nginx 照常走。
+		//
+		// 「base 为空」在两种模式下含义相反,outputKey 设没设本身就是足够的信号:
+		//   - 省略(落点 config.yaml)= 独占底稿,和 chart 同一个 key。空 = 底稿没了(kubectl edit 手滑 /
+		//     values.baseConfig 被置空 / chart 渲出空值)→ 必须跳过。
+		//   - 显式设了(落点如 workers.yaml)= 覆盖层,这个 key 归 autoconfig 独占,chart 不碰。
+		//     空 = 首轮还没建过 → 照写,没有任何东西会被覆盖。
+		cartKey, exclusiveBase := c.OutputKey, false
+		if cartKey == "" {
+			cartKey, exclusiveBase = "config.yaml", true
+		}
+		if base, ok := r.readConfigMapKey(ctx, c.OutputConfigMap, cartKey, rb.Namespace); !ok || (exclusiveBase && base == "") {
+			log.Info("cart base not readable, keep last cart config (fail-safe, no clobber)",
+				"cm", c.OutputConfigMap, "key", cartKey, "cmFound", ok)
 		} else {
 			cartYAML, rerr := sink.RenderCart(base, backends, c.MaxLoad)
 			if rerr != nil {
 				return ctrl.Result{}, fmt.Errorf("render cart config: %w", rerr)
 			}
-			if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{"config.yaml": cartYAML}); err != nil {
+			if err := r.writeConfigMap(ctx, &rb, c.OutputConfigMap, map[string]string{cartKey: cartYAML}); err != nil {
 				return r.configMapWriteResult(ctx, req.NamespacedName, len(backends), 0, c.OutputConfigMap, err)
 			}
 		}
@@ -891,14 +903,16 @@ func setCondition(conds *[]metav1.Condition, c metav1.Condition) {
 	*conds = append(*conds, c)
 }
 
-// readConfigMapKey 读某 ConfigMap("ns/name" 或裸名)的一个 key,不存在返回 ""。
-func (r *ModelRouteReconciler) readConfigMapKey(ctx context.Context, ref, key, defaultNS string) string {
+// readConfigMapKey 读某 ConfigMap("ns/name" 或裸名)的一个 key。
+// 第二个返回值 = ConfigMap 本身是否读到:false = 缺失或读失败(调用方据此走 fail-safe),
+// 与「CM 正常但这个 key 还没有」(返回 "", true)区分开 —— 后者是正常起步,不是故障。
+func (r *ModelRouteReconciler) readConfigMapKey(ctx context.Context, ref, key, defaultNS string) (string, bool) {
 	ns, name := splitNSName(ref, defaultNS)
 	var cm corev1.ConfigMap
 	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &cm); err != nil {
-		return ""
+		return "", false
 	}
-	return cm.Data[key]
+	return cm.Data[key], true
 }
 
 func splitNSName(ref, defaultNS string) (ns, name string) {

@@ -29,9 +29,15 @@ type CartSpec struct {
 	// Port:CART 端口。省略则从 EndpointSlice/containerPort 自动推导(单端口)。
 	// +optional
 	Port int `json:"port,omitempty"`
-	// OutputConfigMap:autoconfig 写 CART 的 config.yaml 到这("ns/name")。
-	// 底稿(server/cache/health)由 chart 的 values.baseConfig 建在此 ConfigMap 里;autoconfig 只重填 workers 段。
+	// OutputConfigMap:autoconfig 写 CART workers 的 ConfigMap("ns/name")。autoconfig 只更新不创建。
 	OutputConfigMap string `json:"outputConfigMap"`
+	// OutputKey:workers 写进这个 ConfigMap 的哪个 key。省略 = "config.yaml"。
+	// 指到一个【只放 workers】的 key(如 "workers.yaml"),底稿那个 key 就完全归 chart:
+	// CART 按 `-c config.yaml -c workers.yaml` 的顺序合并(后者覆盖前者),helm upgrade 与 autoconfig
+	// 各写各的 key,不再抢同一份内容。autoconfig 对这个 key 没有特殊规则 —— 读它现有内容当底稿、
+	// 换掉 workers 再写回,key 还没内容就等于从空文档起写。
+	// +optional
+	OutputKey string `json:"outputKey,omitempty"`
 	// MaxLoad:每 worker 的 max_load,默认 20。
 	MaxLoad int `json:"maxLoad,omitempty"`
 }
