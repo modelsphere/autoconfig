@@ -1,7 +1,10 @@
 # autoconfig controller(ModelRoute)部署参数。
 image:
   repository: harbor.4pd.io/hardcore-tech/autoconfig
-  tag: "0.3.45"              # 缺省用 Chart.appVersion
+  tag: ""                    # 缺省用 Chart.appVersion(= 发版 tag;CI 打 tag 时 sed appVersion=tag)
+                             # ⚠️ 别写死版本号:CI 只 sed Chart.yaml 的 version/appVersion、不碰本文件,
+                             # 写死会让 chart 升版后 image.tag 仍停在旧值 → 装出来的 controller 用旧镜像。
+                             # 与 openresty / cart / bodylog / monitor 的 values 保持一致。
   pullPolicy: Always   # tag 会被 CI overwrite,Always 避免用到节点旧缓存
 
 replicas: 2            # 主备 HA:leader 选举保证只有一个在 reconcile,另一个热备,leader 挂了秒接管
