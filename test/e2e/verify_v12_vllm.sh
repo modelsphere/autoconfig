@@ -9,7 +9,7 @@ BACKEND_SVC=${BACKEND_SVC:-e2e-test/vllm-mock-vllm-svc}
 MODEL=${MODEL:-facebook/opt-125m}   # 真实服务模型名(推理用)
 MODEL_LABEL=${MODEL_LABEL:-opt-125m}  # monitor 显示名
 LISTEN=${LISTEN:-18080}
-AUTH_KEY=${AUTH_KEY:-REDACTED-SEE-DEPLOY-DOCS}
+AUTH_KEY=${AUTH_KEY:?需设置:openresty 入口鉴权 key(Bearer)}
 FAIL=0; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 waiteq(){ local want="$1" d="$2"; shift 2; local i g; for i in $(seq 1 40); do g="$("$@" 2>/dev/null)"; [ "$g" = "$want" ] && { ok "$d=$want"; return; }; sleep 3; done; bad "$d: got '$g' want '$want'"; }
 

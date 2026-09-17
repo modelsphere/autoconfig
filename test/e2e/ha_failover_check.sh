@@ -8,7 +8,7 @@ CHARTS=${CHARTS:-$HERE/charts}
 OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
 CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
 ACR=${ACR:-harbor.4pd.io/hardcore-tech/autoconfig-reload:0.3.22}
-AUTH_KEY=${AUTH_KEY:-REDACTED-SEE-DEPLOY-DOCS}
+AUTH_KEY=${AUTH_KEY:?需设置:openresty 入口鉴权 key(Bearer)}
 FAIL=0; say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 
 # ready endpoint 数(Service 背后 Ready 端点)

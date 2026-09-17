@@ -227,14 +227,15 @@ kubectl -n llm-route get modelroute
 kubectl -n llm-route get pods | grep -E 'cart-|openresty'
 
 # 8.3 端到端经 openresty → cart → 后端(在 openresty pod 内打本地 8080)
+AUTH_KEY='<openresty 入口鉴权 key>'   # 真实 key 不入库
 ORP=$(kubectl -n llm-route get pod -l app.kubernetes.io/name=openresty -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 [ -z "$ORP" ] && ORP=$(kubectl -n llm-route get pods -o name | grep openresty | head -1 | cut -d/ -f2)
 kubectl -n llm-route exec $ORP -c openresty -- sh -c \
-  "curl -s -o /dev/null -w 'qwen /v1/models=%{http_code}\n' http://127.0.0.1:8080/qwen/v1/models -H 'Authorization: Bearer REDACTED-SEE-DEPLOY-DOCS'"
+  "curl -s -o /dev/null -w 'qwen /v1/models=%{http_code}\n' http://127.0.0.1:8080/qwen/v1/models -H 'Authorization: Bearer $AUTH_KEY'"
 # chat 流(应 200,并回 X-Routed-Peer 头):
 kubectl -n llm-route exec $ORP -c openresty -- sh -c \
   "curl -s -D - -o /dev/null http://127.0.0.1:8080/qwen/v1/chat/completions -H 'Content-Type: application/json' \
-   -H 'Authorization: Bearer REDACTED-SEE-DEPLOY-DOCS' \
+   -H 'Authorization: Bearer $AUTH_KEY' \
    -d '{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}' | grep -iE 'HTTP/|x-routed-peer'"
 
 # 8.4 monitor 采到该模型(dashboard 或 /api/status)

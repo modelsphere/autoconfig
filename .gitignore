@@ -4,3 +4,6 @@ autoconfig.exe
 /hagate
 /reload
 /autoconfig
+
+# 排查时的抓包/落盘,禁止入库(含真实请求体与内网地址)
+/debug/

@@ -27,7 +27,7 @@ autoconfig 写的 3 个 ConfigMap:
 ### 0. 辅助变量(每个新终端先跑一次)
 ```bash
 NS=llm-route
-AUTH="Authorization: Bearer REDACTED-SEE-DEPLOY-DOCS"
+AUTH="Authorization: Bearer ${AUTH_KEY:?需设置:openresty 入口鉴权 key(Bearer)}"
 # openresty active leader pod(HA hagate 只有它对外服务 + 有 curl,用它做 exec 探测)
 orexec(){ kubectl -n $NS exec "$(kubectl -n $NS get pod -l openresty-active=true -o jsonpath='{.items[0].metadata.name}')" -c openresty -- "$@"; }
 ```

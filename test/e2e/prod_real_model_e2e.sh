@@ -8,6 +8,7 @@ AC=$H/autoconfig; ACR=$H/autoconfig-reload:$TAG; AH=$H/autoconfig-hagate:$TAG
 OR_IMG=$H/llm-openresty:e2e0; CART_IMG=$H/cache_aware_router:v0.6.0; MON_IMG=$H/llm-monitor:k8s
 BACKEND_SVC=e2e-test/vllm-mock-vllm-svc; BPORT=8000; MODEL=facebook/opt-125m
 KEEP=${KEEP:-0}; FAIL=0
+AUTH_KEY=${AUTH_KEY:?需设置:openresty 入口鉴权 key(Bearer)}
 say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 waiteq(){ local w="$1" d="$2"; shift 2; local i g; for i in $(seq 1 60); do g="$("$@" 2>/dev/null)"; [ "$g" = "$w" ] && { ok "$d = $w"; return 0; }; sleep 3; done; bad "$d: got '$g' want '$w'"; return 1; }
 cleanup(){ [ "$KEEP" = 1 ] && { echo "(--keep)"; return; }
@@ -100,12 +101,12 @@ kubectl -n "$NS" logs deploy/monitor --tail=100 2>/dev/null | grep -qiE "MySQL|e
 say "8) 真推理:openresty:8080/opt/v1/completions → cart → opt-125m(真出词)"
 # 从 monitor pod 发(有 python3)。opt-125m 是 base 模型,用 /v1/completions
 for try in 1 2 3; do
-RESP=$(kubectl -n "$NS" exec -i deploy/monitor -- python3 - "$MODEL" <<'PYEOF'
+RESP=$(kubectl -n "$NS" exec -i deploy/monitor -- python3 - "$MODEL" "$AUTH_KEY" <<'PYEOF'
 import sys,urllib.request,json
-model=sys.argv[1]
+model,auth=sys.argv[1],sys.argv[2]
 req={"model":model,"prompt":"The capital of France is","max_tokens":10,"temperature":0}
 r=urllib.request.Request("http://openresty:8080/opt/v1/completions",data=json.dumps(req).encode(),
-  headers={"Content-Type":"application/json","Authorization":"Bearer REDACTED-SEE-DEPLOY-DOCS"})
+  headers={"Content-Type":"application/json","Authorization":"Bearer "+auth})
 try: print(urllib.request.urlopen(r,timeout=30).read().decode())
 except Exception as e: print("ERR",e)
 PYEOF
