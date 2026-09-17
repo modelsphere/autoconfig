@@ -2,8 +2,10 @@
 # openresty/cart/monitor pod 里当 sidecar:只有持 Lease 的 leader 给自己 pod 打 <name>-active 标签,
 # Service selector 带它 → 只有 leader 进 Service endpoints(主备)。多阶段:goproxy 国内镜像拉依赖(无 vendor)。
 #   docker build -f Dockerfile.hagate -t harbor.4pd.io/hardcore-tech/autoconfig-hagate:<tag> .
-ARG GO_BASE=harbor.4pd.io/library/golang:1.23.3-alpine3.20
-ARG GOPROXY=https://mirrors.tencent.com/go/,direct
+# 基础镜像与 goproxy 默认走公网;内网构建用 --build-arg 覆盖(见 .gitlab-ci.yml)。
+ARG GO_BASE=golang:1.23.3-alpine3.20
+ARG RUNTIME_BASE=python:3.12-alpine
+ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ${GO_BASE} AS build
 ARG GOPROXY
@@ -14,6 +16,6 @@ RUN go mod download
 COPY . .
 RUN go build -ldflags="-s -w" -o /out/hagate ./cmd/hagate
 
-FROM harbor.4pd.io/hardcore-tech/python:3.12-alpine
+FROM ${RUNTIME_BASE}
 COPY --from=build /out/hagate /usr/local/bin/hagate
 ENTRYPOINT ["/usr/local/bin/hagate"]

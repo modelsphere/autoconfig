@@ -2,8 +2,10 @@
 # 与 controller 分离:openresty / CART pod 里挂它当 sidecar,watch ConfigMap 文件变 → SIGHUP 主进程。
 # 多阶段:goproxy 国内镜像拉依赖(无 vendor),同 Dockerfile。GOPROXY 是 ARG,可 --build-arg 换。
 #   docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-reload:<tag> .
-ARG GO_BASE=harbor.4pd.io/library/golang:1.23.3-alpine3.20
-ARG GOPROXY=https://mirrors.tencent.com/go/,direct
+# 基础镜像与 goproxy 默认走公网;内网构建用 --build-arg 覆盖(见 .gitlab-ci.yml)。
+ARG GO_BASE=golang:1.23.3-alpine3.20
+ARG RUNTIME_BASE=python:3.12-alpine
+ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ${GO_BASE} AS build
 ARG GOPROXY
@@ -14,6 +16,6 @@ RUN go mod download
 COPY . .
 RUN go build -ldflags="-s -w" -o /out/reload ./cmd/reload
 
-FROM harbor.4pd.io/hardcore-tech/python:3.12-alpine
+FROM ${RUNTIME_BASE}
 COPY --from=build /out/reload /usr/local/bin/reload
 ENTRYPOINT ["/usr/local/bin/reload"]

@@ -4,6 +4,13 @@
 IMG        ?= harbor.4pd.io/hardcore-tech/autoconfig:latest
 RELOAD_IMG ?= harbor.4pd.io/hardcore-tech/autoconfig-reload:latest
 
+# Dockerfile 里 GO_BASE / RUNTIME_BASE / GOPROXY 三个 ARG 的默认值是【公网】
+# (Docker Hub + proxy.golang.org),保证外部用户开箱可 build。内网构建覆盖成 harbor
+# 缓存与国内 goproxy —— 下面是内网默认值,走公网时 `make docker-build BUILD_ARGS=`。
+BUILD_ARGS ?= --build-arg GO_BASE=harbor.4pd.io/library/golang:1.23.3-alpine3.20 \
+              --build-arg RUNTIME_BASE=harbor.4pd.io/hardcore-tech/python:3.12-alpine \
+              --build-arg GOPROXY=https://mirrors.tencent.com/go/,direct
+
 CONTROLLER_GEN_VERSION ?= v0.16.4
 KUSTOMIZE_VERSION      ?= v5.4.3
 CONTROLLER_GEN = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
@@ -53,8 +60,8 @@ build: ## 交叉编译两个二进制到 bin/。
 
 .PHONY: docker-build
 docker-build: ## 构建 controller + reload 两个镜像。
-	docker build -t $(IMG) .
-	docker build -f Dockerfile.reload -t $(RELOAD_IMG) .
+	docker build $(BUILD_ARGS) -t $(IMG) .
+	docker build $(BUILD_ARGS) -f Dockerfile.reload -t $(RELOAD_IMG) .
 
 ##@ 部署(kustomize 路径;生产推荐 Helm,见 deploy/helm)
 
