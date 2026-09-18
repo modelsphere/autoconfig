@@ -92,3 +92,45 @@ func TestHasListener_Real(t *testing.T) {
 		t.Error("无 listener 的普通文件应返回 false")
 	}
 }
+
+// watchDirs: a file resolves to its parent dir (ConfigMap/Secret updates swap the ..data symlink,
+// so watching the file itself would miss them), directories pass through, and duplicates collapse.
+// Order must be preserved -- Run treats the first path as the route-conf dir for the orphan scan.
+func TestWatchDirs_FileToParentAndDedup(t *testing.T) {
+	routes := t.TempDir()
+	keys := t.TempDir()
+	file := filepath.Join(keys, "api_keys.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := watchDirs([]string{routes, file, keys, routes})
+	want := []string{routes, keys}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("position %d: expected %s, got %s", i, want[i], got[i])
+		}
+	}
+}
+
+// Run's argument validation: no paths, an empty first path, or no --process is a usage error.
+// (The happy path blocks forever, so it is not unit-testable here.)
+func TestRun_RejectsMissingArgs(t *testing.T) {
+	cases := []struct {
+		name  string
+		paths []string
+		proc  string
+	}{
+		{"no paths", nil, "nginx: master"},
+		{"empty first path", []string{""}, "nginx: master"},
+		{"no process", []string{t.TempDir()}, ""},
+	}
+	for _, c := range cases {
+		if err := Run(c.paths, c.proc, ""); err == nil {
+			t.Errorf("%s: expected an error, got nil", c.name)
+		}
+	}
+}

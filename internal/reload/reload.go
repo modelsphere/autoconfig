@@ -84,32 +84,63 @@ func cleanupOrphanSockets(sockDir, confDir string) {
 	}
 }
 
-// Run watches watchPath (its dir, since ConfigMap updates swap the ..data symlink) and, on change,
-// SIGHUPs the process whose argv[0] matches procMatch (see findPID). Blocks. Needs shareProcessNamespace.
+// watchDirs maps each requested path to the directory to hand fsnotify. A ConfigMap or Secret
+// update swaps the ..data symlink rather than rewriting the file in place, so watching a file
+// directly would miss every update -- we always watch its parent directory.
+func watchDirs(paths []string) []string {
+	dirs := make([]string, 0, len(paths))
+	seen := map[string]bool{}
+	for _, p := range paths {
+		d := p
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			d = filepath.Dir(p)
+		}
+		d = filepath.Clean(d)
+		if seen[d] {
+			continue // same directory named twice (or a file plus its own dir) -- add it once
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+	return dirs
+}
+
+// Run watches every path in watchPaths (each one's directory, since ConfigMap/Secret updates swap
+// the ..data symlink) and, on any change, SIGHUPs the process whose argv[0] matches procMatch (see
+// findPID). Blocks. Needs shareProcessNamespace.
+//
+// Several paths are supported because a single reload can be driven by more than one mounted
+// volume -- openresty takes its route confs from a ConfigMap and its API keys from a Secret, and
+// a change to either has to reach the same nginx master. A reload is idempotent, so one debounce
+// timer shared by all paths is exactly right: a burst touching both mounts SIGHUPs once.
+//
 // sockDir(可选,路径路由用):reload 前删掉「无对应 conf 的孤儿 <name>.sock」——模型删除后 nginx
 // reload 不会 unlink 残留 unix socket 文件,dispatch 打它会 502 且文件长期堆积。为空则不做清理。
-func Run(watchPath, procMatch, sockDir string) error {
-	if watchPath == "" || procMatch == "" {
+// The orphan scan stays bound to watchPaths[0] by convention: it looks for `listen unix:` lines in
+// *.conf, which only the route-conf directory has. Passing the first path keeps that contract
+// explicit -- callers must list the route-conf mount first.
+func Run(watchPaths []string, procMatch, sockDir string) error {
+	if len(watchPaths) == 0 || watchPaths[0] == "" || procMatch == "" {
 		return fmt.Errorf("reload mode needs --watch and --process")
 	}
-	dir := watchPath
-	if fi, err := os.Stat(watchPath); err == nil && !fi.IsDir() {
-		dir = filepath.Dir(watchPath)
-	}
+	dirs := watchDirs(watchPaths)
+	confDir := dirs[0] // see the sockDir note above: orphan scan reads the route-conf dir only
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
 	defer w.Close()
-	if err := w.Add(dir); err != nil {
-		return fmt.Errorf("watch %s: %w", dir, err)
+	for _, d := range dirs {
+		if err := w.Add(d); err != nil {
+			return fmt.Errorf("watch %s: %w", d, err)
+		}
 	}
-	log.Printf("[reload] watching %s -> SIGHUP process matching %q", dir, procMatch)
+	log.Printf("[reload] watching %s -> SIGHUP process matching %q", strings.Join(dirs, ", "), procMatch)
 
 	var timer *time.Timer
 	trigger := func() {
 		if sockDir != "" {
-			cleanupOrphanSockets(sockDir, dir) // reload 前清孤儿 socket(见 sockDir 注释)
+			cleanupOrphanSockets(sockDir, confDir) // reload 前清孤儿 socket(见 sockDir 注释)
 		}
 		pid := findPID(procMatch)
 		if pid <= 0 {
