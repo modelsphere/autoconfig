@@ -43,7 +43,7 @@ kubectl describe mr <name>     # status 里有 backends / cartPeers / conditions
 不用 helm 时走 kustomize(同源生成物):`make install`(装 CRD)+ `make deploy`(起 controller)。
 
 **⚠️ 卸载顺序:先删 ModelRoute,再 `helm uninstall`。** ModelRoute 带 finalizer
-(`routing.gpucluster.io/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)
+(`routing.modelsphere.dev/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)
 再删 ModelRoute / namespace,ModelRoute 会卡住、拖住 namespace 与 CRD 的删除。
 正确顺序:`kubectl delete mr --all -A` → `helm uninstall`。
 (chart 里用 `modelRoutes` 声明的 ModelRoute 由 helm 托管,uninstall 前会随 release 删除、
@@ -114,7 +114,7 @@ reload 看到的永远是完整文件,不会读到半写)。
 
 ## ModelRoute CRD
 
-`ModelRoute`(`routing.gpucluster.io/v1alpha1`),一个模型一个对象,`kubectl apply` 当场 CEL 校验、
+`ModelRoute`(`routing.modelsphere.dev/v1alpha1`),一个模型一个对象,`kubectl apply` 当场 CEL 校验、
 `kubectl get mr` 看发现结果。完整样例见 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。
 下表逐字段说明(✅=必填)。
 

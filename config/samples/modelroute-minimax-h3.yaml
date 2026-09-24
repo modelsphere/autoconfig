@@ -15,7 +15,7 @@
 # 对外地址因此是 https://<域名>/minimax-h3/v2/video_generation,
 # H3 生成下载 URL 时要把这个前缀算进去 —— 在 H3 侧配:
 #   server.config.publicBaseUrl: https://<域名>/minimax-h3
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata:
   name: minimax-h3

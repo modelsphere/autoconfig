@@ -16,7 +16,7 @@ waiteq(){ local want="$1" d="$2"; shift 2; local i g; for i in $(seq 1 40); do g
 echo "=== 换 ModelRoute:opt(跨 ns 发现 vllm-mock + 新语法)==="
 kubectl -n "$NS" delete mr glm-kimi opt 2>/dev/null; sleep 3
 kubectl -n "$NS" apply -f - <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: opt }
 spec:

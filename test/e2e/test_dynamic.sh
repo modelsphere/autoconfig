@@ -45,7 +45,7 @@ helm -n "$NS" upgrade --install monitor "$CHARTS/monitor" --set fullnameOverride
   --set image.repository="${MON_IMG%:*}" --set image.tag="${MON_IMG##*:}" --set service.nodePort="" \
   --set-string secret.data.WEB_TPM_AUTH_PASS=testpass --set-string mysql.auth.rootPassword=rootpass --set-string mysql.auth.password=monpass >/dev/null
 kubectl -n "$NS" apply -f - >/dev/null <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: m1 }
 spec:
@@ -85,7 +85,7 @@ waitval 1 "monitor service 行 → 1" ms
 ######## C 增删模型 ########
 say "C1: 新增 ModelRoute m2(route=m2,复用 be-svc)→ openresty/monitor 新增,m1 不受影响"
 kubectl -n "$NS" apply -f - >/dev/null <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: m2 }
 spec:

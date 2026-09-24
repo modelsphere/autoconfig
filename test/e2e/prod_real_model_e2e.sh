@@ -55,7 +55,7 @@ waiteq monitor-conf   "monitor-conf 建"   kubectl -n "$NS" get cm monitor-conf 
 
 say "5) ModelRoute → 真 opt-125m(跨 ns discovery)"
 kubectl -n "$NS" apply -f - <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: opt }
 spec:

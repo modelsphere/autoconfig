@@ -1,2 +1,2 @@
 resources:
-- bases/routing.gpucluster.io_modelroutes.yaml
+- bases/routing.modelsphere.dev_modelroutes.yaml

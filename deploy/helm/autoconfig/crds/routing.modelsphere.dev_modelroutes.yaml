@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.4
-  name: modelroutes.routing.gpucluster.io
+  name: modelroutes.routing.modelsphere.dev
 spec:
-  group: routing.gpucluster.io
+  group: routing.modelsphere.dev
   names:
     kind: ModelRoute
     listKind: ModelRouteList

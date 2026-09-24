@@ -6,7 +6,7 @@
 #   - monitor-conf(opt.monitor.conf 的 service/nginx/router 行)
 # 带 backend-svc 兜底层 → autoconfig(≥0.3.29)自动注入 cross_tier_fallback=true + max_more_tries=3。
 # 所有 service / outputConfigMap 均为 ns/name 全限定 → 本 ModelRoute 放哪个 ns 都行(引用不依赖它)。
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata:
   name: opt
@@ -32,7 +32,7 @@ spec:
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart(并发上限随后端数自动变)
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
     - { use: backend-svc, priority: 1 }                                   # 兜底:后端 Service VIP(operator 挂时靠它)
-  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+  slo:                                # 可选:把 LLMSLORequirement(inference.modelsphere.dev)下发给 openresty
     name: opt-13b                       # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
     # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。
   monitor:                            # 可选:monitor 的 service/nginx/router 行

@@ -11,7 +11,7 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
   发现后端 → 写 CART 的 workers(cart-config)+ openresty 的 peers(openresty-conf,CART 优先 + 后端兜底)。
 
   kubectl apply -f - <<'EOF'
-  apiVersion: routing.gpucluster.io/v1alpha1
+  apiVersion: routing.modelsphere.dev/v1alpha1
   kind: ModelRoute
   metadata: { name: glm-5.1-fp8, namespace: glm }
   spec:
@@ -27,7 +27,7 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
   kubectl get modelroutes -A     # 或 kubectl get mr -A
 
 ⚠️ 卸载顺序:先删 ModelRoute,再 helm uninstall。
-  ModelRoute 带 finalizer(routing.gpucluster.io/cleanup),要 controller 在跑才能摘。
+  ModelRoute 带 finalizer(routing.modelsphere.dev/cleanup),要 controller 在跑才能摘。
   若先 helm uninstall(删了 controller)再删 ModelRoute / namespace,ModelRoute 会卡住、
   拖住 namespace/CRD 删除。正确顺序:
     kubectl delete mr --all -A          # 1) 先删所有 ModelRoute(controller 摘 finalizer)

@@ -1,5 +1,5 @@
 # kubebuilder / operator-sdk 项目元数据。
-domain: gpucluster.io
+domain: modelsphere.dev
 layout:
 - go.kubebuilder.io/v4
 projectName: autoconfig
@@ -9,7 +9,7 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: 4pd.io
+  domain: modelsphere.dev
   group: routing
   kind: ModelRoute
   path: autoconfig/api/v1alpha1

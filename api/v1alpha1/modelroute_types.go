@@ -168,7 +168,7 @@ type ModelRouteSpec struct {
 	SLO *SLOSpec `json:"slo,omitempty"`
 }
 
-// SLOSpec:把 LLMSLORequirement(inference.x-k8s.io,别人的 CRD)下发给 openresty。
+// SLOSpec:把 LLMSLORequirement(inference.modelsphere.dev,别人的 CRD)下发给 openresty。
 // 空对象 `slo: {}` 就够用 —— serviceId 默认从 discovery.service 推导。
 //
 // 与 nginx.values 的关系:**两个来源,不冲突**。values.ttft_limit_ms / tps_limit_tps 继续作为

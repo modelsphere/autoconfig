@@ -60,7 +60,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - inference.x-k8s.io
+  - inference.modelsphere.dev
   resources:
   - llmslorequirements
   verbs:
@@ -68,7 +68,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - routing.gpucluster.io
+  - routing.modelsphere.dev
   resources:
   - modelroutes
   verbs:
@@ -80,13 +80,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - routing.gpucluster.io
+  - routing.modelsphere.dev
   resources:
   - modelroutes/finalizers
   verbs:
   - update
 - apiGroups:
-  - routing.gpucluster.io
+  - routing.modelsphere.dev
   resources:
   - modelroutes/status
   verbs:

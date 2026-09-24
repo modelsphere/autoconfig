@@ -97,7 +97,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata: { name: monitor-conf }
 ---
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: glm }
 spec:
