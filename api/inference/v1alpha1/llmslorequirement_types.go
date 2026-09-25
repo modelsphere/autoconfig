@@ -1,4 +1,4 @@
-// Package v1alpha1 是 LLMSLORequirement(inference.x-k8s.io/v1alpha1)的**只读**最小类型。
+// Package v1alpha1 是 LLMSLORequirement(inference.modelsphere.dev/v1alpha1)的**只读**最小类型。
 //
 // 这个 CRD **不归 autoconfig 所有** —— 它由别的组件安装和写入(autoscaler 消费
 // priority / minimumDeployment / maximumDeployment;我们只消费 ttft / otps)。
@@ -19,8 +19,8 @@ import (
 )
 
 var (
-	// GroupVersion is inference.x-k8s.io/v1alpha1.
-	GroupVersion = schema.GroupVersion{Group: "inference.x-k8s.io", Version: "v1alpha1"}
+	// GroupVersion is inference.modelsphere.dev/v1alpha1.
+	GroupVersion = schema.GroupVersion{Group: "inference.modelsphere.dev", Version: "v1alpha1"}
 	// SchemeBuilder registers the read-only types.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
 	// AddToScheme adds the types to a scheme.

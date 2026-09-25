@@ -77,7 +77,7 @@ waiteq monitor-conf   "monitor-conf 已建"   kubectl -n "$NS" get cm monitor-co
 # ---------- 4) ModelRoute:驱动三组件(cart svc/openresty svc 名 = fullnameOverride)----------
 say "apply ModelRoute(discovery + cart + openresty + monitor.nginx)"
 kubectl -n "$NS" apply -f - <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: glm }
 spec:

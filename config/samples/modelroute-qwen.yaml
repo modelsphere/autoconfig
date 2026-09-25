@@ -9,7 +9,7 @@
 # autoconfig 据此写 openresty-conf(session_route_qwen.conf)+ cart-qwen-config(workers)。
 # 所有 service / outputConfigMap 均为 ns/name 全限定 → controller 全集群 watch,本 ModelRoute 放哪个 ns 都行
 # (下面 namespace 仅示例;换成 qwen 等任意 ns 不影响,引用不依赖它)。
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata:
   name: qwen
@@ -35,7 +35,7 @@ spec:
     - { use: cart,        priority: 3, maxConcurrencyFromBackend: true }  # 主:cart-qwen
     - { use: backend,     priority: 2, maxConcurrency: 100 }              # 次:直连后端 pod-IP
     - { use: backend-svc, priority: 1 }                                   # 兜底:qwen-svc VIP
-  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+  slo:                                # 可选:把 LLMSLORequirement(inference.modelsphere.dev)下发给 openresty
     name: qwen-svc                      # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
     # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。
   monitor:                            # monitor 的 service/nginx/router 行(不配则无 qwen 监控)

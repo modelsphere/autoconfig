@@ -32,7 +32,7 @@ kind: Service
 metadata: { name: be-multi }
 spec: { selector: { app: be }, ports: [{ name: a, port: 8050, targetPort: 8050 },{ name: b, port: 8060, targetPort: 8060 }] }   # 两个端口
 ---
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: mp }
 spec:

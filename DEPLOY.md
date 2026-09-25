@@ -61,7 +61,7 @@ helm -n llm-route install autoconfig harbor-chart-repo/autoconfig \
   --set fullnameOverride=autoconfig-controller
 
 # 校验:CRD 装上 + controller Running
-kubectl get crd modelroutes.routing.gpucluster.io
+kubectl get crd modelroutes.routing.modelsphere.dev
 kubectl -n llm-route rollout status deploy/autoconfig-controller
 ```
 
@@ -111,7 +111,7 @@ workqueue_unfinished_work_seconds{job=~"autoconfig.*"} and on(pod) (leader_elect
 leader 是 k8s Lease,查当前持有者:
 
 ```bash
-kubectl -n llm-route get lease autoconfig-controller.routing.gpucluster.io -o jsonpath='{.spec.holderIdentity}{"\n"}'
+kubectl -n llm-route get lease autoconfig-controller.routing.modelsphere.dev -o jsonpath='{.spec.holderIdentity}{"\n"}'
 ```
 
 关掉指标(如不想被抓):`--set metrics.enabled=false` 或 `--set metrics.serviceMonitor.enabled=false`。
@@ -276,5 +276,5 @@ kubectl delete -f config/samples/modelroute-qwen.yaml
 helm -n llm-route  uninstall openresty cart-qwen autoconfig      # opt 同理:再 uninstall cart-opt
 helm -n monitoring uninstall monitor
 kubectl delete -f config/samples/qwen-backend.yaml               # 连带删 qwen ns(opt 同理删 opt-backend.yaml)
-kubectl delete crd modelroutes.routing.gpucluster.io            # 如需彻底移除 CRD
+kubectl delete crd modelroutes.routing.modelsphere.dev            # 如需彻底移除 CRD
 ```

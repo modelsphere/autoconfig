@@ -24,7 +24,7 @@ echo "=== 在 xns ns 建 ModelRoute:跨 ns 发现 kimi leader + 不写 port ==="
 kubectl create ns "$NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl -n "$NS" create configmap openresty-conf >/dev/null 2>&1  # 目标 CM 预建(无 chart;autoconfig 只更新不创建)
 kubectl -n "$NS" apply -f - <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: xns-kimi }
 spec:

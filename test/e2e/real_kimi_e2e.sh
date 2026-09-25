@@ -68,7 +68,7 @@ helm -n "$NS" upgrade --install monitor "$CHARTS/monitor" \
 # ---------- 3) ModelRoute:discovery = 真 kimi leader ----------
 say "apply ModelRoute(discovery=$KIMI_SVC:8050,真 kimi 后端)"
 kubectl -n "$NS" apply -f - <<YAML
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata: { name: glm-kimi }
 spec:

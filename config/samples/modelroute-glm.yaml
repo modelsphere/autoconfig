@@ -1,6 +1,6 @@
 # 示例:glm-5.1-fp8 —— ModelRoute 放【中心 ns routing】,跨 ns 发现各组件(service 用 ns/name)。
 # service 写 "ns/name" 跨 ns;裸名则与本 ModelRoute 同 ns。port 省略 → 从 Service 的 EndpointSlice 自动取。
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata:
   name: glm-5.1                       # ← 短标识即可;served-model-name 在 monitor.model 单独给(见下)
@@ -29,7 +29,7 @@ spec:
       - { use: backend-svc, priority: 1 }                                  # 后端 Service ClusterIP【静态兜底】:operator 宕+rollout
                                                                            #   致 pod-IP 层全死时级联到 VIP(kube-proxy 维护)→ 降级不全断
   # (backend-svc 需 discovery.service;selector 模式无 VIP 会被自动跳过)
-  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+  slo:                                # 可选:把 LLMSLORequirement(inference.modelsphere.dev)下发给 openresty
     name: glm                           # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
     # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。
   monitor:                           # 可选;把后端写进 monitor 的 services(monitor 60s 自热加载,无 sidecar)
@@ -42,7 +42,7 @@ spec:
     # router: false                  #   关 monitor 的 router: 行(.../workers)
 ---
 # 无 CART 的例子:nginx 直连后端(省略 cart 段,sources 只有 backend)
-apiVersion: routing.gpucluster.io/v1alpha1
+apiVersion: routing.modelsphere.dev/v1alpha1
 kind: ModelRoute
 metadata:
   name: kimi-k2.6
@@ -56,6 +56,6 @@ spec:
     outputConfigMap: openresty/openresty-conf
     peers:
       - { use: backend }
-  slo:                                # 可选:把 LLMSLORequirement(inference.x-k8s.io)下发给 openresty
+  slo:                                # 可选:把 LLMSLORequirement(inference.modelsphere.dev)下发给 openresty
     name: kimi-k26                      # 必填:LLMSLORequirement 的 metadata.name,支持 ns/name 跨 ns
     # → 翻译成 ttft_metrics / tps_metrics 渲染进本路由的 conf,优先级高于上面 values 里的静态阈值。

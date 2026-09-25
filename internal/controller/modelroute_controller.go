@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	finalizer = "routing.gpucluster.io/cleanup"
+	finalizer = "routing.modelsphere.dev/cleanup"
 	// 重新发现的轮询周期(informer 事件之外的兜底 resync)。
 	resyncEvery = 10 * time.Second
 	// dispatchPortName:openresty chart Service 里路径路由 dispatch 端口的【名字】。monitor 的 nginx 行
@@ -54,14 +54,14 @@ type ModelRouteReconciler struct {
 	Scheme    *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=routing.gpucluster.io,resources=modelroutes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=routing.modelsphere.dev,resources=modelroutes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=routing.modelsphere.dev,resources=modelroutes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=routing.modelsphere.dev,resources=modelroutes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
-// +kubebuilder:rbac:groups=inference.x-k8s.io,resources=llmslorequirements,verbs=get;list;watch
+// +kubebuilder:rbac:groups=inference.modelsphere.dev,resources=llmslorequirements,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
