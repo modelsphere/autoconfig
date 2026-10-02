@@ -1,220 +1,260 @@
 # autoconfig
 
-**让路由层的后端列表跟着 Kubernetes 自动收敛的 operator。**
+English | [简体中文](README.zh-CN.md)
 
-在 k8s 上跑推理服务时,后端 pod 的 IP 会随扩缩容、重启、滚动更新不断变化。而前面的路由组件
-—— openresty、cache-aware-router(CART)、监控 —— 各自维护着一份 peer / worker / 采集目标列表。
-人工同步这几份列表既繁琐又容易漏:扩容了没加进去等于白扩,缩容了没摘掉就是持续打死 IP。
+**A Kubernetes operator that keeps the routing layer's backend lists in step with what is actually running.**
 
-autoconfig 用一个 `ModelRoute` 自定义资源描述「一个模型的路由长什么样」,然后:
+When you serve inference on Kubernetes, backend pod IPs change all the time: scaling, restarts, rolling
+updates. The routing components in front of them — openresty, the cache-aware router (CART), monitoring —
+each keep their own list of peers / workers / scrape targets. Syncing those lists by hand is tedious and
+easy to get wrong: a scale-up that never reaches the list is wasted, and a scale-down that is never removed
+keeps sending traffic to a dead IP.
 
-1. **发现** —— watch 该模型对应 Service 的 EndpointSlice(或 pod label),得到当前就绪的后端端点;
-2. **渲染** —— 生成 openresty 的路由配置、CART 的 workers 列表、监控的采集行;
-3. **下发** —— 写进各消费方已有的 ConfigMap,由它们各自的 sidecar 热重载生效。
+autoconfig describes "what routing for one model looks like" with a `ModelRoute` custom resource, and then:
+
+1. **Discovers** — watches the EndpointSlices of the model's Service (or a pod label selector) to get the
+   backend endpoints that are ready right now;
+2. **Renders** — generates the openresty route config, the CART worker list and the monitoring targets;
+3. **Delivers** — writes them into ConfigMaps the consumers already have, where each consumer's sidecar
+   hot-reloads them.
 
 ```bash
 kubectl apply -f config/samples/modelroute-glm.yaml
 kubectl get mr -A      # NAME  BACKENDS  CART  READY  AGE
 ```
 
-后端扩缩容时不需要任何人工操作,`BACKENDS` 列会自己变。
+When backends scale, nobody has to do anything: the `BACKENDS` column changes on its own.
 
-## 它不做什么
+## What it does not do
 
-- **不创建 chart、不创建 ConfigMap** —— 只把内容写进消费方**已有**的 ConfigMap。消费方的部署、
-  初始配置、sidecar 挂载由各自的 chart 负责(见「消费方接入」)。
-- **不代理流量** —— 它是控制面,数据面仍是 openresty / CART。
-- **不管非 LLM 之外的健康语义** —— `modelType: video` 走纯反向代理,不套 token 级限流那一套。
+- **It creates no charts and no ConfigMaps** — it only writes content into ConfigMaps the consumers
+  **already have**. Deploying a consumer, its initial config and its sidecar mounts is that consumer's
+  chart's job (see "Integrating consumers").
+- **It does not proxy traffic** — it is a control plane; openresty and CART remain the data plane.
+- **It applies no LLM health semantics to other workloads** — `modelType: video` is rendered as a plain
+  reverse proxy, without the token-level rate limiting.
 
-## 快速上手
+## Quick start
 
 ```bash
-# 1. 部署 controller(chart 含 CRD + RBAC + Deployment)
+# 1. Deploy the controller (the chart contains the CRD, RBAC and the Deployment)
 helm upgrade --install autoconfig deploy/helm/autoconfig -n llm-route --create-namespace
 
-# 2. 声明一条路由
+# 2. Declare a route
 kubectl apply -f config/samples/modelroute-glm.yaml
 
-# 3. 看发现结果
+# 3. Look at what was discovered
 kubectl get mr -A
-kubectl describe mr <name>     # status 里有 backends / cartPeers / conditions
+kubectl describe mr <name>     # status has backends / cartPeers / conditions
 ```
 
-不用 helm 时走 kustomize(同源生成物):`make install`(装 CRD)+ `make deploy`(起 controller)。
+The chart is also published as `modelsphere/autoconfig` in the
+[modelsphere Helm repository](https://github.com/modelsphere/helm-charts); installing the whole stack
+(autoconfig, CART, openresty, a test model) is described in [DEPLOY.md](DEPLOY.md).
 
-**⚠️ 卸载顺序:先删 ModelRoute,再 `helm uninstall`。** ModelRoute 带 finalizer
-(`routing.modelsphere.dev/cleanup`),要 controller 在跑才能摘。若先 uninstall(删了 controller)
-再删 ModelRoute / namespace,ModelRoute 会卡住、拖住 namespace 与 CRD 的删除。
-正确顺序:`kubectl delete mr --all -A` → `helm uninstall`。
-(chart 里用 `modelRoutes` 声明的 ModelRoute 由 helm 托管,uninstall 前会随 release 删除、
-controller 还在 → 自动摘 finalizer,无此问题。)
-已卡住的补救:`kubectl patch mr <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'`。
+Without Helm, use kustomize (same generated manifests): `make install` (CRD) + `make deploy` (controller).
 
-## 工作原理
+**⚠️ Uninstall order: delete the ModelRoutes first, then `helm uninstall`.** A ModelRoute carries a
+finalizer (`routing.modelsphere.dev/cleanup`) that only a running controller can remove. If you uninstall
+first (removing the controller) and then delete ModelRoutes or their namespace, the ModelRoutes hang and
+block the deletion of the namespace and the CRD. The right order: `kubectl delete mr --all -A` →
+`helm uninstall`. (ModelRoutes declared through the chart's `modelRoutes` value are managed by Helm: they are
+deleted with the release while the controller is still running, so the finalizer is removed and this does
+not happen.) To free ModelRoutes that are already stuck:
+`kubectl patch mr <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'`.
 
-![autoconfig 架构:controller 按 Service 发现后端端点 → 写 openresty / CART / monitor 三个 ConfigMap;openresty/CART 里 reload sidecar 收 SIGHUP 热重载,monitor 自身每 60s 热加载](docs/architecture.png)
+## How it works
 
-三个独立二进制 / 镜像,各司其职:
+![autoconfig architecture: the controller discovers backend endpoints per Service → writes the openresty / CART / monitor ConfigMaps; the reload sidecar in openresty/CART hot-reloads on SIGHUP, the monitor reloads itself every 60s](docs/architecture.png)
 
-| 组件 | 镜像 | 角色 |
+Three separate binaries / images, each with one job:
+
+| Component | Image | Role |
 |---|---|---|
-| **controller** | `autoconfig`(`cmd/`) | 唯一发现逻辑 + RBAC 一处;watch ModelRoute + EndpointSlice + Pod → 发现 → 渲染 → 写 ConfigMap + status。controller 自身 `replicas>1` 时靠 manager 的 leader 选举保证只有一个在干活。 |
-| **reload sidecar** | `autoconfig-reload`(`cmd/reload`) | 跑在消费方 pod 里,watch 挂载的 ConfigMap 文件,变化就 `kill -HUP` 主进程(靠 `shareProcessNamespace`)。CART / openresty 收 SIGHUP 优雅重载。 |
-| **hagate sidecar** | `autoconfig-hagate`(`cmd/hagate`) | 消费方 **master-standby**:2 副本都保持 Ready,但只有持 Lease 的 leader 给自己 pod 打 `<name>-active=true` 标签;Service selector 带这个标签 → **只有 leader 进 endpoints**。用标签而非 readiness 门控,standby 不会永久 NotReady 卡住滚动。 |
+| **controller** | `autoconfig` (`cmd/`) | The only discovery logic and the only place with RBAC. Watches ModelRoute + EndpointSlice + Pod → discovers → renders → writes ConfigMaps + status. With `replicas>1`, the manager's leader election makes sure only one replica does the work. |
+| **reload sidecar** | `autoconfig-reload` (`cmd/reload`) | Runs in the consumer's pod, watches the mounted ConfigMap files and `kill -HUP`s the main process when they change (needs `shareProcessNamespace`). CART and openresty reload gracefully on SIGHUP. |
+| **hagate sidecar** | `autoconfig-hagate` (`cmd/hagate`) | Consumer **master-standby**: both replicas stay Ready, but only the leader holding the Lease labels its own pod `<name>-active=true`; the Service selects on that label → **only the leader is in the endpoints**. Gating with a label instead of readiness means the standby is never permanently NotReady and never stalls a rollout. |
 
-三个镜像的 tag 与 chart 版本同线(chart 的 `appVersion` = 镜像 tag),见「构建」。
+The three images share one version number with each other and with the chart (`appVersion` = image tag);
+see "Building".
 
-## 两个 sidecar 的实现原理
+## How the two sidecars work
 
-消费方 pod(openresty / CART)里除主容器外各挂两个 autoconfig sidecar:**hagate**(主备门控)+ **reload**(配置热重载)。
-两者都靠 `shareProcessNamespace: true` 与主容器同 pod 协作。
+Besides the main container, each consumer pod (openresty / CART) carries two autoconfig sidecars:
+**hagate** (master-standby gate) and **reload** (config hot reload). Both work alongside the main container
+through `shareProcessNamespace: true`.
 
-### hagate —— master-standby 单活门控
+### hagate — single-active master-standby gate
 
-**为什么要单活**:openresty / CART 是**有状态**路由器(openresty 有 session 亲和 + `active_conns` 并发计数,
-CART 有 prefix-cache radix tree)。多副本同时进 Service endpoints = 缓存被打散、并发计数分裂,路由质量下降。
-所以要 **2 副本主备(master-standby)**:都保持运行,但同一时刻只有一个对外收流量。
+**Why single-active**: openresty and CART are **stateful** routers (openresty keeps session affinity and an
+`active_conns` concurrency count; CART keeps a prefix-cache radix tree). With several replicas in the
+Service endpoints at once, the cache is scattered and the concurrency count split, and routing quality
+drops. So they run **two replicas as master-standby**: both running, only one taking traffic at a time.
 
-**为什么不用 readinessProbe 门控**:若让 standby 的 readiness 恒 NotReady 来挡流量,Deployment 滚动时
-`maxUnavailable`/`minReady` 会把「永久 NotReady 的 standby」当成不可用 → 滚动卡死。故改用**标签门控**而非 readiness。
+**Why not gate with a readinessProbe**: if the standby were kept NotReady to keep traffic away, a Deployment
+rollout would count that permanently NotReady standby as unavailable under `maxUnavailable`/`minReady` and
+stall. Hence a **label gate** instead of readiness.
 
-**机制**:每 pod 一个 hagate sidecar 参与 Lease `<name>-ha` 的 leader 选举。
-- 只有持 Lease 的 leader 给**自己 pod** 打 `<name>-active=true` 标签;
-- Service 的 selector 带这个标签 → **只有 leader 的 pod 进 endpoints**,standby 在池外待命;
-- 消费方上游(如 openresty 的 cart 层)走 **Service ClusterIP VIP**,VIP 恒指 active leader → failover/rollout 对上游透明。
+**Mechanism**: one hagate sidecar per pod takes part in leader election on the Lease `<name>-ha`.
+- Only the leader holding the Lease labels **its own pod** `<name>-active=true`;
+- The Service's selector includes that label → **only the leader's pod is in the endpoints**; the standby
+  waits outside the pool;
+- Consumers upstream (for example openresty's cart tier) go through the **Service ClusterIP VIP**, which
+  always points at the active leader → failover and rollouts are transparent to them.
 
-**level-triggered 自愈**:每 2s 读 pod 实际标签,与「**该不该 active**(= 是 leader **且**本地 app 端口可连)」比对,
-不符就纠正 —— 标签被外部误删也能自愈;本地 app 端口连不上时即便是 leader 也主动摘标签(避免把流量导向坏 pod)。
+**Level-triggered self-healing**: every 2s it reads the pod's actual label, compares it with whether the pod
+**should be active** (= it is the leader **and** the local app port accepts connections), and corrects any
+difference — so a label removed by someone else heals itself, and a leader whose local app port is unreachable
+removes its own label rather than send traffic to a broken pod.
 
-**failover**:计划内下线(SIGTERM=删 pod/滚动/驱逐)release Lease → standby ~1-2s 接管**新**流量;
-本 pod **保留** active 标签作 **terminating endpoint**(deletionTimestamp),靠 CNI 的 graceful-terminating
-把新连接导向 standby、老在途连接留在本 pod 排空(配合主容器优雅停 + grace),**不硬摘标签 → 不 reset 在途连接**,
-pod 退出即自动出 endpoints。存活丢主(Lease 续约失败但 pod 没死)才摘标签离开 Service(避免 2-active)。
-硬崩则等 Lease TTL 过期后接管。
+**Failover**: on a planned shutdown (SIGTERM: pod deletion, rollout, eviction) it releases the Lease → the
+standby takes over **new** traffic in about 1–2s. The old pod **keeps** its active label and stays a
+**terminating endpoint** (deletionTimestamp set); the CNI's graceful-termination handling sends new
+connections to the standby while in-flight connections drain on the old pod (together with the main
+container's graceful stop and grace period). **The label is not torn off, so in-flight connections are not
+reset**; the pod leaves the endpoints when it exits. Only when leadership is lost while the pod is alive
+(Lease renewal fails) does it remove the label and leave the Service, to avoid two active pods. After a hard
+crash, the standby takes over when the Lease TTL expires.
 
-**监控组件不做 HA**:采集/告警是**自主轮询循环**(不接收外部流量),readiness 门控挡不住重复采集,
-单活无意义 → 单例(`replicas: 1` + `Recreate`),chart 不带 hagate。
-openresty/cart 默认开(`replicas: 2` + `ha.enabled: true`)。
+**The monitoring component has no HA**: scraping and alerting are a **self-driven polling loop** (it takes no
+external traffic), so a readiness gate cannot stop duplicate scraping and single-active buys nothing → it
+runs as a singleton (`replicas: 1` + `Recreate`), and its chart has no hagate.
+openresty and CART enable it by default (`replicas: 2` + `ha.enabled: true`).
 
-### reload —— 配置热重载
+### reload — config hot reload
 
-**问题**:autoconfig 改写了 ConfigMap,主进程(nginx / CART)要重读配置才生效,但不能重启(会断在途长流式连接)。
+**Problem**: once autoconfig rewrites a ConfigMap, the main process (nginx / CART) must re-read its config,
+but must not restart (that would cut long in-flight streaming connections).
 
-**机制**:每消费方 pod 一个 reload sidecar:
-- 把输出 ConfigMap **整卷挂**(非 subPath —— subPath 不随 ConfigMap 更新同步)到 `--watch` 目录,用 fsnotify 监听;
-- 文件变 → 找主进程 pid(读 `/proc/*/cmdline` 匹配 `nginx: master` / `cache-aware-router`;
-  **用 cmdline 不用 `comm`** —— comm 截断 15 字符、且要避开 nginx worker)→ `kill -HUP`;
-- nginx / CART 收 **SIGHUP 都是优雅重载**:坏配置只 log warning + 保留旧配置,绝不中断在途请求。
+**Mechanism**: one reload sidecar per consumer pod:
+- The output ConfigMap is **mounted as a whole volume** (not with subPath — a subPath mount does not follow
+  ConfigMap updates) at the `--watch` directory and watched with fsnotify;
+- When a file changes → find the main process's pid (read `/proc/*/cmdline` and match `nginx: master` /
+  `cache-aware-router`; **cmdline rather than `comm`**, since comm is truncated to 15 characters, and nginx
+  workers must not match) → `kill -HUP`;
+- **SIGHUP is a graceful reload for both nginx and CART**: a bad config only logs a warning and keeps the old
+  one, and in-flight requests are never interrupted.
 
-**传播延迟**:kubelet 同步挂载的 ConfigMap 有 ~1min 延迟(AtomicWriter `..data` 原子软链切换 →
-reload 看到的永远是完整文件,不会读到半写)。
+**Propagation delay**: the kubelet syncs mounted ConfigMaps with a delay of about a minute (the AtomicWriter
+swaps the `..data` symlink atomically, so reload always sees complete files, never a half-written one).
 
-**openresty 侧 `--sock-dir`**:per-model server 监听 unix socket,模型删除后 nginx 不会自动 unlink
-残留 `.sock`;reload 前先删掉「已无 conf 引用」的孤儿 socket。
+**`--sock-dir` for openresty**: per-model servers listen on unix sockets, and nginx does not unlink a model's
+leftover `.sock` after the model is deleted; before reloading, the sidecar deletes orphan sockets that no conf
+references any more.
 
-## ModelRoute CRD
+## The ModelRoute CRD
 
-`ModelRoute`(`routing.modelsphere.dev/v1alpha1`),一个模型一个对象,`kubectl apply` 当场 CEL 校验、
-`kubectl get mr` 看发现结果。完整样例见 [`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml)。
-下表逐字段说明(✅=必填)。
+`ModelRoute` (`routing.modelsphere.dev/v1alpha1`), one object per model. `kubectl apply` validates it on the
+spot with CEL, and `kubectl get mr` shows what was discovered. A full example is
+[`config/samples/modelroute-glm.yaml`](config/samples/modelroute-glm.yaml). The tables below describe each
+field (✅ = required).
 
-**`spec` 顶层**
+**Top-level `spec`**
 
-| 字段 | 必填 | 含义 |
+| Field | Required | Meaning |
 |---|---|---|
-| `modelType` | 可选 | 这条路由服务的是哪类模型,决定渲染方式。默认 `llm`;`video` = 视频生成,见下 |
-| `discovery` | ✅ | 本模型的后端桶发现方式(喂 CART workers / nginx backend / monitor services) |
-| `cart` | 可选 | 配了 = autoconfig 管这个 CART;省略 = nginx 直连后端(无 CART 层) |
-| `nginx` | ✅ | openresty 路由:渲染 peers → `session_route_<route>.conf` |
-| `monitor` | 可选 | 把发现的后端/入口/CART 也写进共享的监控配置 |
+| `modelType` | optional | What kind of model this route serves; decides how it is rendered. Default `llm`; `video` = video generation, see below |
+| `discovery` | ✅ | How this model's backend bucket is discovered (feeds CART workers / nginx backends / monitor services) |
+| `cart` | optional | Set = autoconfig manages this CART; omitted = nginx talks to the backends directly (no CART tier) |
+| `nginx` | ✅ | openresty routing: peers rendered → `session_route_<route>.conf` |
+| `monitor` | optional | Also write the discovered backends / entry point / CART into the shared monitoring config |
 
-### modelType:一条路由服务哪类模型
+### modelType: what kind of model a route serves
 
-| 取值 | 渲染成什么 | 适用 |
+| Value | Rendered as | For |
 |---|---|---|
-| `llm`(默认) | 走 lua 路由引擎:会话亲和、TTFT/TPS 限流、自适应并发、CART 前置 | `/v1/chat/completions` 这类 token 流式接口 |
-| `video` | **纯反向代理**:不解析请求体、不限流;放开超时、关响应缓冲、透传 `Range`、补齐 `X-Forwarded-Host/Proto` | 视频生成:异步建任务 + 轮询 + 大文件下载 |
+| `llm` (default) | The Lua routing engine: session affinity, TTFT/TPS limits, adaptive concurrency, CART in front | Token-streaming APIs such as `/v1/chat/completions` |
+| `video` | **A plain reverse proxy**: no request-body parsing, no rate limiting; long timeouts, response buffering off, `Range` passed through, `X-Forwarded-Host/Proto` filled in | Video generation: asynchronous job creation + polling + large file downloads |
 
-为什么视频不能套 LLM 那套:请求体可能是 64MB 的 base64 图(引擎要解析 body 取 model)、
-一条片子要 1~3 分钟才出结果(TTFT/TPS 这类 token 级指标无从谈起)、响应是几十 MB 的视频流
-(响应缓冲会把它憋在内存或磁盘上),而下载接口还要支持断点续传(`Range` 必须原样透传)。
+Why video cannot reuse the LLM setup: a request body can be a 64 MB base64 image (the engine would parse the
+body to find the model); one clip takes 1–3 minutes (token-level metrics such as TTFT/TPS mean nothing);
+the response is a video stream of tens of MB (response buffering would hold it in memory or on disk); and
+downloads must support resuming (`Range` has to pass through untouched).
 
-`video` 的可用调优项如下(其余会被 CEL 拒,避免「配了以为生效」):
+The tuning keys available for `video` are listed below (CEL rejects any other key, so nothing gets configured
+in the belief that it has an effect):
 
-| `nginx.values` 键 | 默认 | 含义 |
+| `nginx.values` key | Default | Meaning |
 |---|---|---|
-| `max_body_size` | `64m` | 请求体上限(I2V 允许 base64 传图) |
-| `proxy_timeout` | `3600s` | 读/写超时(生成 + 大文件下载) |
-| `connect_timeout` | `10s` | 连后端超时 |
-| `rate_limit` | **不配 = 不限速** | **单连接**下载限速,配了才渲染 `limit_rate`。接受 `200Mbps`/`1.5Gbps`(比特口径,自动换算成 nginx 要的字节/秒)或 nginx 原生写法(`25m`/`512k`) |
-| `rate_limit_after` | `1m`(仅当配了 `rate_limit`) | 前 N 字节全速。建任务/查询/删除都是几百字节的 JSON,不该被下载限速拖慢 |
-| `upload_conn_limit` | 不配 = 不限 | 每 IP 同时在传的连接数(`limit_conn`),超出直接 503 |
-| `upload_req_limit` | 不配 = 不限 | 每 IP 请求速率(`limit_req`,nginx 原生写法如 `10r/s`) |
-| `upload_req_burst` | 不配 = 无突发 | 配合 `upload_req_limit` 的突发额度 |
-| `api_keys` | 不配 = **不鉴权** | 逗号分隔的 Bearer token,与 LLM 路由同一套约定;不匹配返回 401 |
-| `auth_public_paths` | `~^/v2/video_generation/[^/]+/content$` | 免鉴权的路径(nginx map 左值)。默认放行下载:`content.url` 交给最终用户,浏览器不带 Authorization 头,而任务 id 是 UUID、相当于一次性能力 URL。置空 = 连下载也要 key |
-| `upload_limit_key` | `$http_x_real_ip` | 上面两个 zone 按什么分组。**不能用 `$binary_remote_addr`**,原因见文末 |
+| `max_body_size` | `64m` | Request body limit (I2V allows base64 images) |
+| `proxy_timeout` | `3600s` | Read/write timeout (generation + large downloads) |
+| `connect_timeout` | `10s` | Timeout for connecting to the backend |
+| `rate_limit` | **unset = no limit** | **Per-connection** download rate limit; `limit_rate` is rendered only when set. Accepts `200Mbps`/`1.5Gbps` (bits, converted to the bytes/second nginx wants) or nginx's own notation (`25m`/`512k`) |
+| `rate_limit_after` | `1m` (only when `rate_limit` is set) | The first N bytes go at full speed. Creating, querying and deleting jobs are a few hundred bytes of JSON and should not be slowed by the download limit |
+| `upload_conn_limit` | unset = no limit | Concurrent connections per IP (`limit_conn`); excess requests get 503 |
+| `upload_req_limit` | unset = no limit | Request rate per IP (`limit_req`, nginx notation such as `10r/s`) |
+| `upload_req_burst` | unset = no burst | Burst allowance for `upload_req_limit` |
+| `api_keys` | unset = **no authentication** | Comma-separated Bearer tokens, the same convention as LLM routes; a mismatch returns 401 |
+| `auth_public_paths` | `~^/v2/video_generation/[^/]+/content$` | Paths exempt from authentication (left side of an nginx map). Downloads are exempt by default: `content.url` is handed to end users, browsers send no Authorization header, and the job id is a UUID, effectively a one-time capability URL. Empty = downloads need a key too |
+| `upload_limit_key` | `$http_x_real_ip` | What the two zones above are keyed by. **`$binary_remote_addr` does not work**; see the end of this document |
 
-**下载限速必须配合开缓冲**:`proxy_buffering off` 时 `limit_rate` 会被 nginx 完全忽略
-(50MB 实测:静态文件 4.99s / 开缓冲 4.61s / 关缓冲 0.089s,`proxy_limit_rate` 同理)。
-所以配了 `rate_limit` 时模板渲染成 `proxy_buffering on` + `proxy_max_temp_file_size 0`
-—— 开缓冲但不落临时文件,缓冲区满即对上游反压;不配限速时仍是 `proxy_buffering off` 边收边发。
+**A download rate limit needs buffering on**: with `proxy_buffering off`, nginx ignores `limit_rate`
+entirely (measured on 50 MB: static file 4.99s / buffering on 4.61s / buffering off 0.089s; `proxy_limit_rate`
+behaves the same). So when `rate_limit` is set, the template renders `proxy_buffering on` +
+`proxy_max_temp_file_size 0` — buffering without temporary files, so a full buffer applies backpressure
+upstream. Without a rate limit it stays `proxy_buffering off`, streaming as it receives.
 
-**上传方向没有字节级限速**:`limit_rate`/`proxy_limit_rate` 都只作用于响应,nginx 没有
-限制请求体读取速率的指令(真要做只能在 lua 里自己读 `ngx.req.socket` 加 sleep,会丢掉
-`proxy_request_buffering` 的现成反压)。所以上传靠三道闸:`max_body_size` 卡单条体积、
-`upload_conn_limit` 卡并发、`upload_req_limit` 卡频率 —— 单个来源的入向带宽 ≈ 并发数 × 单条速率。
+**There is no byte-level limit on uploads**: `limit_rate`/`proxy_limit_rate` only apply to responses, and
+nginx has no directive that limits how fast a request body is read (doing it would mean reading
+`ngx.req.socket` in Lua with sleeps, losing the backpressure `proxy_request_buffering` already provides). So
+uploads are bounded by three gates: `max_body_size` caps the size of one request, `upload_conn_limit` caps
+concurrency, and `upload_req_limit` caps frequency — one source's inbound bandwidth ≈ concurrency × per-request
+rate.
 
-限速只限**速度不限大小** —— `client_max_body_size` 管的是请求体,和响应无关;
-`proxy_buffering off` 也让响应不落临时文件,所以下载的视频多大都行(1GB 按 200Mbps 约 40 秒)。
-`proxy_read_timeout` 限的是两次数据之间的间隔,不是总时长。
+A rate limit limits **speed, not size** — `client_max_body_size` applies to the request body, not the
+response, and `proxy_buffering off` keeps responses out of temporary files, so downloaded videos can be any size
+(1 GB at 200 Mbps takes about 40 seconds). `proxy_read_timeout` limits the gap between two reads, not the total
+duration.
 
-CEL 还会拒掉 `video` + `cart` / `slo` / `monitor`:前两个是 LLM 专用;监控的探活与告警
-按 LLM 端点设计,指向视频服务只会产生假告警(用 Prometheus 抓服务自己的指标)。
+CEL also rejects `video` combined with `cart` / `slo` / `monitor`: the first two are LLM-specific; the
+monitor's liveness checks and alerts are designed for LLM endpoints and would only raise false alarms against
+a video service (scrape the service's own metrics with Prometheus instead).
 
-peers 的优先级在 `video` 下映射成 nginx 的主用/`backup` 两档:优先级最高的一组主用,
-更低的(如 `backend-svc` 这种 VIP 静态兜底)标 `backup`,pod-IP 那层全挂了才顶上。
+Under `video`, peer priorities map to nginx's two tiers, primary and `backup`: the highest-priority group is
+primary, and lower ones (such as the `backend-svc` VIP fallback) are marked `backup` and only take over when the
+whole pod-IP tier is down.
 
-**下发通道与 llm 完全一致**:同样写进 `nginx.outputConfigMap` 的 `session_route_<route>.conf` 键,
-同样由 reload sidecar 监听挂载目录 → `SIGHUP` 生效,没有第二条通道。
-(sidecar 还靠 conf 里的 `listen unix:.../<route>.sock;` 判断哪些 socket 仍在用,
-video 模板保持同样的 listen 行格式,有用例守着。)
+**Delivery is exactly the same as for `llm`**: written to the `session_route_<route>.conf` key of
+`nginx.outputConfigMap`, picked up by the reload sidecar watching the mounted directory → `SIGHUP`. There is no
+second channel. (The sidecar also uses the conf's `listen unix:.../<route>.sock;` line to tell which sockets are
+still in use; the video template keeps the same listen line format, and a test guards it.)
 
-样例见 [`config/samples/modelroute-minimax-h3.yaml`](config/samples/modelroute-minimax-h3.yaml)。
+Example: [`config/samples/modelroute-minimax-h3.yaml`](config/samples/modelroute-minimax-h3.yaml).
 
-**`spec.discovery`** —— 一桶后端怎么发现
+**`spec.discovery`** — how one bucket of backends is discovered
 
-| 字段 | 类型 | 默认/约束 | 含义与配置 |
+| Field | Type | Default / constraint | Meaning |
 |---|---|---|---|
-| `service` | string | 与 `selector` **二选一** | EndpointSlice 发现(推荐);支持 `ns/name` 跨 ns(裸名默认同 ModelRoute 的 ns)→ ModelRoute 可放中心 ns |
-| `selector` | string | 与 `service` **二选一** | pod label 发现(没建 Service 的单机/单卡兜底) |
-| `port` | int | 可选,省略自动推导 | 后端端口;service 路径从 EndpointSlice 取、selector 路径从 containerPort 取(仅单端口可推) |
-| `includeNotReady` | bool | `false` | 默认只取 Ready 端点(排空中端点自动排除);`true` = 含未 Ready |
+| `service` | string | **exactly one of** `service` / `selector` | EndpointSlice discovery (recommended); `ns/name` works across namespaces (a bare name means the ModelRoute's namespace) → ModelRoutes can live in a central namespace |
+| `selector` | string | **exactly one of** `service` / `selector` | Pod label discovery (fallback for single-node / single-GPU backends without a Service) |
+| `port` | int | optional, derived when omitted | Backend port; taken from the EndpointSlice for `service`, from the containerPort for `selector` (only a single port can be derived) |
+| `includeNotReady` | bool | `false` | By default only Ready endpoints are used (draining endpoints are excluded); `true` = include not-ready ones |
 
-**`spec.cart`** —— 省略整段 = 无 CART
+**`spec.cart`** — omit the whole block for no CART
 
-| 字段 | 类型 | 默认/约束 | 含义与配置 |
+| Field | Type | Default / constraint | Meaning |
 |---|---|---|---|
-| `service` / `selector` | string | **二选一** | CART pod 发现(供 openresty 的 cart source);`service` 支持 `ns/name` |
-| `port` | int | 省略推导 | CART 端口(EndpointSlice/containerPort 单端口自动推) |
-| `outputConfigMap` | string | ✅ | 写 CART `config.yaml` 的目标 `ns/name`;底稿(server/cache/health)由 CART chart 的 `values.baseConfig` 建在此 CM,autoconfig 只重填 `workers` 段 |
-| `maxLoad` | int | `20` | 每 worker 的 `max_load` |
+| `service` / `selector` | string | **exactly one** | How the CART pods are discovered (for openresty's cart source); `service` accepts `ns/name` |
+| `port` | int | derived when omitted | CART port (derived from a single EndpointSlice port / containerPort) |
+| `outputConfigMap` | string | ✅ | `ns/name` of the ConfigMap CART's `config.yaml` is written to; the base config (server/cache/health) is created in it by the CART chart's `values.baseConfig`, and autoconfig only rewrites the `workers` section |
+| `outputKey` | string | `config.yaml` | Which key of that ConfigMap the workers go to. Point it at a workers-only key (for example `workers.yaml`) to leave the base config key entirely to the chart; CART merges `-c config.yaml -c workers.yaml` in that order |
+| `maxLoad` | int | `20` | `max_load` per worker |
 
-**`spec.nginx`** —— openresty 路由
+**`spec.nginx`** — openresty routing
 
-| 字段 | 类型 | 默认/约束 | 含义与配置 |
+| Field | Type | Default / constraint | Meaning |
 |---|---|---|---|
-| `route` | string | 省略 = `metadata.name` | 路由短名 = conf 文件名 + openresty dict 名 + `<route>.sock` + 外部路径 key `/<route>/`。**字符集必须 ⊆ `[a-z0-9._-]`**(做 dispatch 路径捕获正则;含大写会派生不到 socket → 8080 打不通) |
-| `peers` | list | ✅(≥1) | 有序 peer 组(见 `peers[]` 表) |
-| `outputConfigMap` | string | ✅ | 输出 ConfigMap `ns/name`(多路由共享,每路由一个 key,finalizer 摘各自 key) |
-| `values` | map | 可选 | 任意调优项原样渲染进 lua `register_route` 返回表(key=value)→ 加新调优项无需改代码 |
-| `service` | string | 可选 | nginx 入口自身的 Service `ns/name` → 供监控的 `nginx:` 行 + 入口 pod 扩缩事件驱动;端口取 Service 的 dispatch 命名端口 8080 |
-| `selector` | string | 可选 | nginx 入口 pod label 发现(没建 Service 兜底;与 `service` 二选一,都配则 `service` 优先) |
+| `route` | string | omitted = `metadata.name` | Short route name = conf file name + openresty dict name + `<route>.sock` + external path key `/<route>/`. **Characters must be within `[a-z0-9._-]`** (it is captured by the dispatch path regex; with upper case no socket is derived and port 8080 cannot reach it) |
+| `peers` | list | ✅ (≥1) | Ordered peer groups (see the `peers[]` table) |
+| `outputConfigMap` | string | ✅ | Output ConfigMap `ns/name` (shared by many routes, one key per route; the finalizer removes each route's own key) |
+| `values` | map | optional | Any tuning keys, rendered as-is into the table returned by Lua `register_route` (key=value) → a new tuning key needs no code change |
+| `service` | string | optional | The nginx entry point's own Service `ns/name` → used for the monitor's `nginx:` lines and to react to entry pods scaling; the port is the Service's named dispatch port 8080 |
+| `selector` | string | optional | nginx entry pods by label (fallback without a Service; alternative to `service`, which wins if both are set) |
 
-**`spec.nginx.values` 示例 —— 开启动态限流(自适应并发 AIMD)**
+**`spec.nginx.values` example — dynamic rate limiting (adaptive concurrency, AIMD)**
 
-配了 `tps_limit_tps` 即对本路由 opt-in;未显式 `adaptive_cc: "false"` 时,`adaptive_cc` 按全局默认自动开。
-删掉 `values` 即退回不限流。
+Setting `tps_limit_tps` opts the route in; unless `adaptive_cc: "false"` is set explicitly, `adaptive_cc`
+follows the global default and turns on. Removing `values` returns to no rate limiting.
 
 ```yaml
 spec:
@@ -222,97 +262,110 @@ spec:
     route: qwen
     service: llm-route/openresty
     outputConfigMap: llm-route/openresty-conf
-    values:                       # 任意 key 原样渲染进 lua register_route opts(值必须字符串)
-      tps_limit_tps: "30"         # 解码速率下限(tok/s):EWMA 低于它→AIMD 缩并发,高于它→涨(= opt-in 闸门)
-      # adaptive_cc_min: "10"     # 可选:并发下限(不配 = 静态 max × 全局 min_frac 派生)
-      # ttft_limit_ms: "60000"    # 可选:TTFT 软控阈值
-      # adaptive_cc: "false"      # 可选:显式关自适应,走静态硬熔断
+    values:                       # any key, rendered as-is into the Lua register_route opts (values must be strings)
+      tps_limit_tps: "30"         # decode-rate floor (tok/s): EWMA below it → AIMD lowers concurrency, above it → raises (= the opt-in switch)
+      # adaptive_cc_min: "10"     # optional: concurrency floor (unset = static max × global min_frac)
+      # ttft_limit_ms: "60000"    # optional: soft TTFT threshold
+      # adaptive_cc: "false"      # optional: turn adaptive concurrency off and use the static hard limit
     peers:
     - { use: cart, priority: 3, maxConcurrencyFromBackend: true }
     - { use: backend, priority: 2, maxConcurrency: 100 }
     - { use: backend-svc, priority: 1 }
 ```
 
-生效后 openresty 侧 `GET /<route>/_tps_status` 应见 `opt_in=true, adaptive_cc_on=true`。
+Once applied, `GET /<route>/_tps_status` on openresty should show `opt_in=true, adaptive_cc_on=true`.
 
-**`spec.nginx.peers[]`** —— 有序分层(数字大=优先,高优层全 banned 才级联到低层)
+**`spec.nginx.peers[]`** — ordered tiers (higher number = preferred; traffic falls through to a lower tier
+only when every peer of the higher tier is banned)
 
-| 字段 | 类型 | 默认/约束 | 含义与配置 |
+| Field | Type | Default / constraint | Meaning |
 |---|---|---|---|
-| `use` | enum | ✅ `cart`\|`backend`\|`backend-svc` | 见下「三档 `use`」 |
-| `priority` | int | — | openresty peer 优先级(建议 cart=3、backend=2、backend-svc=1) |
-| `maxConcurrency` | int | 省略用 `values.default_max` | 该组所有 peer 的并发上限 |
-| `maxConcurrencyFromBackend` | bool | 仅 `use:cart` 有意义 | `true` = cart 并发上限动态 = 后端单实例并发 × 后端数(CART 扇出到 N 后端,容量随扩缩自动变);设了则忽略静态 `maxConcurrency`,且**要求 `backend` 组 `maxConcurrency>0`** 作乘数 |
-| `probePath` | string | 省略见右 | openresty 健康探测路径覆盖(GET,状态行含 200=健康否则 ban)。`use:cart` 默认 `/health`(CART 的 `/v1/models` 是缓存端点、worker 全挂也返 200,不能当信号);其余层默认空 = 用 route 的 `health_probe_path` |
+| `use` | enum | ✅ `cart`\|`backend`\|`backend-svc` | See "The three `use` values" below |
+| `priority` | int | — | openresty peer priority (suggested: cart=3, backend=2, backend-svc=1) |
+| `maxConcurrency` | int | omitted = `values.default_max` | Concurrency limit for every peer in the group |
+| `maxConcurrencyFromBackend` | bool | only meaningful for `use:cart` | `true` = the cart limit is dynamic = per-backend concurrency × number of backends (CART fans out to N backends, so capacity follows scaling); overrides a static `maxConcurrency`, and **requires `maxConcurrency>0` on the `backend` group** as the multiplier |
+| `probePath` | string | see right when omitted | Overrides openresty's health probe path (GET; a status line containing 200 = healthy, otherwise banned). `use:cart` defaults to `/health` (CART's `/v1/models` is cached and returns 200 even when every worker is down, so it is no signal); other tiers default to empty = the route's `health_probe_path` |
 
-三档 `use`:
-- **`cart`**(priority 3)—— CART 上游,走 **CART Service 的 ClusterIP(VIP,非 pod IP)**:CART 是 master-standby,
-  VIP 恒指 active leader → CART failover/rollout 对 openresty 透明,autoconfig 无需重写。
-- **`backend`**(priority 2)—— 后端 **pod IP**(session 亲和 / least_conn / per-peer 健康的主力层)。
-- **`backend-svc`**(priority 1,可选兜底)—— 后端 **Service 的 ClusterIP(VIP)静态兜底**:
-  **autoconfig 本身宕 + 后端 rollout** 时 pod-IP 层是死 IP 又没人重写 → 若无兜底会全断;
-  VIP 由 kube-proxy 维护、不依赖 autoconfig 存活,pod-IP 层全 banned 后级联到它 →
-  **降级(走 kube-proxy、无亲和)但不全断**。需 `discovery.service`(selector 模式无 VIP,自动跳过)。
+The three `use` values:
+- **`cart`** (priority 3) — the CART upstream, through the **CART Service's ClusterIP (VIP, not pod IPs)**: CART
+  runs master-standby and the VIP always points at the active leader → CART failover and rollouts are
+  transparent to openresty, and autoconfig need not rewrite anything.
+- **`backend`** (priority 2) — backend **pod IPs** (the main tier for session affinity / least_conn /
+  per-peer health).
+- **`backend-svc`** (priority 1, optional fallback) — the backend **Service's ClusterIP (VIP) as a static
+  fallback**: if **autoconfig itself is down while the backend rolls out**, the pod-IP tier holds dead IPs and
+  nobody rewrites it → without a fallback everything fails. The VIP is maintained by kube-proxy and does not
+  depend on autoconfig; when the whole pod-IP tier is banned, traffic falls through to it → **degraded (through
+  kube-proxy, no affinity) but not down**. Needs `discovery.service` (selector mode has no VIP and skips it).
 
-**`spec.monitor`** —— 可选;监控组件自身每 60s 热加载,**无 reload sidecar**(区别于 nginx/CART)。每模型一个 key,三类行:
+**`spec.monitor`** — optional. The monitoring component reloads itself every 60s, **with no reload sidecar**
+(unlike nginx/CART). One key per model, three kinds of lines:
 
-| 字段 | 类型 | 默认/约束 | 含义与配置 |
+| Field | Type | Default / constraint | Meaning |
 |---|---|---|---|
-| `outputConfigMap` | string | ✅ | 写监控配置的 ConfigMap `ns/name`(多模型共享,每模型一个 key) |
-| `model` | string | 省略 = `metadata.name` | `service:` 行的 model 字段(served-model-name) |
-| `gpuType` | string | 省略自动推导 | `service:` 行的 gpu_type;省略 = 从后端节点 GPU label `nvidia.com/gpu.product`(GFD)推短名,推不出留空 |
-| `nginx` | bool | 默认 `true`(当 `spec.nginx` 配了 service/selector) | 复用 nginx 入口发现写 `nginx:` 行;`false` 关 |
-| `router` | bool | 默认 `true`(当配了 `spec.cart`) | 复用 `spec.cart` 发现的 CART pod 写 `router:` 表(`.../workers`);`false` 关 |
+| `outputConfigMap` | string | ✅ | ConfigMap `ns/name` the monitoring config is written to (shared by many models, one key per model) |
+| `model` | string | omitted = `metadata.name` | The model field of the `service:` lines (served-model-name) |
+| `gpuType` | string | derived when omitted | The gpu_type of the `service:` lines; omitted = a short name derived from the backend node's GPU label `nvidia.com/gpu.product` (GFD), left empty if it cannot be derived |
+| `nginx` | bool | default `true` (when `spec.nginx` has a service/selector) | Reuse the nginx entry discovery to write `nginx:` lines; `false` turns it off |
+| `router` | bool | default `true` (when `spec.cart` is set) | Reuse the CART pods discovered for `spec.cart` to write the `router:` lines (`.../workers`); `false` turns it off |
 
-三类输出行格式:`service: <name> \| <url> \| <model> \| <gpu_type>`(每后端实例一行)、
-`nginx: <svc>-<i> \| http://ip:8080/<route>`、`router: <name>-router-<i> \| http://ip:port/workers`。
+The three output line formats: `service: <name> \| <url> \| <model> \| <gpu_type>` (one line per backend
+instance), `nginx: <svc>-<i> \| http://ip:8080/<route>`, `router: <name>-router-<i> \| http://ip:port/workers`.
 
-**CEL 校验(apply 时即报错)**:① `discovery`/`cart` 的 `service` 与 `selector` 必须**恰好一个**;
-② `nginx.peers` 用了 `cart` 必须配 `spec.cart`;③ `cart` 用 `maxConcurrencyFromBackend` 必须给
-`backend` 组配 `maxConcurrency>0`。
+**CEL validation (errors at apply time)**: ① for `discovery`/`cart`, **exactly one** of `service` and
+`selector`; ② if `nginx.peers` uses `cart`, `spec.cart` must be set; ③ if `cart` uses
+`maxConcurrencyFromBackend`, the `backend` group must have `maxConcurrency>0`.
 
-## 消费方接入
+## Integrating consumers
 
-autoconfig 只负责把配置**写进已有的 ConfigMap**(不创建 chart、不创建 ConfigMap);消费方各自 chart 建初始
-ConfigMap + reload/hagate sidecar + Service 门控,并把对应 ConfigMap 挂进自己的 pod。
-`autoconfig-reload` / `autoconfig-hagate` 两个 sidecar 镜像由本仓构建,消费方跨仓引用。三个消费方一览:
+autoconfig only **writes config into existing ConfigMaps** (it creates no charts and no ConfigMaps). Each
+consumer's chart creates the initial ConfigMap, the reload/hagate sidecars and the Service gate, and mounts the
+ConfigMap into its pod. The `autoconfig-reload` / `autoconfig-hagate` sidecar images are built from this
+repository and referenced by the consumers. The three consumers:
 
-| 消费方 | autoconfig 写的 ConfigMap → 挂载文件 | reload sidecar |
+| Consumer | ConfigMap autoconfig writes → mounted file | reload sidecar |
 |---|---|---|
 | **openresty** | `openresty-conf` → `conf.d/routes/session_route_<route>.conf` | ✅ `--process "nginx: master"` + `--sock-dir` |
-| **cart**(cache-aware-router) | `cart-config` → `configs/config.yaml`(只重填 `workers` 段) | ✅ `--process cache-aware-router` |
-| **监控** | `monitor-conf` → `conf.d/<model>.monitor.conf` | ❌ 自身每 60s 热加载 |
+| **cart** (cache-aware-router) | `cart-config` → `configs/config.yaml` (only the `workers` section is rewritten) | ✅ `--process cache-aware-router` |
+| **monitoring** | `monitor-conf` → `conf.d/<model>.monitor.conf` | ❌ reloads itself every 60s |
 
 ### openresty
 
-- **ConfigMap 交付(为什么挂子目录)**:ConfigMap 整卷挂会覆盖整个目录,而 `.conf` 和 `lua/` 同在 `conf.d/`。
-  所以把 `session_route*.conf` 移到子目录 **`conf.d/routes/`**,ConfigMap(`openresty-conf`)只挂到那里;
-  `lua/` + `router_locations.inc` + `nginx.conf` + **8080 dispatch(`session_base.conf`)** 仍烤镜像。
-  `nginx.conf` 的 include 从 `conf.d/*.conf` 改成 `conf.d/routes/*.conf`(`lua_package_path` 不变)。
-- **路径路由(单一对外端口)**:
-  - 镜像 baked 一个 `listen 8080` 的 dispatch server,按请求路径首段 `/<route>/`
-    运行时派生到 per-model server 的 unix socket(`<prefix>/sock/<route>.sock`)—— 单一对外端口、零映射表。
-  - per-model server 只 `listen unix:.../<route>.sock`(不占 TCP 端口),故 `spec.nginx.route` = 外部路径 key
-    = socket 名;autoconfig 生成的 `session_route_<route>.conf` 里就是这个 socket listen。
-  - dispatch 把打 8080 的真实客户端 IP 经 `X-Real-IP` 透传,per-model `set_real_ip_from unix:` 还原
-    `$remote_addr` → `allow 127.0.0.1` 的调参端点仍只对 in-pod 本地开放。
-- **reload sidecar**:`--process "nginx: master"` + **`--sock-dir`**。
+- **ConfigMap delivery (why a subdirectory)**: mounting a ConfigMap as a whole volume replaces the whole
+  directory, and the `.conf` files and `lua/` both live in `conf.d/`. So the `session_route*.conf` files moved to
+  the subdirectory **`conf.d/routes/`**, and the ConfigMap (`openresty-conf`) is mounted only there; `lua/` +
+  `router_locations.inc` + `nginx.conf` + the **8080 dispatch (`session_base.conf`)** stay baked into the image.
+  The include in `nginx.conf` changes from `conf.d/*.conf` to `conf.d/routes/*.conf` (`lua_package_path` is
+  unchanged).
+- **Path routing (a single external port)**:
+  - The image bakes in a dispatch server on `listen 8080` that, by the first path segment `/<route>/`, forwards
+    at runtime to the unix socket of the per-model server (`<prefix>/sock/<route>.sock`) — one external port, no
+    mapping table.
+  - Per-model servers only `listen unix:.../<route>.sock` (no TCP port), so `spec.nginx.route` = external path
+    key = socket name; the `session_route_<route>.conf` autoconfig generates contains exactly this socket listen.
+  - The dispatch server passes the real client IP of requests to 8080 in `X-Real-IP`, and the per-model
+    `set_real_ip_from unix:` restores `$remote_addr` → tuning endpoints restricted with `allow 127.0.0.1` stay
+    reachable only from inside the pod.
+- **reload sidecar**: `--process "nginx: master"` + **`--sock-dir`**.
 
 ### cart
 
-- **ConfigMap 交付**:整卷挂 `cart-config` → cart 启动 `-c configs/config.yaml`。底稿(`server`/`cache`/`health`)
-  由 CART chart 的 `values.baseConfig` 建在此 ConfigMap,autoconfig 只重填 `workers` 段。
-- **reload sidecar**:`--process cache-aware-router`。
+- **ConfigMap delivery**: `cart-config` is mounted as a whole volume → cart starts with `-c configs/config.yaml`.
+  The base config (`server`/`cache`/`health`) is created in this ConfigMap by the CART chart's
+  `values.baseConfig`; autoconfig only rewrites the `workers` section.
+- **reload sidecar**: `--process cache-aware-router`.
 
-### 监控
+### Monitoring
 
-- **ConfigMap 交付**:整卷挂 `monitor-conf` → `conf.d/<model>.monitor.conf`(多模型共享,每模型一个 key)。
-- **无 reload sidecar**:自身每 60s 热加载,不需要 SIGHUP(区别于 openresty/cart)。
+- **ConfigMap delivery**: `monitor-conf` is mounted as a whole volume → `conf.d/<model>.monitor.conf` (shared by
+  many models, one key per model).
+- **No reload sidecar**: it reloads itself every 60s and needs no SIGHUP (unlike openresty/cart).
 
-### reload sidecar 接入(openresty / cart 通用)
+### Adding the reload sidecar (openresty / cart)
 
-机制见上「reload —— 配置热重载」。接入 = 消费方 pod 加一个 `autoconfig-reload` 容器
-(`shareProcessNamespace: true` 才能发 SIGHUP + 输出 ConfigMap **整卷挂**到 `--watch`),args:
+See "reload — config hot reload" above for how it works. To add it, give the consumer pod an
+`autoconfig-reload` container (`shareProcessNamespace: true` is needed to send SIGHUP, and the output
+ConfigMap must be **mounted as a whole volume** at `--watch`), with args:
 
 ```yaml
 # openresty
@@ -321,26 +374,28 @@ args: ["--watch","/watch","--process","nginx: master","--sock-dir","/usr/local/o
 args: ["--watch","/watch","--process","cache-aware-router"]
 ```
 
-## 构建(三个镜像)
+## Building (three images)
 
-多阶段 build:golang builder 编译 → 产物打进运行期基础镜像。**不 vendor**;
-`go.sum` 入库 + `GOSUMDB=off` 保证可复现,`GOTOOLCHAIN=local` 防联网拉工具链。
+Multi-stage builds: a Go builder compiles, and the binary is copied into a runtime base image. **Nothing is
+vendored**; the committed `go.sum` keeps builds reproducible with `GOSUMDB=off`, and `GOTOOLCHAIN=local` stops
+Go from downloading a toolchain.
 
-基础镜像与 goproxy 都是 `ARG`,**默认走公网**,clone 下来即可构建:
+The base images and the Go module proxy are `ARG`s that **default to public sources**, so a fresh clone builds
+as is:
 
 ```bash
-docker build                        -t autoconfig:dev        .   # controller(cmd/)
+docker build                        -t autoconfig:dev        .   # controller (cmd/)
 docker build -f Dockerfile.reload   -t autoconfig-reload:dev .   # reload sidecar
 docker build -f Dockerfile.hagate   -t autoconfig-hagate:dev .   # hagate sidecar
 ```
 
-| ARG | 默认 | 说明 |
+| ARG | Default | Description |
 |---|---|---|
-| `GO_BASE` | `golang:1.23.3-alpine3.20` | 编译阶段基础镜像 |
-| `RUNTIME_BASE` | `python:3.12-alpine` | 运行期基础镜像 |
-| `GOPROXY` | `https://proxy.golang.org,direct` | 依赖代理 |
+| `GO_BASE` | `golang:1.23.3-alpine3.20` | Base image of the build stage |
+| `RUNTIME_BASE` | `python:3.12-alpine` | Runtime base image |
+| `GOPROXY` | `https://proxy.golang.org,direct` | Go module proxy |
 
-在内网 / 受限网络里换成镜像缓存:
+On an internal or restricted network, point them at mirrors:
 
 ```bash
 docker build \
@@ -350,65 +405,71 @@ docker build \
   -t autoconfig:dev .
 ```
 
-`Makefile` 的 `make docker-build` 默认不带覆盖参数(走公网);需要时用 `BUILD_ARGS` 传入,
-如 `make docker-build BUILD_ARGS="--build-arg GOPROXY=<your-goproxy>,direct"`。CI 在打 git tag 时自动构建并推送三个镜像,
-chart 的 `version` / `appVersion` 同步成该 tag —— `values.yaml` 的 `image.tag` 留空即回落到
-`appVersion`,**不要在 values 里写死版本号**。
+`make docker-build` passes no overrides by default; pass them through `BUILD_ARGS`, for example
+`make docker-build BUILD_ARGS="--build-arg GOPROXY=<your-goproxy>,direct"`. On a git tag,
+`.github/workflows/release.yml` builds the three images (linux/amd64 + linux/arm64) and pushes them to Docker
+Hub (`4pdosc/`). The chart is published from
+[modelsphere/helm-charts](https://github.com/modelsphere/helm-charts); leave `image.tag` in `values.yaml` empty
+so it falls back to the chart's `appVersion` — **do not pin a version in values**.
 
-本地快速验证:`go build ./cmd/...`。
+Quick local check: `go build ./cmd/...`.
 
-## 测试
-
-```bash
-make test        # 代码生成 + fmt + vet + go test ./...
-```
-
-`test/e2e/` 下是端到端脚本,需要一个可用的 k8s 集群(`kubectl` + `helm`),覆盖:
-CRD controller 的发现分桶 / 渲染内容 / status / 扩缩跟随 / fail-safe / finalizer 清理,
-以及真 openresty + 真 CART 经 helm chart 的接入(真 reload 热更、路径路由 unix socket、
-`openresty -t` 校验、master-standby failover)。脚本默认值用环境变量覆盖,
-鉴权 key 等敏感项需显式提供(未设置会直接报错退出,不带默认值)。
-
-## 开发布局(kubebuilder / operator-sdk v4)
-
-标准 operator 布局:`PROJECT` + `Makefile` + `api/v1alpha1`(带 kubebuilder marker 的类型)
-+ `internal/controller`(reconciler)+ `internal/{discovery,sink,hagate,reload}`
-+ `config/`(kustomize:crd/rbac/manager/default/samples)。
-
-**改了 `api/` 类型或 `+kubebuilder:` marker 后**,跑生成、提交生成物(CI 不跑生成,只编译):
+## Testing
 
 ```bash
-make generate manifests    # controller-gen 生成 deepcopy + config/crd/bases + config/rbac/role.yaml,并同步 CRD 到 helm/crds
-make test                  # 生成 + fmt + vet + go test
+make test        # code generation + fmt + vet + go test ./...
 ```
 
-工具用 `go run ...@version`(见 Makefile),不装二进制、不入库。
+`test/e2e/` holds end-to-end scripts that need a working Kubernetes cluster (`kubectl` + `helm`). They cover
+the CRD controller's discovery bucketing / rendered content / status / following scale changes / fail-safe /
+finalizer cleanup, and real openresty + real CART integrated through Helm charts (real reload, path routing over
+unix sockets, `openresty -t` validation, master-standby failover). Defaults can be overridden with environment
+variables; secrets such as the auth key must be provided explicitly (the scripts stop with an error if they are
+unset — there is no default).
 
-**部署两条路都可**:生产用 **Helm**(`deploy/helm/autoconfig`);kustomize 用 `make deploy`
-(`config/default`)。两者的 CRD/RBAC 同源(都来自 `config/` 的生成物)。
+## Development layout (kubebuilder / operator-sdk v4)
 
-## 注意(踩坑)
+The standard operator layout: `PROJECT` + `Makefile` + `api/v1alpha1` (types with kubebuilder markers)
++ `internal/controller` (the reconciler) + `internal/{discovery,sink,hagate,reload}`
++ `config/` (kustomize: crd/rbac/manager/default/samples).
 
-- **ConfigMap 必须整卷挂**(非 subPath)才会随更新自动同步;kubelet 同步有 **~1min 延迟** —— 对 peer 更新可接受
-  (health-timer + proxy_next_upstream 兜过渡),对 CART 反而是天然去抖(reload 会重建 radix tree)。
-- **fail-safe**:发现结果为空绝不写空(CART 拒绝空 workers;openresty 会丢全部流量)。
-- **reload 找 pid 只比 argv[0]**(不是整条 cmdline,也不用 comm —— comm 截断 15 字符):否则 sidecar 自己的
-  `--process nginx: master` 参数会自匹配。规则:argv[0] 相等 / basename 相等 / 以 match 开头
-  (nginx master 的 argv[0] = `nginx: master process ...`)。
-- **env 名别撞 k8s Service 注入**:若有名为 `cart` 的 Service,k8s 会注入 `CART_PORT=tcp://...`;
-  autoconfig 的 env 前缀统一 `PS_`。
+**After changing a type in `api/` or a `+kubebuilder:` marker**, run the generators and commit the output (CI
+reruns them and fails on any difference):
 
-### 为什么限流的默认 key 不是 `$binary_remote_addr`
-
-生产链路是 dispatch(`:8080` TCP)→ `proxy_pass` 到 **unix socket** → 各路由的 server 块。
-在 unix socket 那一跳上没有 IP,实测路由层拿到的是:
-
-```
-经 dispatch → unix socket:  remote_addr=[unix:]  xff=[127.0.0.1]  xrealip=[127.0.0.1]
-客户端带 XFF 时:            remote_addr=[unix:]  xff=[203.0.113.7, 127.0.0.1]
-直连对照(不经 socket):      remote_addr=[127.0.0.1]
+```bash
+make generate manifests    # controller-gen: deepcopy + config/crd/bases + config/rbac/role.yaml, and copies the CRD into the Helm chart
+make test                  # generate + fmt + vet + go test
 ```
 
-`$remote_addr` 恒等于字符串 `unix:` —— 每个请求算出同一个 key,
-`limit_conn 4` 就成了「整个服务同时只许 4 条」,而不是「每 IP 4 条」。
-这与外层是不是网关无关,是 dispatch→路由走 unix socket 这个结构决定的。
+Tools run as `go run ...@version` (see the Makefile); no binaries are installed or committed.
+
+**Two ways to deploy**: **Helm** for production (`deploy/helm/autoconfig`), or kustomize with `make deploy`
+(`config/default`). Both use the same CRD/RBAC, generated from `config/`.
+
+## Notes and pitfalls
+
+- **ConfigMaps must be mounted as whole volumes** (not subPath) to follow updates, and the kubelet syncs them
+  with a **delay of about a minute** — acceptable for peer updates (health timers + `proxy_next_upstream` cover
+  the transition), and for CART a natural debounce (a reload rebuilds the radix tree).
+- **Fail-safe**: an empty discovery result is never written (CART rejects an empty worker list; openresty would
+  drop all traffic).
+- **reload matches the pid on argv[0] only** (not the whole cmdline, and not comm, which is truncated to 15
+  characters): otherwise the sidecar's own `--process nginx: master` argument would match itself. Rule: argv[0]
+  equal / basename equal / starts with the match (the nginx master's argv[0] is `nginx: master process ...`).
+- **Keep env names clear of Kubernetes Service injection**: if there is a Service named `cart`, Kubernetes
+  injects `CART_PORT=tcp://...`; autoconfig's env prefix is always `PS_`.
+
+### Why the rate-limit key does not default to `$binary_remote_addr`
+
+The production path is dispatch (`:8080` TCP) → `proxy_pass` to a **unix socket** → each route's server block.
+The unix-socket hop has no IP; measured at the route level:
+
+```
+via dispatch → unix socket:   remote_addr=[unix:]  xff=[127.0.0.1]  xrealip=[127.0.0.1]
+client sends XFF:             remote_addr=[unix:]  xff=[203.0.113.7, 127.0.0.1]
+direct, for comparison:       remote_addr=[127.0.0.1]
+```
+
+`$remote_addr` is always the string `unix:` — every request computes the same key, so `limit_conn 4` becomes
+"4 connections for the whole service" instead of "4 per IP". This has nothing to do with whether there is a
+gateway in front; it follows from the dispatch → route hop going through a unix socket.
