@@ -350,8 +350,8 @@ docker build \
   -t autoconfig:dev .
 ```
 
-`Makefile` 的 `make docker-build` 已带上这组参数(`BUILD_ARGS` 变量可覆盖,走公网时
-`make docker-build BUILD_ARGS=`)。CI 在打 git tag 时自动构建并推送三个镜像,
+`Makefile` 的 `make docker-build` 默认不带覆盖参数(走公网);需要时用 `BUILD_ARGS` 传入,
+如 `make docker-build BUILD_ARGS="--build-arg GOPROXY=<your-goproxy>,direct"`。CI 在打 git tag 时自动构建并推送三个镜像,
 chart 的 `version` / `appVersion` 同步成该 tag —— `values.yaml` 的 `image.tag` 留空即回落到
 `appVersion`,**不要在 values 里写死版本号**。
 
