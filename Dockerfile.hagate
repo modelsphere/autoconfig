@@ -1,8 +1,22 @@
-# autoconfig-hagate 镜像 —— master-standby 的 leader 选举门控 sidecar(cmd/hagate)。
-# openresty/cart/monitor pod 里当 sidecar:只有持 Lease 的 leader 给自己 pod 打 <name>-active 标签,
-# Service selector 带它 → 只有 leader 进 Service endpoints(主备)。多阶段:goproxy 国内镜像拉依赖(无 vendor)。
-#   docker build -f Dockerfile.hagate -t harbor.4pd.io/hardcore-tech/autoconfig-hagate:<tag> .
-# 基础镜像与 goproxy 默认走公网;内网构建用 --build-arg 覆盖(见 .gitlab-ci.yml)。
+# autoconfig-hagate: the master-standby leader-election gate sidecar
+# (cmd/hagate). In an openresty/cart/monitor pod, only the sidecar that holds
+# the Lease labels its own pod <name>-active; the Service selects on that label,
+# so only the leader is in the Service endpoints.
+#
+#   docker build -f Dockerfile.hagate -t autoconfig-hagate:dev .
+#
+# Dependencies are not vendored: go.sum is committed, so `go mod download` is
+# reproducible. GOTOOLCHAIN=local keeps go from fetching a newer toolchain
+# because of the version in go.mod.
+#
+# The base images and the Go module proxy are build args. Their defaults are
+# public (Docker Hub, the upstream Go proxy), so a fresh clone builds as is.
+# Behind a firewall, point them at a mirror:
+#   --build-arg GO_BASE=<registry>/library/golang:1.23.3-alpine3.20
+#   --build-arg RUNTIME_BASE=<registry>/library/python:3.12-alpine
+#   --build-arg GOPROXY=<your-goproxy>,direct
+#
+# A version tag builds and publishes the image: .github/workflows/release.yml.
 ARG GO_BASE=golang:1.23.3-alpine3.20
 ARG RUNTIME_BASE=python:3.12-alpine
 ARG GOPROXY=https://proxy.golang.org,direct
