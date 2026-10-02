@@ -3,9 +3,9 @@
 # 后端 = 真 opt-125m vLLM(复用 e2e-test/vllm-mock-vllm-svc,跨 ns discovery)。真 /v1/completions 推理。
 set -uo pipefail
 NS=${NS:-llm-route}; CTRL_NS=autoconfig; CHARTS=~/prod-e2e/charts
-H=harbor.4pd.io/hardcore-tech; TAG=clusterip-test
+H=${REGISTRY:-4pdosc}; TAG=${IMG_TAG:-0.4.0}
 AC=$H/autoconfig; ACR=$H/autoconfig-reload:$TAG; AH=$H/autoconfig-hagate:$TAG
-OR_IMG=$H/llm-openresty:e2e0; CART_IMG=$H/cache_aware_router:v0.6.0; MON_IMG=$H/llm-monitor:k8s
+OR_IMG=${OR_IMG:-$H/llm-openresty:0.1.20}; CART_IMG=${CART_IMG:-$H/cache_aware_router:0.6.5}; MON_IMG=${MON_IMG:?需设置:llm-monitor 镜像(无公开镜像)}
 BACKEND_SVC=e2e-test/vllm-mock-vllm-svc; BPORT=8000; MODEL=facebook/opt-125m
 KEEP=${KEEP:-0}; FAIL=0
 AUTH_KEY=${AUTH_KEY:?需设置:openresty 入口鉴权 key(Bearer)}

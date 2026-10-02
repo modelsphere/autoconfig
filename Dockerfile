@@ -1,24 +1,30 @@
-# autoconfig 镜像 —— 多阶段:golang builder 从国内 goproxy 拉依赖编译 → 打进 python:3.12-alpine。
+# autoconfig: the ModelRoute controller (cmd/). Multi-stage: a Go builder
+# compiles the binary, which is copied into a small runtime image.
 #
-# 照 llm-openresty/Dockerfile.bodylog:依赖走【国内 goproxy 镜像】(mirrors.tencent.com/go —— public-buildx
-# runner 实测可达,见 llm-openresty CI #416384),不再 vendor。go.sum 入库 + GOSUMDB=off → 仍可复现;
-# GOTOOLCHAIN=local 防 go 因 go.mod 版本联网拉新工具链。GOPROXY 是 ARG,可 --build-arg 换 aliyun 等。
+#   docker build -t autoconfig:dev .
 #
-#   docker build -t harbor.4pd.io/hardcore-tech/autoconfig:<tag> .
-#   docker push harbor.4pd.io/hardcore-tech/autoconfig:<tag>
-# 打 git tag 自动 build+push,见 .gitlab-ci.yml。
-# 基础镜像与 goproxy 都是 ARG,默认走公网(Docker Hub / proxy.golang.org),开箱即可 build。
-# 内网构建加 --build-arg 指向 harbor 缓存与国内 goproxy(见 .gitlab-ci.yml):
-#   --build-arg GO_BASE=harbor.4pd.io/library/golang:1.23.3-alpine3.20
-#   --build-arg RUNTIME_BASE=harbor.4pd.io/hardcore-tech/python:3.12-alpine
-#   --build-arg GOPROXY=https://mirrors.tencent.com/go/,direct
+# Dependencies are not vendored: go.sum is committed, so `go mod download` is
+# reproducible. GOTOOLCHAIN=local keeps go from fetching a newer toolchain
+# because of the version in go.mod.
+#
+# The base images and the Go module proxy are build args. Their defaults are
+# public (Docker Hub, the upstream Go proxy), so a fresh clone builds as is.
+# Behind a firewall, point them at a mirror:
+#   --build-arg GO_BASE=<registry>/library/golang:1.23.3-alpine3.20
+#   --build-arg RUNTIME_BASE=<registry>/library/python:3.12-alpine
+#   --build-arg GOPROXY=<your-goproxy>,direct
+#
+# A version tag builds and publishes the image: .github/workflows/release.yml.
 ARG GO_BASE=golang:1.23.3-alpine3.20
 ARG RUNTIME_BASE=python:3.12-alpine
 ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ${GO_BASE} AS build
 ARG GOPROXY
-ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# Set by BuildKit for each platform being built; the defaults apply to the legacy builder.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

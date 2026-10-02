@@ -63,8 +63,8 @@ const (
 	// "每 IP 限 4 条"直接塌成"整个服务限 4 条"(与外层是不是网关无关,是结构决定的)。
 	//
 	// 改用 $http_x_real_ip:dispatch 转发时设了 X-Real-IP = 它自己的 $remote_addr,
-	// 也就是 openresty 的直连对端 —— 客户端直连时就是客户端本身,经 phanrouter 时是
-	// phanrouter 的 IP。要精确到"每真实客户端",配 upload_limit_key 取 XFF 最左一跳
+	// 也就是 openresty 的直连对端 —— 客户端直连时就是客户端本身,经上游代理时是
+	// 该代理的 IP。要精确到"每真实客户端",配 upload_limit_key 取 XFF 最左一跳
 	// (前提是外层确实透传 X-Forwarded-For)。
 	defaultVideoUploadLimitKey = "$http_x_real_ip"
 	// 免鉴权路径:下载。任务 id 是 UUID,等于一次性能力 URL。

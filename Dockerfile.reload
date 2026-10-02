@@ -1,15 +1,31 @@
-# autoconfig-reload 镜像 —— reload sidecar 独立小程序(cmd/reload)。
-# 与 controller 分离:openresty / CART pod 里挂它当 sidecar,watch ConfigMap 文件变 → SIGHUP 主进程。
-# 多阶段:goproxy 国内镜像拉依赖(无 vendor),同 Dockerfile。GOPROXY 是 ARG,可 --build-arg 换。
-#   docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-reload:<tag> .
-# 基础镜像与 goproxy 默认走公网;内网构建用 --build-arg 覆盖(见 .gitlab-ci.yml)。
+# autoconfig-reload: the config reload sidecar (cmd/reload). It runs in the
+# openresty / CART pod, watches the mounted ConfigMap and sends SIGHUP to the
+# main process when a file changes.
+#
+#   docker build -f Dockerfile.reload -t autoconfig-reload:dev .
+#
+# Dependencies are not vendored: go.sum is committed, so `go mod download` is
+# reproducible. GOTOOLCHAIN=local keeps go from fetching a newer toolchain
+# because of the version in go.mod.
+#
+# The base images and the Go module proxy are build args. Their defaults are
+# public (Docker Hub, the upstream Go proxy), so a fresh clone builds as is.
+# Behind a firewall, point them at a mirror:
+#   --build-arg GO_BASE=<registry>/library/golang:1.23.3-alpine3.20
+#   --build-arg RUNTIME_BASE=<registry>/library/python:3.12-alpine
+#   --build-arg GOPROXY=<your-goproxy>,direct
+#
+# A version tag builds and publishes the image: .github/workflows/release.yml.
 ARG GO_BASE=golang:1.23.3-alpine3.20
 ARG RUNTIME_BASE=python:3.12-alpine
 ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ${GO_BASE} AS build
 ARG GOPROXY
-ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# Set by BuildKit for each platform being built; the defaults apply to the legacy builder.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

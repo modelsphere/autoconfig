@@ -26,7 +26,7 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
       - name: manager
-        image: harbor.4pd.io/hardcore-tech/autoconfig:latest
+        image: 4pdosc/autoconfig:latest
         imagePullPolicy: Always
         args: []                    # 默认开 leader 选举;--leader-elect=false 可关
         env:
