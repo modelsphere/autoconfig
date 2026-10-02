@@ -1,7 +1,7 @@
 # k8s 部署手册(autoconfig 路由栈 + 测试模型 + ModelRoute)
 
 在一套干净的 k8s 集群上,把整套「ModelRoute 驱动的 LLM 路由栈」部署起来,并跑通一个测试模型(以 **qwen** 为例;opt 等其它模型同样方式接入)。
-所有组件镜像 + helm chart 都由各仓 CI 打 git tag 后产出到 harbor / ChartMuseum,本文档只做 `helm install` + `kubectl apply`。
+组件镜像由各仓打 git tag 后发布到 Docker Hub(`4pdosc/*`),helm chart 发布在 [modelsphere/helm-charts](https://github.com/modelsphere/helm-charts);本文档只做 `helm install` + `kubectl apply`。
 
 ## 0. 架构与依赖顺序
 
@@ -17,7 +17,7 @@
 ```
 
 **部署顺序(有依赖,别颠倒)**:
-1. 前置:helm repo(ChartMuseum)+ namespace
+1. 前置:helm repo + namespace
 2. **autoconfig**(先装 —— 它带 ModelRoute CRD + controller;后面组件都消费它产出的 ConfigMap)
 3. 测试模型后端(qwen)
 4. **cart**(每模型一个;`waitForWorkers` 会 Init 等 autoconfig 写入 workers)
@@ -26,29 +26,31 @@
 7. **ModelRoute CR**(qwen)→ autoconfig 据此填三个 ConfigMap → cart 就绪、openresty 出路由、monitor 出监控
 8. 验证
 
-镜像统一在 `harbor.4pd.io/hardcore-tech/`;chart 统一在 ChartMuseum `https://harbor.4pd.io/chartrepo/hardcore-tech`。
+镜像默认来自 Docker Hub(`4pdosc/`);chart 来自 helm 仓 `https://modelsphere.github.io/helm-charts`。
+集群不能访问外网时,把镜像同步到自己的镜像仓库,再用各 chart 的 `image` 相关 values 覆盖。
+
+monitor 目前没有公开的 chart 和镜像:第 6 步换成你自己的 monitor chart 来源,或者跳过它(见第 6 步)。
 
 ---
 
 ## 1. 前置
 
 ```bash
-# 1.1 helm 加 ChartMuseum 仓(harbor 的 hardcore-tech project 允许匿名 pull → 只读无需凭证)
-helm repo add harbor-chart-repo https://harbor.4pd.io/chartrepo/hardcore-tech
-helm repo update harbor-chart-repo
+# 1.1 加 helm 仓(公开,只读无需凭证)
+helm repo add modelsphere https://modelsphere.github.io/helm-charts
+helm repo update modelsphere
 
-# 1.2 确认能看到各 chart(注:helm search 对本 ChartMuseum 偶发空,用 helm show chart 确认;不加 --version 默认取最新)
-helm show chart harbor-chart-repo/autoconfig         | grep -E '^name|^version'
-helm show chart harbor-chart-repo/openresty          | grep -E '^name|^version'
-helm show chart harbor-chart-repo/cache_aware_router | grep -E '^name|^version'
-helm show chart harbor-chart-repo/monitor            | grep -E '^name|^version'
+# 1.2 确认能看到各 chart(不加 --version 默认取最新)
+helm search repo modelsphere/autoconfig
+helm search repo modelsphere/openresty
+helm search repo modelsphere/cart
 
 # 1.3 namespace(qwen ns 由后端 sample 自带 Namespace,无需先建)
 kubectl create ns llm-route   2>/dev/null || true
 kubectl create ns monitoring  2>/dev/null || true
 ```
 
-> **本文档所有 `helm install`/`upgrade` 都不带 `--version`** —— helm 默认拉 ChartMuseum 里的最新版本,新 tag 一发布下次执行就自动用上,无需改本文档维护版本号。若需要锁定/回滚到某个历史版本,再显式加 `--version <x.y.z>`(可用版本:`curl -s https://harbor.4pd.io/api/chartrepo/hardcore-tech/charts/<chart>`)。
+> **本文档所有 `helm install`/`upgrade` 都不带 `--version`** —— helm 默认拉仓里的最新版本,新版本一发布下次执行就自动用上,无需改本文档维护版本号。若需要锁定/回滚到某个历史版本,再显式加 `--version <x.y.z>`(可用版本:`helm search repo modelsphere/<chart> --versions`)。
 
 ---
 
@@ -57,7 +59,7 @@ kubectl create ns monitoring  2>/dev/null || true
 chart 自带 `crds/`(ModelRoute CRD)+ controller Deployment(2 副本 leader 选举)+ RBAC。
 
 ```bash
-helm -n llm-route install autoconfig harbor-chart-repo/autoconfig \
+helm -n llm-route install autoconfig modelsphere/autoconfig \
   --set fullnameOverride=autoconfig-controller
 
 # 校验:CRD 装上 + controller Running
@@ -132,7 +134,7 @@ kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}
 ```
 
 > **opt 同理**:`config/samples/opt-backend.yaml`(vLLM `opt-125m`,ns `opt`,`opt-svc` ClusterIP:8000;`--shutdown-timeout=3540` 优雅停机)+ `modelroute-opt.yaml`,后续步骤把 `qwen` 换成 `opt` 即可。
-> 生产模型(如 kimi 用 LeaderWorkerSet TP8/PP2)部署方式不同(见 `scripts/k8s-llm/`),但接入路由的方式一样:建 Service + 写 ModelRoute。
+> 生产模型(如 kimi 用 LeaderWorkerSet TP8/PP2)部署方式不同(见 modelsphere/helm-charts 的 `sglang` / `vllm` chart),但接入路由的方式一样:建 Service + 写 ModelRoute。
 
 ---
 
@@ -144,7 +146,7 @@ kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}
 ```bash
 # reload/hagate 侧车镜像版本已是 chart 的默认值(每次 autoconfig 发版会同步 bump 进各 chart),
 # 不用显式 --set 覆盖 —— 显式写死版本号反而会在 chart 默认值升级后仍锁在旧版,忘了改就悄悄漂移。
-helm -n llm-route install cart-qwen harbor-chart-repo/cache_aware_router \
+helm -n llm-route install cart-qwen modelsphere/cart \
   --set fullnameOverride=cart-qwen
 
 # 此时 cart pod 会停在 Init(等 workers),属正常;第 7 步后转 Running
@@ -162,7 +164,7 @@ chart 挂载 autoconfig 产出的 `openresty-conf` ConfigMap(各 `session_route_
 `bodylog.host` 指向 bodylog-listener(k8s 里需 FQDN 或可解析地址)。
 
 ```bash
-helm -n llm-route install openresty harbor-chart-repo/openresty \
+helm -n llm-route install openresty modelsphere/openresty \
   --set fullnameOverride=openresty \
   --set bodylog.host=192.0.2.31
 
@@ -177,6 +179,8 @@ kubectl -n llm-route rollout status deploy/openresty
 
 chart 自带 MySQL(持久化 state + 时序);读 autoconfig 产出的 `monitor-conf`(service/nginx/router 行,60s 热加载)。
 
+> monitor 没有公开的 chart:下面的 `<monitor-chart>` 换成你自己的 chart 来源。不装 monitor 时跳过本步,并删掉第 7 步 ModelRoute 里的 `spec.monitor` 段(它是可选的)。
+
 **生产推荐:密钥走 `existingSecret`(带外建,不归 helm 管)** —— 这样 `helm upgrade` 无论带不带 `--set` 都碰不到密钥,避免「误用 `--set` 不带 `--reuse-values` → 密钥被刷成占位」的坑(app + mysql 两份密钥都能外置)。
 
 ```bash
@@ -184,8 +188,8 @@ chart 自带 MySQL(持久化 state + 时序);读 autoconfig 产出的 `monitor-c
 kubectl -n monitoring apply -f secret.example.yaml    # llm-monitor-secret + llm-monitor-mysql-secret
 
 # ② install:关掉 chart 自建密钥,引用带外的
-#    (nginxHost / bodylogSummaryURL 已是 chart 默认值——bodylog 默认指 ts34,换集群才 --set 覆盖)
-helm -n monitoring install monitor harbor-chart-repo/monitor \
+#    (nginxHost / bodylogSummaryURL 按你的集群用 --set 覆盖)
+helm -n monitoring install monitor <monitor-chart> \
   --set secret.create=false \
   --set secret.existingSecret=llm-monitor-secret \
   --set mysql.auth.existingSecret=llm-monitor-mysql-secret
@@ -247,17 +251,17 @@ kubectl -n monitoring exec deploy/monitor -- python3 -c \
 
 ---
 
-## 9. 升级 / 回滚(chart 已在 ChartMuseum)
+## 9. 升级 / 回滚
 
-发新版流程:改代码 → 各仓打 git tag(CI 自动出镜像 + push chart 到 ChartMuseum)→ 集群 `helm upgrade`。
+发新版流程:改代码 → 各仓打 git tag(CI 发布镜像到 Docker Hub)→ chart 在 modelsphere/helm-charts 发布 → 集群 `helm upgrade`。
 
 ```bash
-helm repo update harbor-chart-repo
+helm repo update modelsphere
 # 不带 --version = 拉最新 tag;--reuse-values 保留安装时的 fullnameOverride / 密钥 / bodylog.host 等
-helm -n llm-route  upgrade autoconfig harbor-chart-repo/autoconfig         --reuse-values
-helm -n llm-route  upgrade openresty  harbor-chart-repo/openresty          --reuse-values
-helm -n llm-route  upgrade cart-qwen  harbor-chart-repo/cache_aware_router --reuse-values   # 每个 cart-<model> 各升一次
-helm -n monitoring upgrade monitor    harbor-chart-repo/monitor            --reuse-values
+helm -n llm-route  upgrade autoconfig modelsphere/autoconfig         --reuse-values
+helm -n llm-route  upgrade openresty  modelsphere/openresty          --reuse-values
+helm -n llm-route  upgrade cart-qwen  modelsphere/cart --reuse-values   # 每个 cart-<model> 各升一次
+helm -n monitoring upgrade monitor    <monitor-chart>            --reuse-values
 
 helm -n <ns> history <release>                          # 看修订
 helm -n <ns> rollback <release> <REV>                    # 回滚到某修订
@@ -265,7 +269,7 @@ helm -n <ns> upgrade <release> <chart> --version <x.y.z> --reuse-values   # 需�
 ```
 
 > chart 内容不变时,`helm upgrade` 只更新 release 元数据、**不重启 pod**(渲染出的 spec 一致),零中断。
-> chart 版本命名:多数仓 = git tag(0.1.x / 0.3.x);**cache_aware_router 例外** —— git tag 带前导 `v`(如 `v0.6.2-k8s`),chart version 去掉 `v`(`0.6.2-k8s`,SemVer2 不许带 v),`--version` 用去 v 的。
+> chart 版本不一定等于组件版本(如 `cart` chart 0.2.x 部署的是 CART 0.6.x);锁版本时用 `helm search repo modelsphere/<chart> --versions` 查 chart 版本。
 
 ---
 
