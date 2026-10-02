@@ -1,167 +1,199 @@
-# k8s 部署手册(autoconfig 路由栈 + 测试模型 + ModelRoute)
+# Kubernetes deployment guide (autoconfig routing stack + test model + ModelRoute)
 
-在一套干净的 k8s 集群上,把整套「ModelRoute 驱动的 LLM 路由栈」部署起来,并跑通一个测试模型(以 **qwen** 为例;opt 等其它模型同样方式接入)。
-组件镜像由各仓打 git tag 后发布到 Docker Hub(`4pdosc/*`),helm chart 发布在 [modelsphere/helm-charts](https://github.com/modelsphere/helm-charts);本文档只做 `helm install` + `kubectl apply`。
+English | [简体中文](DEPLOY.zh-CN.md)
 
-## 0. 架构与依赖顺序
+This guide deploys the whole "ModelRoute-driven LLM routing stack" on a clean Kubernetes cluster and brings up
+one test model end to end (**qwen** as the example; opt and other models are added the same way).
+Component images are published to Docker Hub (`4pdosc/*`) when each repository is tagged, and the Helm charts
+are published from [modelsphere/helm-charts](https://github.com/modelsphere/helm-charts); this guide only runs
+`helm install` and `kubectl apply`.
+
+## 0. Architecture and dependency order
 
 ```
-                    ┌── autoconfig(operator)──┐  watch ModelRoute + EndpointSlice
-   ModelRoute(CR) ─▶│  渲染 3 个 ConfigMap:     │  →  openresty-conf / cart-<m>-config / monitor-conf
+                    ┌── autoconfig (operator) ──┐  watches ModelRoute + EndpointSlice
+   ModelRoute (CR) ▶│  renders 3 ConfigMaps:    │  →  openresty-conf / cart-<m>-config / monitor-conf
                     └──────────┬────────────────┘
         ┌──────────────┬───────┴───────┬──────────────┐
-   openresty        cart-<model>      monitor        (各自挂对应 ConfigMap,reload sidecar 热更)
-   (对外入口 8080)   (cache 亲和路由)   (dashboard)
+   openresty        cart-<model>      monitor        (each mounts its ConfigMap; the reload sidecar hot-reloads)
+   (entry, 8080)    (cache-affinity   (dashboard)
+                     routing)
         │                │
-        └── 3 层 peer:cart(优先)→ backend pod-IP → backend-svc VIP 兜底 ──▶  模型后端(vllm/sglang)
+        └── 3 peer tiers: cart (preferred) → backend pod IPs → backend-svc VIP fallback ──▶ model backend (vllm/sglang)
 ```
 
-**部署顺序(有依赖,别颠倒)**:
-1. 前置:helm repo + namespace
-2. **autoconfig**(先装 —— 它带 ModelRoute CRD + controller;后面组件都消费它产出的 ConfigMap)
-3. 测试模型后端(qwen)
-4. **cart**(每模型一个;`waitForWorkers` 会 Init 等 autoconfig 写入 workers)
-5. **openresty**(对外入口)
-6. **monitor**(dashboard + MySQL)
-7. **ModelRoute CR**(qwen)→ autoconfig 据此填三个 ConfigMap → cart 就绪、openresty 出路由、monitor 出监控
-8. 验证
+**Deployment order (there are dependencies; do not reorder)**:
+1. Prerequisites: Helm repository + namespaces
+2. **autoconfig** (first — it brings the ModelRoute CRD and the controller; everything after consumes the
+   ConfigMaps it produces)
+3. Test model backend (qwen)
+4. **cart** (one per model; with `waitForWorkers` it waits in Init until autoconfig writes the workers)
+5. **openresty** (the entry point)
+6. **monitor** (dashboard + MySQL)
+7. **ModelRoute CR** (qwen) → autoconfig fills the three ConfigMaps → cart becomes ready, openresty gets the
+   route, monitor starts monitoring it
+8. Verify
 
-镜像默认来自 Docker Hub(`4pdosc/`);chart 来自 helm 仓 `https://modelsphere.github.io/helm-charts`。
-集群不能访问外网时,把镜像同步到自己的镜像仓库,再用各 chart 的 `image` 相关 values 覆盖。
+Images come from Docker Hub (`4pdosc/`) by default; charts come from the Helm repository
+`https://modelsphere.github.io/helm-charts`. If the cluster has no internet access, mirror the images into your
+own registry and override each chart's `image` values.
 
-monitor 目前没有公开的 chart 和镜像:第 6 步换成你自己的 monitor chart 来源,或者跳过它(见第 6 步)。
+monitor has no public chart or image yet: in step 6, substitute your own monitor chart, or skip it (see step 6).
 
 ---
 
-## 1. 前置
+## 1. Prerequisites
 
 ```bash
-# 1.1 加 helm 仓(公开,只读无需凭证)
+# 1.1 Add the Helm repository (public, read-only, no credentials)
 helm repo add modelsphere https://modelsphere.github.io/helm-charts
 helm repo update modelsphere
 
-# 1.2 确认能看到各 chart(不加 --version 默认取最新)
+# 1.2 Check that the charts are visible (without --version, the latest is used)
 helm search repo modelsphere/autoconfig
 helm search repo modelsphere/openresty
 helm search repo modelsphere/cart
 
-# 1.3 namespace(qwen ns 由后端 sample 自带 Namespace,无需先建)
+# 1.3 Namespaces (the qwen namespace comes with the backend sample; no need to create it)
 kubectl create ns llm-route   2>/dev/null || true
 kubectl create ns monitoring  2>/dev/null || true
 ```
 
-> **本文档所有 `helm install`/`upgrade` 都不带 `--version`** —— helm 默认拉仓里的最新版本,新版本一发布下次执行就自动用上,无需改本文档维护版本号。若需要锁定/回滚到某个历史版本,再显式加 `--version <x.y.z>`(可用版本:`helm search repo modelsphere/<chart> --versions`)。
+> **No `helm install`/`upgrade` in this guide passes `--version`** — Helm takes the latest version in the
+> repository, so a new release is picked up the next time you run the command without editing this guide. To
+> pin or roll back to an earlier version, add `--version <x.y.z>` (available versions:
+> `helm search repo modelsphere/<chart> --versions`).
 
 ---
 
-## 2. autoconfig(operator + CRD)
+## 2. autoconfig (operator + CRD)
 
-chart 自带 `crds/`(ModelRoute CRD)+ controller Deployment(2 副本 leader 选举)+ RBAC。
+The chart ships `crds/` (the ModelRoute CRD), the controller Deployment (2 replicas with leader election) and
+RBAC.
 
 ```bash
 helm -n llm-route install autoconfig modelsphere/autoconfig \
   --set fullnameOverride=autoconfig-controller
 
-# 校验:CRD 装上 + controller Running
+# Check: CRD installed + controller running
 kubectl get crd modelroutes.routing.modelsphere.dev
 kubectl -n llm-route rollout status deploy/autoconfig-controller
 ```
 
-### 2.1 健康探针与指标(0.3.32 起)
+### 2.1 Health probes and metrics (since 0.3.32)
 
-容器暴露两个端口,都**只给 k8s / Prometheus 用**,不承载业务:
+The container exposes two ports, **for Kubernetes and Prometheus only**; they carry no application traffic:
 
-| 端口 | 路径 | 用途 |
+| Port | Path | Purpose |
 |---|---|---|
-| 8081 | `/healthz` `/readyz` | liveness / readiness 探针 |
-| 8080 | `/metrics` | controller-runtime 自带指标(Prometheus 抓) |
+| 8081 | `/healthz` `/readyz` | liveness / readiness probes |
+| 8080 | `/metrics` | controller-runtime's built-in metrics (scraped by Prometheus) |
 
 ```bash
-# 校验探针
+# Check the probes
 kubectl -n llm-route get deploy autoconfig-controller \
   -o jsonpath='{.spec.template.spec.containers[0].livenessProbe.httpGet}{"\n"}'
 
-# 校验 ServiceMonitor 被 Prometheus 收编(注意 label release=kube-prometheus-stack)
+# Check that Prometheus picks up the ServiceMonitor (note the label release=kube-prometheus-stack)
 kubectl -n llm-route get servicemonitor autoconfig-controller -o jsonpath='{.metadata.labels}{"\n"}'
-# 抓到没:Prometheus 里应有 job=autoconfig-controller-metrics 的 target
+# Is it scraped? Prometheus should have a target with job=autoconfig-controller-metrics
 ```
 
-**⚠️ 两个副本是主备,但 Service 里两个都在**。k8s Service 只按 label 选 pod,**不认 leader**;
-autoconfig 也没有 hagate 侧车(它不接流量,不需要把 standby 摘出 endpoints)。
-所以 metrics Service 做成 **headless(`clusterIP: None`)**,让 Prometheus 按 pod 逐个抓、指标带 `pod` 标签分开。
-**直接 curl Service 会随机落到某个副本,可能是 standby,看到的队列恒空、reconcile 计数近 0,别误判成没干活。**
+**⚠️ The two replicas are master-standby, but both are in the Service.** A Kubernetes Service selects pods by
+label only and **knows nothing about the leader**; autoconfig has no hagate sidecar either (it takes no traffic,
+so there is no need to take the standby out of the endpoints). The metrics Service is therefore **headless
+(`clusterIP: None`)**, so Prometheus scrapes each pod and the metrics carry a `pod` label.
+**A plain curl to the Service lands on a random replica, possibly the standby, whose queue is always empty and
+whose reconcile count is near zero — do not mistake that for the controller doing nothing.**
 
-在 Prometheus 里认 leader 用 `leader_election_master_status`(leader=1 / standby=0,controller-runtime 自带):
+To identify the leader in Prometheus, use `leader_election_master_status` (leader=1 / standby=0, built into
+controller-runtime):
 
 ```promql
-# 只看 leader 的队列积压
+# The leader's queue backlog only
 workqueue_depth{job=~"autoconfig.*"} and on(pod) (leader_election_master_status == 1)
 ```
 
-**排查 reconcile 卡死(如 cart ConfigMap wedge)看这条**——健康探针发现不了,它只证明进程能应答 HTTP:
+**To diagnose a stuck reconcile (such as a wedged cart ConfigMap), look at this one** — the health probes cannot
+catch it; they only prove the process answers HTTP:
 
 ```promql
-# 当前这次 reconcile 已经跑了多久;持续上涨且不归零 = 卡住了
+# How long the current reconcile has been running; rising without returning to zero = stuck
 workqueue_unfinished_work_seconds{job=~"autoconfig.*"} and on(pod) (leader_election_master_status == 1)
 ```
 
-其余常用:`workqueue_depth`(排队的 ModelRoute 数,线上 4 个对象 + 10s resync,稳态 0~1)、
-`workqueue_retries_total`(调谐失败重试,DiscoverError / 底稿读空会陡增)、
-`controller_runtime_reconcile_errors_total`、`rest_client_requests_total`(出现 429 = 被 apiserver 限流)、
-`go_goroutines`(泄漏)。
+Other useful ones: `workqueue_depth` (ModelRoutes waiting in the queue; with a handful of objects and the 10s
+resync, 0–1 in steady state), `workqueue_retries_total` (reconcile retries; jumps on DiscoverError or an empty
+base config), `controller_runtime_reconcile_errors_total`, `rest_client_requests_total` (429s = throttled by the
+API server), `go_goroutines` (leaks).
 
-leader 是 k8s Lease,查当前持有者:
+The leader is a Kubernetes Lease; to see the current holder:
 
 ```bash
 kubectl -n llm-route get lease autoconfig-controller.routing.modelsphere.dev -o jsonpath='{.spec.holderIdentity}{"\n"}'
 ```
 
-关掉指标(如不想被抓):`--set metrics.enabled=false` 或 `--set metrics.serviceMonitor.enabled=false`。
+To turn metrics off (if you do not want them scraped): `--set metrics.enabled=false` or
+`--set metrics.serviceMonitor.enabled=false`.
 
 ---
 
-## 3. 测试模型后端(以 qwen 为例)
+## 3. Test model backend (qwen as the example)
 
-sample 在 `config/samples/`,自带 Namespace + Deployment + Service。
+The samples are in `config/samples/` and include the Namespace, Deployment and Service.
 
-- `qwen-backend.yaml`:sglang `Qwen3.5-4B`(ns `qwen`,`qwen-svc` NodePort:30055;**`--enable-metrics`** 否则 monitor 采不到 KV/running/waiting;`terminationGracePeriodSeconds:3600` 排空长请求)
+- `qwen-backend.yaml`: sglang `Qwen3.5-4B` (namespace `qwen`, `qwen-svc` NodePort 30055; **`--enable-metrics`**,
+  without which the monitor cannot collect KV/running/waiting; `terminationGracePeriodSeconds: 3600` to drain long
+  requests). The model is read from a `hostPath`; set `nodeName` (commented out in the sample) to the node that
+  holds it.
 
 ```bash
 kubectl apply -f config/samples/qwen-backend.yaml
 kubectl -n qwen rollout status deploy/qwen
-# sglang /metrics 需 --enable-metrics 才 200(默认 404):
+# sglang /metrics returns 200 only with --enable-metrics (404 by default):
 kubectl -n qwen exec deploy/qwen -- sh -c "curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/metrics"
 ```
 
-> **opt 同理**:`config/samples/opt-backend.yaml`(vLLM `opt-125m`,ns `opt`,`opt-svc` ClusterIP:8000;`--shutdown-timeout=3540` 优雅停机)+ `modelroute-opt.yaml`,后续步骤把 `qwen` 换成 `opt` 即可。
-> 生产模型(如 kimi 用 LeaderWorkerSet TP8/PP2)部署方式不同(见 modelsphere/helm-charts 的 `sglang` / `vllm` chart),但接入路由的方式一样:建 Service + 写 ModelRoute。
+> **opt works the same way**: `config/samples/opt-backend.yaml` (vLLM `opt-125m`, namespace `opt`, `opt-svc`
+> ClusterIP 8000; `--shutdown-timeout=3540` for a graceful shutdown) + `modelroute-opt.yaml`; in the following
+> steps, replace `qwen` with `opt`.
+> Production models (for example multi-node deployments with LeaderWorkerSet) are deployed differently (see the
+> `sglang` / `vllm` charts in modelsphere/helm-charts), but they join the routing the same way: create a Service
+> and write a ModelRoute.
 
 ---
 
-## 4. cart(cache_aware_router,每模型一个)
+## 4. cart (cache_aware_router, one per model)
 
-**cart 是「一个模型一个」**(radix 前缀缓存只对单模型有效)。`fullnameOverride` 决定 Service 名 + config ConfigMap 名(`<name>-config`),ModelRoute 的 `cart.service` / `cart.outputConfigMap` 要对上。
-`waitForWorkers=true`:cart pod 停在 Init 等 autoconfig 写 workers(第 7 步 apply ModelRoute 后就绪),不会 CrashLoop。
+**There is one cart per model** (the radix prefix cache only helps within one model). `fullnameOverride` decides
+the Service name and the config ConfigMap name (`<name>-config`); the ModelRoute's `cart.service` /
+`cart.outputConfigMap` must match them.
+With `waitForWorkers=true`, the cart pod waits in Init for autoconfig to write the workers (ready after the
+ModelRoute is applied in step 7) instead of crash-looping.
 
 ```bash
-# reload/hagate 侧车镜像版本已是 chart 的默认值(每次 autoconfig 发版会同步 bump 进各 chart),
-# 不用显式 --set 覆盖 —— 显式写死版本号反而会在 chart 默认值升级后仍锁在旧版,忘了改就悄悄漂移。
+# The reload/hagate sidecar images are already the chart's defaults (bumped in each chart when autoconfig
+# releases), so do not override them with --set — a pinned version stays pinned after the chart default moves,
+# and drifts silently if you forget to update it.
 helm -n llm-route install cart-qwen modelsphere/cart \
   --set fullnameOverride=cart-qwen
 
-# 此时 cart pod 会停在 Init(等 workers),属正常;第 7 步后转 Running
+# The cart pod now waits in Init (for workers); that is expected. It turns Running after step 7
 kubectl -n llm-route get pods | grep cart-
 ```
 
-> opt 同理:`--set fullnameOverride=cart-opt`(要与 `modelroute-opt.yaml` 的 `cart.service`/`cart.outputConfigMap` 对上)。
+> opt works the same way: `--set fullnameOverride=cart-opt` (must match `cart.service`/`cart.outputConfigMap`
+> in `modelroute-opt.yaml`).
 
 ---
 
-## 5. openresty(对外入口)
+## 5. openresty (the entry point)
 
-chart 挂载 autoconfig 产出的 `openresty-conf` ConfigMap(各 `session_route_<model>.conf`),reload sidecar 收 SIGHUP 热更路由。
-`image.tag` 用 chart 默认(= chart 的 `appVersion`,随最新 tag 走);`reload.image`/`ha.image` 同理用 chart 默认,不显式覆盖;
-`bodylog.host` 指向 bodylog-listener(k8s 里需 FQDN 或可解析地址)。
+The chart mounts the `openresty-conf` ConfigMap autoconfig produces (one `session_route_<model>.conf` per model),
+and the reload sidecar hot-reloads the routes on SIGHUP.
+`image.tag` uses the chart default (= the chart's `appVersion`, following the latest release); likewise leave
+`reload.image`/`ha.image` at the chart defaults. `bodylog.host` points at the bodylog listener (in Kubernetes it
+must be an FQDN or another resolvable address).
 
 ```bash
 helm -n llm-route install openresty modelsphere/openresty \
@@ -171,24 +203,29 @@ helm -n llm-route install openresty modelsphere/openresty \
 kubectl -n llm-route rollout status deploy/openresty
 ```
 
-> openresty Service 是 **ClusterIP:8080**(集群内访问);对外测试用 `kubectl -n llm-route port-forward svc/openresty 18080:8080`。
+> The openresty Service is **ClusterIP 8080** (in-cluster access); to test from outside, use
+> `kubectl -n llm-route port-forward svc/openresty 18080:8080`.
 
 ---
 
-## 6. monitor(dashboard + MySQL)
+## 6. monitor (dashboard + MySQL)
 
-chart 自带 MySQL(持久化 state + 时序);读 autoconfig 产出的 `monitor-conf`(service/nginx/router 行,60s 热加载)。
+The chart includes MySQL (persistent state + time series) and reads the `monitor-conf` autoconfig produces
+(service/nginx/router lines, hot-reloaded every 60s).
 
-> monitor 没有公开的 chart:下面的 `<monitor-chart>` 换成你自己的 chart 来源。不装 monitor 时跳过本步,并删掉第 7 步 ModelRoute 里的 `spec.monitor` 段(它是可选的)。
+> monitor has no public chart: replace `<monitor-chart>` below with your own chart source. Without a monitor,
+> skip this step and remove the `spec.monitor` block from the ModelRoute in step 7 (it is optional).
 
-**生产推荐:密钥走 `existingSecret`(带外建,不归 helm 管)** —— 这样 `helm upgrade` 无论带不带 `--set` 都碰不到密钥,避免「误用 `--set` 不带 `--reuse-values` → 密钥被刷成占位」的坑(app + mysql 两份密钥都能外置)。
+**Recommended for production: keep secrets in an `existingSecret` (created out of band, not managed by Helm)** —
+then `helm upgrade` never touches the secrets, with or without `--set`, which avoids the trap of "`--set` without
+`--reuse-values` → secrets reset to placeholders" (both the app and the MySQL secrets can be external).
 
 ```bash
-# ① 带外建两份 secret(模板见 monitor 仓 k8s/secret.example.yaml,改成真值)——注意 mysql 密码两处要一致
+# ① Create the two secrets out of band (template: k8s/secret.example.yaml in the monitor repository; fill in real values) — the MySQL password must match in both
 kubectl -n monitoring apply -f secret.example.yaml    # llm-monitor-secret + llm-monitor-mysql-secret
 
-# ② install:关掉 chart 自建密钥,引用带外的
-#    (nginxHost / bodylogSummaryURL 按你的集群用 --set 覆盖)
+# ② Install: disable the chart's own secret and reference the external ones
+#    (override nginxHost / bodylogSummaryURL with --set for your cluster)
 helm -n monitoring install monitor <monitor-chart> \
   --set secret.create=false \
   --set secret.existingSecret=llm-monitor-secret \
@@ -196,89 +233,105 @@ helm -n monitoring install monitor <monitor-chart> \
 kubectl -n monitoring rollout status deploy/monitor
 ```
 
-> **快速起(测试用,chart 自建密钥)**:不想带外建 secret 时,可用 values 文件把密钥/密码写进去(`secret.data.*` + `mysql.auth.*`,占位改真值,**别提交 repo**)、`create:true` 装。但这种模式下升级务必 `--reuse-values`,且带 `--set` 时尤其小心(见 §9)。
+> **Quick start (for testing, chart-managed secrets)**: if you do not want external secrets, put the keys and
+> passwords in a values file (`secret.data.*` + `mysql.auth.*`, replacing the placeholders; **never commit it**)
+> and install with `create: true`. In this mode always upgrade with `--reuse-values`, and take particular care when
+> passing `--set` (see §9).
 
-> dashboard 是 **NodePort:30080** → `http://<任一 node IP>:30080`(如 `http://192.0.2.20:30080`),Basic Auth `admin/<WEB_PASS>`;`/tpm` 子页独立 Auth `tpm/<TPM_PASS>`。
+> The dashboard is **NodePort 30080** → `http://<any node IP>:30080` (for example `http://192.0.2.20:30080`), Basic
+> Auth `admin/<WEB_PASS>`; the `/tpm` page has its own auth `tpm/<TPM_PASS>`.
 
 ---
 
-## 7. 安装 ModelRoute(触发全栈自动配置)
+## 7. Install the ModelRoute (triggers configuration of the whole stack)
 
-ModelRoute 是**中心配置**:autoconfig 据此同时写 openresty-conf / cart-<model>-config / monitor-conf。
-sample 在 `config/samples/`,`modelroute-qwen.yaml`:qwen 三层路由(cart-qwen → backend pod-IP → backend-svc VIP 兜底);discovery `qwen/qwen-svc`;monitor model `qwen`。
+The ModelRoute is the **central configuration**: from it, autoconfig writes openresty-conf /
+cart-<model>-config / monitor-conf at the same time.
+The sample is `config/samples/modelroute-qwen.yaml`: three-tier routing for qwen (cart-qwen → backend pod IPs →
+backend-svc VIP fallback); discovery `qwen/qwen-svc`; monitor model `qwen`.
 
 ```bash
 kubectl apply -f config/samples/modelroute-qwen.yaml
 
-# autoconfig 会在 ~秒级 reconcile;ConfigMap→pod 挂载传播有 ~1min kubelet 同步 lag
-kubectl -n llm-route get modelroute qwen        # READY 应为 true,BACKENDS≥1,CART=1
+# autoconfig reconciles within seconds; ConfigMap → pod mount propagation lags by ~1 min (kubelet sync)
+kubectl -n llm-route get modelroute qwen        # READY should be true, BACKENDS ≥ 1, CART = 1
 ```
 
-apply 后应观察到:cart-qwen pod 从 Init 转 **Running**(autoconfig 写入 workers);openresty 出现 `session_route_qwen.conf`;monitor dashboard 出现 qwen 的 service 行。
+After applying, you should see: the cart-qwen pod go from Init to **Running** (autoconfig wrote the workers);
+`session_route_qwen.conf` appear in openresty; and qwen's service line appear on the monitor dashboard.
 
-> **ModelRoute 放哪个 ns?** 本例放 `llm-route`(与 cart/openresty 同 ns,sample 里 `cart.service: cart-qwen`、`nginx.service: openresty` 用裸名即可)。controller 是全集群 watch(ClusterRole),ModelRoute 放 model ns(如 `qwen`)也行,但那些**裸引用会默认解析到 ModelRoute 自己的 ns** → 需显式加前缀 `llm-route/cart-qwen`、`llm-route/openresty`(各 `outputConfigMap` 本就带 ns,不用改)。
-> **opt 同理**:`kubectl apply -f config/samples/modelroute-opt.yaml`(discovery `opt/opt-svc`、cart-opt、monitor model `opt-125m`)。
+> **Which namespace for the ModelRoute?** This example uses `llm-route` (the same namespace as cart/openresty, so
+> the sample's `cart.service: cart-qwen` and `nginx.service: openresty` can be bare names). The controller watches
+> the whole cluster (ClusterRole), so the ModelRoute can also live in the model's namespace (such as `qwen`), but
+> then **bare references resolve to the ModelRoute's own namespace** → prefix them explicitly:
+> `llm-route/cart-qwen`, `llm-route/openresty` (each `outputConfigMap` already includes its namespace).
+> **opt works the same way**: `kubectl apply -f config/samples/modelroute-opt.yaml` (discovery `opt/opt-svc`,
+> cart-opt, monitor model `opt-125m`).
 
 ---
 
-## 8. 验证(端到端)
+## 8. Verify (end to end)
 
 ```bash
-# 8.1 ModelRoute 就绪
+# 8.1 ModelRoute ready
 kubectl -n llm-route get modelroute
 
-# 8.2 cart 就绪(3/3,含 cart + reload + hagate 侧车)
+# 8.2 cart ready (3/3: cart + reload + hagate sidecars)
 kubectl -n llm-route get pods | grep -E 'cart-|openresty'
 
-# 8.3 端到端经 openresty → cart → 后端(在 openresty pod 内打本地 8080)
-AUTH_KEY='<openresty 入口鉴权 key>'   # 真实 key 不入库
+# 8.3 End to end through openresty → cart → backend (call local port 8080 inside the openresty pod)
+AUTH_KEY='<openresty entry auth key>'   # never commit the real key
 ORP=$(kubectl -n llm-route get pod -l app.kubernetes.io/name=openresty -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 [ -z "$ORP" ] && ORP=$(kubectl -n llm-route get pods -o name | grep openresty | head -1 | cut -d/ -f2)
 kubectl -n llm-route exec $ORP -c openresty -- sh -c \
   "curl -s -o /dev/null -w 'qwen /v1/models=%{http_code}\n' http://127.0.0.1:8080/qwen/v1/models -H 'Authorization: Bearer $AUTH_KEY'"
-# chat 流(应 200,并回 X-Routed-Peer 头):
+# A chat stream (should be 200, with an X-Routed-Peer header):
 kubectl -n llm-route exec $ORP -c openresty -- sh -c \
   "curl -s -D - -o /dev/null http://127.0.0.1:8080/qwen/v1/chat/completions -H 'Content-Type: application/json' \
    -H 'Authorization: Bearer $AUTH_KEY' \
    -d '{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}' | grep -iE 'HTTP/|x-routed-peer'"
 
-# 8.4 monitor 采到该模型(dashboard 或 /api/status)
+# 8.4 The monitor collects the model (dashboard or /api/status)
 kubectl -n monitoring exec deploy/monitor -- python3 -c \
  'import urllib.request,base64,json;r=urllib.request.Request("http://127.0.0.1:8080/api/status");r.add_header("Authorization","Basic "+base64.b64encode(b"admin:<WEB_PASS>").decode());print("api/status",json.load(urllib.request.urlopen(r)) and "OK")'
 ```
 
-`X-Routed-Peer` 头出现 = 请求确实经 cart 路由到了真实后端(cart 的 `proxy.add_routed_peer_header=true`)。
+An `X-Routed-Peer` header means the request really was routed by cart to a real backend (cart's
+`proxy.add_routed_peer_header=true`).
 
 ---
 
-## 9. 升级 / 回滚
+## 9. Upgrade / roll back
 
-发新版流程:改代码 → 各仓打 git tag(CI 发布镜像到 Docker Hub)→ chart 在 modelsphere/helm-charts 发布 → 集群 `helm upgrade`。
+Releasing a new version: change the code → tag each repository (CI publishes the images to Docker Hub) → the
+charts are released in modelsphere/helm-charts → `helm upgrade` in the cluster.
 
 ```bash
 helm repo update modelsphere
-# 不带 --version = 拉最新 tag;--reuse-values 保留安装时的 fullnameOverride / 密钥 / bodylog.host 等
-helm -n llm-route  upgrade autoconfig modelsphere/autoconfig         --reuse-values
-helm -n llm-route  upgrade openresty  modelsphere/openresty          --reuse-values
-helm -n llm-route  upgrade cart-qwen  modelsphere/cart --reuse-values   # 每个 cart-<model> 各升一次
-helm -n monitoring upgrade monitor    <monitor-chart>            --reuse-values
+# Without --version = the latest release; --reuse-values keeps fullnameOverride / secrets / bodylog.host etc. from install time
+helm -n llm-route  upgrade autoconfig modelsphere/autoconfig --reuse-values
+helm -n llm-route  upgrade openresty  modelsphere/openresty  --reuse-values
+helm -n llm-route  upgrade cart-qwen  modelsphere/cart       --reuse-values   # once for each cart-<model>
+helm -n monitoring upgrade monitor    <monitor-chart>        --reuse-values
 
-helm -n <ns> history <release>                          # 看修订
-helm -n <ns> rollback <release> <REV>                    # 回滚到某修订
-helm -n <ns> upgrade <release> <chart> --version <x.y.z> --reuse-values   # 需要锁定/回退到某个历史版本才加 --version
+helm -n <ns> history <release>                          # list revisions
+helm -n <ns> rollback <release> <REV>                    # roll back to a revision
+helm -n <ns> upgrade <release> <chart> --version <x.y.z> --reuse-values   # add --version only to pin or go back to an earlier version
 ```
 
-> chart 内容不变时,`helm upgrade` 只更新 release 元数据、**不重启 pod**(渲染出的 spec 一致),零中断。
-> chart 版本不一定等于组件版本(如 `cart` chart 0.2.x 部署的是 CART 0.6.x);锁版本时用 `helm search repo modelsphere/<chart> --versions` 查 chart 版本。
+> When the chart content is unchanged, `helm upgrade` only updates the release metadata and **does not restart
+> pods** (the rendered spec is identical): no interruption.
+> A chart version is not necessarily the component version (for example the `cart` chart 0.2.x deploys CART
+> 0.6.x); to pin a version, look up the chart versions with `helm search repo modelsphere/<chart> --versions`.
 
 ---
 
-## 10. 卸载 / 清理
+## 10. Uninstall / clean up
 
 ```bash
 kubectl delete -f config/samples/modelroute-qwen.yaml
-helm -n llm-route  uninstall openresty cart-qwen autoconfig      # opt 同理:再 uninstall cart-opt
+helm -n llm-route  uninstall openresty cart-qwen autoconfig      # opt: also uninstall cart-opt
 helm -n monitoring uninstall monitor
-kubectl delete -f config/samples/qwen-backend.yaml               # 连带删 qwen ns(opt 同理删 opt-backend.yaml)
-kubectl delete crd modelroutes.routing.modelsphere.dev            # 如需彻底移除 CRD
+kubectl delete -f config/samples/qwen-backend.yaml               # also deletes the qwen namespace (opt: opt-backend.yaml)
+kubectl delete crd modelroutes.routing.modelsphere.dev            # to remove the CRD completely
 ```
