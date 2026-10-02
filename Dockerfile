@@ -21,7 +21,10 @@ ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ${GO_BASE} AS build
 ARG GOPROXY
-ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# Set by BuildKit for each platform being built; the defaults apply to the legacy builder.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
