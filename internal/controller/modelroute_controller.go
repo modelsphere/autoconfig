@@ -515,7 +515,7 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 //
 // ⚠️⚠️ **为什么只报不删。** 曾经这里是直接删的,判据是"没有别的 ModelRoute 声明这个 key"。
 // 那个判据不成立:openresty 的 route key 是**面向流量**的,它还有没有人用,取决于
-// phanrouter / 调用方还在不在打 /<旧 route 名>,与 k8s 里有没有对象声明它**毫无关系**。
+// 上游代理 / 调用方还在不在打 /<旧 route 名>,与 k8s 里有没有对象声明它**毫无关系**。
 // 把"没有对象声明"当成"没人在用",就是在无人看管的情况下删掉一条可能仍在承接流量的路由:
 //
 //	泄漏旧 key → 该路由继续服务,但 peers 陈旧(可能 502)
