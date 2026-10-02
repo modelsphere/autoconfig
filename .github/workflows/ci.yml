@@ -1,0 +1,79 @@
+name: ci
+
+# Tests and repository checks on every pull request and push to main.
+# Building and publishing the images is release.yml.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-formatted:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      # Regenerates the CRD, RBAC and deepcopy code, then vets and tests.
+      - run: make test
+      - name: Generated files are committed
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::make manifests generate changed files; run them and commit the result."
+            exit 1
+          fi
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # helm comes preinstalled on the GitHub-hosted Ubuntu runners.
+      - run: helm lint --strict deploy/helm/autoconfig
+      - run: helm template autoconfig deploy/helm/autoconfig > /dev/null
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t autoconfig:ci .
+
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: LICENSE is the Apache-2.0 text, unmodified
+        run: |
+          if ! grep -q "Apache License" LICENSE || ! grep -q "Version 2.0, January 2004" LICENSE; then
+            echo "::error file=LICENSE::LICENSE is not the Apache-2.0 text."
+            exit 1
+          fi
+      - name: No credentials committed
+        run: |
+          if git ls-files | grep -InE '(^|/)\.env$|\.kubeconfig$|\.pem$|(^|/)(id_rsa|id_ed25519)$'; then
+            echo "::error::a credential file is tracked"
+            exit 1
+          fi
