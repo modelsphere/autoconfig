@@ -1,0 +1,23 @@
+autoconfig
+Copyright (c) 2026 the ModelSphere authors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes software developed by third parties. Their licenses apply
+to their own code, not to this project's.
+
+Go modules compiled into the images (direct dependencies, from go.mod)
+  Kubernetes api, apimachinery,
+  client-go ......................... Apache-2.0
+  controller-runtime ................ Apache-2.0
+  fsnotify .......................... BSD-3-Clause
+  gopkg.in/yaml.v3 .................. MIT / Apache-2.0
+  Their own dependencies, listed in go.sum, are under their own licenses.
+
+Container base images
+  Runtime: python:3.12-alpine (Docker Hub) — see the image's own licenses.
+  Build stage only, not shipped: golang:1.23.3-alpine3.20.
+
+The components autoconfig configures (openresty, the cache-aware router, the
+monitor) are separate projects under their own licenses; nothing here
+redistributes their code.
