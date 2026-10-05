@@ -5,7 +5,7 @@
 # 前提:kimi ns 有 openresty-conf ConfigMap(autoconfig 已写)。用法:bash single_replica_recovery.sh
 set -uo pipefail
 NS=${NS:-kimi}
-OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
+OR_IMG=${OR_IMG:-4pdosc/llm-openresty:0.1.20}
 avail(){ local a=$(kubectl -n "$NS" get deploy ortest -o jsonpath='{.status.availableReplicas}' 2>/dev/null); echo "${a:-0}"; }
 
 echo "=== 起隔离单副本 ortest(openresty 镜像 + 同款 readinessProbe,挂共享路由 conf)==="

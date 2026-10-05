@@ -2,21 +2,22 @@
 # 真组件端到端(经 Helm chart):autoconfig controller 驱动 **真 openresty + 真 CART + 真 monitor**,
 # 三个消费方(openresty/cache_aware_router/monitor)各自 chart 部署(位置见下)(chart 建 ConfigMap 初值,autoconfig 更新)。
 # 验证:CART 读 workers + /workers 端点、openresty reload 生效 peers、monitor 消费 service+nginx+router 行、scale 跟随。
-# 在能 kubectl+helm 的机器上跑(如 k8s-cpu-20)。依赖同目录:charts/{autoconfig,openresty,cache_aware_router,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
+# Run it where kubectl and helm reach the cluster. Needs charts/{autoconfig,openresty,cache_aware_router,monitor}
+# next to it (the autoconfig chart carries the CRD, RBAC and controller).
 #   openresty / monitor / cache_aware_router chart 各在其仓(llm-openresty / llm-monitor / cache_aware_router)的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor,cache_aware_router}。
-#   IMG_TAG=0.3.22 bash real_helm_e2e.sh [--keep]
+#   IMG_TAG=0.4.0 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-helm}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.22}
+TAG=${IMG_TAG:-0.4.0}
 CHARTS=${CHARTS:-$HERE/charts}
-AC=harbor.4pd.io/hardcore-tech/autoconfig
-ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
-OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
-CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
-MON_IMG=${MON_IMG:-harbor.4pd.io/hardcore-tech/llm-monitor:0.1.0}
-MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
+AC=4pdosc/autoconfig
+ACR=4pdosc/autoconfig-reload:$TAG
+OR_IMG=${OR_IMG:-4pdosc/llm-openresty:0.1.20}
+CART_IMG=${CART_IMG:-4pdosc/cache_aware_router:0.6.5}
+MON_IMG=${MON_IMG:?set MON_IMG to an llm-monitor image}
+MOCK=${MOCK:-python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
 say(){ echo -e "\n=== $* ==="; }

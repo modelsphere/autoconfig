@@ -1,15 +1,14 @@
 # autoconfig —— kubebuilder/operator-sdk 风格 Makefile。
 # 工具用 `go run ...@version`(无需装二进制;仅开发时联网拉,不进 CI/镜像)。生成物提交进 repo,CI 只编译。
 
-IMG        ?= harbor.4pd.io/hardcore-tech/autoconfig:latest
-RELOAD_IMG ?= harbor.4pd.io/hardcore-tech/autoconfig-reload:latest
+IMG        ?= 4pdosc/autoconfig:latest
+RELOAD_IMG ?= 4pdosc/autoconfig-reload:latest
 
-# Dockerfile 里 GO_BASE / RUNTIME_BASE / GOPROXY 三个 ARG 的默认值是【公网】
-# (Docker Hub + proxy.golang.org),保证外部用户开箱可 build。内网构建覆盖成 harbor
-# 缓存与国内 goproxy —— 下面是内网默认值,走公网时 `make docker-build BUILD_ARGS=`。
-BUILD_ARGS ?= --build-arg GO_BASE=harbor.4pd.io/library/golang:1.23.3-alpine3.20 \
-              --build-arg RUNTIME_BASE=harbor.4pd.io/hardcore-tech/python:3.12-alpine \
-              --build-arg GOPROXY=https://mirrors.tencent.com/go/,direct
+# The Dockerfiles' GO_BASE / RUNTIME_BASE / GOPROXY args default to public sources
+# (Docker Hub, proxy.golang.org). Behind a registry mirror or a Go proxy, override them:
+#   make docker-build BUILD_ARGS="--build-arg GO_BASE=<mirror>/golang:1.23.3-alpine3.20 \
+#     --build-arg RUNTIME_BASE=<mirror>/python:3.12-alpine --build-arg GOPROXY=<goproxy>,direct"
+BUILD_ARGS ?=
 
 CONTROLLER_GEN_VERSION ?= v0.16.4
 KUSTOMIZE_VERSION      ?= v5.4.3
