@@ -1,8 +1,8 @@
-# autoconfig-reload 镜像 —— reload sidecar 独立小程序(cmd/reload)。
-# 与 controller 分离:openresty / CART pod 里挂它当 sidecar,watch ConfigMap 文件变 → SIGHUP 主进程。
-# 多阶段:goproxy 国内镜像拉依赖(无 vendor),同 Dockerfile。GOPROXY 是 ARG,可 --build-arg 换。
-#   docker build -f Dockerfile.reload -t harbor.4pd.io/hardcore-tech/autoconfig-reload:<tag> .
-# 基础镜像与 goproxy 默认走公网;内网构建用 --build-arg 覆盖(见 .gitlab-ci.yml)。
+# autoconfig-reload image: the reload sidecar (cmd/reload), kept apart from the
+# controller. It runs in openresty / CART pods, watches the ConfigMap files and sends
+# SIGHUP to the main process when they change. Multi-stage, dependencies from GOPROXY.
+#   docker build -f Dockerfile.reload -t autoconfig-reload:dev .
+# The base images and GOPROXY default to public sources; override them with --build-arg.
 ARG GO_BASE=golang:1.23.3-alpine3.20
 ARG RUNTIME_BASE=python:3.12-alpine
 ARG GOPROXY=https://proxy.golang.org,direct
