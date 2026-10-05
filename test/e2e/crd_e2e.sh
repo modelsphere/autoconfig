@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# autoconfig CRD controller 端到端(在能 kubectl 的机器上跑,如 k8s-cpu-20)。
+# End-to-end test of the autoconfig CRD controller; run it where kubectl reaches the cluster.
 # 装 CRD + controller → mock 后端(Service→EndpointSlice)+ mock CART → ModelRoute
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖:autoconfig helm chart(默认 $HERE/charts/autoconfig,含 CRD+RBAC+controller)。
-# 用法:NS=ac-e2e IMG=harbor.4pd.io/hardcore-tech/autoconfig:0.3.22 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=4pdosc/autoconfig:0.4.0 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
-IMG=${IMG:-harbor.4pd.io/hardcore-tech/autoconfig:0.3.22}
-MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
+IMG=${IMG:-4pdosc/autoconfig:0.4.0}
+MOCK=${MOCK:-python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
 say(){ echo -e "\n=== $* ==="; }

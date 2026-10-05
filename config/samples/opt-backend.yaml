@@ -19,7 +19,7 @@ spec:
   template:
     metadata: { labels: { app: opt } }
     spec:
-      nodeName: ucloud-wlcb-gpu-005
+      # nodeName: <gpu-node>                      # optional: pin to one GPU node
       terminationGracePeriodSeconds: 3600          # 硬切刀:到点才 SIGKILL,覆盖排空 + 传播窗口
       containers:
         - name: vllm

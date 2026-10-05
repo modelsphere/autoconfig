@@ -514,8 +514,9 @@ func (r *ModelRouteReconciler) modelRoutesForSLO(ctx context.Context, obj client
 // 且没有任何东西再更新它(2026-09-02 线上 modelforge-0.2 → modelforge-0.2-kimi 改名后实际留下了一个)。
 //
 // ⚠️⚠️ **为什么只报不删。** 曾经这里是直接删的,判据是"没有别的 ModelRoute 声明这个 key"。
-// 那个判据不成立:openresty 的 route key 是**面向流量**的,它还有没有人用,取决于
-// phanrouter / 调用方还在不在打 /<旧 route 名>,与 k8s 里有没有对象声明它**毫无关系**。
+// That test does not hold: an openresty route key faces traffic. Whether it is still in
+// use depends on whether an outer gateway or a caller still hits /<old route name>, which
+// has nothing to do with whether any k8s object declares it.
 // 把"没有对象声明"当成"没人在用",就是在无人看管的情况下删掉一条可能仍在承接流量的路由:
 //
 //	泄漏旧 key → 该路由继续服务,但 peers 陈旧(可能 502)

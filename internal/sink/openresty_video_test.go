@@ -310,9 +310,10 @@ func TestRenderRoute_VideoUploadLimits(t *testing.T) {
 	}
 }
 
-// upload_limit_key 决定两个 zone 按什么分组。默认 $binary_remote_addr 是**直连对端**的 IP;
-// 经外层网关(如 phanrouter)进来时所有请求同一个 IP,"每 IP 限制"就塌成"全局限制",
-// 那种部署必须能换成 $http_x_forwarded_for —— 这个用例守住这个可配性。
+// upload_limit_key decides how the two zones group requests. The default
+// $binary_remote_addr is the direct peer's IP; behind an outer gateway every request
+// comes from the same IP and the per-IP limit collapses into a global one, so such a
+// deployment must be able to switch to $http_x_forwarded_for. This case guards that.
 func TestRenderRoute_VideoUploadLimitKey(t *testing.T) {
 	def, _ := RenderRoute(videoData([]config.Peer{{IP: "10.0.0.1", Port: 8080}},
 		map[string]string{"upload_conn_limit": "4", "upload_req_limit": "10r/s"}))

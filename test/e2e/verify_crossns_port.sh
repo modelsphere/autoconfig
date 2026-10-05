@@ -2,12 +2,12 @@
 # 验证两个新特性(0.3.8 端口自动推导 + 0.3.22 service ns/name 跨 ns 发现):
 # 在【别的 ns(xns)】建 ModelRoute,discovery.service=kimi/kimi-k26-leader(跨 ns)、【不写 port】,
 # 验证仍发现 kimi leader、端口自动 = 8050。前提:kimi LWS 在跑、autoconfig controller 已升到目标 tag。
-# 依赖:autoconfig helm chart($HERE/charts/autoconfig)。用法:IMG_TAG=0.3.22 bash verify_crossns_port.sh
+# 依赖:autoconfig helm chart($HERE/charts/autoconfig)。用法:IMG_TAG=0.4.0 bash verify_crossns_port.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TAG=${IMG_TAG:-0.3.22}
+TAG=${IMG_TAG:-0.4.0}
 CTRL_NS=${CTRL_NS:-autoconfig}
-AC=harbor.4pd.io/hardcore-tech/autoconfig
+AC=4pdosc/autoconfig
 AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
 NS=xns
 FAIL=0; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }

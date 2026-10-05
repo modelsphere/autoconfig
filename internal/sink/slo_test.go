@@ -149,8 +149,9 @@ func TestWithSLOMetrics_NoMutate(t *testing.T) {
 
 // Extra 与 Raw 出现同名键时,**Raw 必须在后** —— lua 表构造式里后写的赢。
 //
-// 这条不是形式主义:2026-09-01 在 k8s-cpu-16 上实测过,用户在 nginx.values 里手写
-// ttft_metrics 时,conf 里会真的出现两行同名键(Extra 那份被 luaVal 加了引号变成字符串)。
+// Not a formality: verified on a test cluster on 2026-09-01. When a user hand-writes
+// ttft_metrics in nginx.values, the conf really gets two keys of the same name (the Extra
+// one quoted into a string by luaVal).
 // 顺序对 → CRD 的 table 生效;顺序反了 → 引擎收到字符串 → validate_metrics 整份丢弃 →
 // **静默降级成静态阈值**,而 /_ttft_status 的 source 看不出任何异常。
 //

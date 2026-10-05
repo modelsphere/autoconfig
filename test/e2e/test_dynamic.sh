@@ -3,9 +3,9 @@
 # 后端用可扩缩 mock(autoconfig 发现行为不需真推理);真推理/GPU 数据在 resilience/opt 用真 opt-125m。
 set -uo pipefail
 NS=${NS:-llm-route}; CTRL_NS=autoconfig; CHARTS=~/prod-e2e/charts
-H=harbor.4pd.io/hardcore-tech; TAG=clusterip-test
+H=4pdosc; TAG=${IMG_TAG:-0.4.0}
 AC=$H/autoconfig; ACR=$H/autoconfig-reload:$TAG; AH=$H/autoconfig-hagate:$TAG
-OR_IMG=$H/llm-openresty:e2e0; CART_IMG=$H/cache_aware_router:v0.6.0; MON_IMG=$H/llm-monitor:k8s; MOCK=$H/python:3.12-alpine
+OR_IMG=$H/llm-openresty:0.1.20; CART_IMG=$H/cache_aware_router:0.6.5; MON_IMG=${MON_IMG:?set MON_IMG to an llm-monitor image}; MOCK=python:3.12-alpine
 KEEP=${KEEP:-0}; FAIL=0
 say(){ echo -e "\n=== $* ==="; }; ok(){ echo "  PASS: $*"; }; bad(){ echo "  FAIL: $*"; FAIL=1; }
 waiteq(){ local w="$1" d="$2"; shift 2; local i g; for i in $(seq 1 60); do g="$("$@" 2>/dev/null)"; [ "$g" = "$w" ] && { ok "$d = $w"; return 0; }; sleep 3; done; bad "$d: got '$g' want '$w'"; return 1; }

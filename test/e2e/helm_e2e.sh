@@ -7,8 +7,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CHART=${CHART:-$HERE/autoconfig}
 NS=${NS:-autoconfig}
 TNS=${TNS:-ac-helm-e2e}
-IMG_TAG=${IMG_TAG:-0.3.22}
-MOCK=${MOCK:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
+IMG_TAG=${IMG_TAG:-0.4.0}
+MOCK=${MOCK:-python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
 say(){ echo -e "\n=== $* ==="; }

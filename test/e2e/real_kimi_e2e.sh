@@ -5,23 +5,23 @@
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:charts/{autoconfig,openresty,cache_aware_router,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
 #   openresty / monitor / cache_aware_router chart 各在其仓(llm-openresty / llm-monitor / cache_aware_router)的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor,cache_aware_router}。
-#   IMG_TAG=0.3.22 bash real_kimi_e2e.sh [--keep]
+#   IMG_TAG=0.4.0 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-kimi}                      # 与 kimi LWS 同 ns(discovery 同 ns)
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.3.22}
+TAG=${IMG_TAG:-0.4.0}
 CHARTS=${CHARTS:-$HERE/charts}
 KIMI_SVC=${KIMI_SVC:-kimi-k26-leader}
 MODEL=${MODEL:-kimi-k2.6}
 LISTEN=${LISTEN:-18080}
 AUTH_KEY=${AUTH_KEY:?需设置:openresty 入口鉴权 key(Bearer)}   # kimi 后端无鉴权
-AC=harbor.4pd.io/hardcore-tech/autoconfig
-ACR=harbor.4pd.io/hardcore-tech/autoconfig-reload:$TAG
-OR_IMG=${OR_IMG:-harbor.4pd.io/hardcore-tech/llm-openresty:0.2.0-routes}
-CART_IMG=${CART_IMG:-harbor.4pd.io/hardcore-tech/cache_aware_router:v0.6.0}
-MON_IMG=${MON_IMG:-harbor.4pd.io/hardcore-tech/llm-monitor:0.1.0}
-ALP=${ALP:-harbor.4pd.io/hardcore-tech/python:3.12-alpine}
+AC=4pdosc/autoconfig
+ACR=4pdosc/autoconfig-reload:$TAG
+OR_IMG=${OR_IMG:-4pdosc/llm-openresty:0.1.20}
+CART_IMG=${CART_IMG:-4pdosc/cache_aware_router:0.6.5}
+MON_IMG=${MON_IMG:?set MON_IMG to an llm-monitor image}
+ALP=${ALP:-python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
 say(){ echo -e "\n=== $* ==="; }
