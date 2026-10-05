@@ -1,11 +1,9 @@
 # Public release: a version tag builds the images and pushes them to Docker Hub.
 #
-# The internal image is built separately by .gitlab-ci.yml and goes to harbor.
-# Both build the same Dockerfiles; only the base-image build args and the
-# destination registry differ. Every base here already defaults to a public
-# image, so this side passes no overrides.
+# Every base image defaults to a public image, so no build-arg overrides are
+# passed here.
 #
-# One tag produces three images, the way the internal pipeline does.
+# One tag produces three images.
 #
 # Credentials come from the organisation secrets DOCKERHUB_USERNAME and
 # DOCKERHUB_TOKEN.
