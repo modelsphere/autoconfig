@@ -4,6 +4,7 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -226,16 +227,46 @@ type RouteData struct {
 	Peers []config.Peer
 }
 
+// llmRouteData feeds route.tmpl: the route data plus the knobs that are nginx directives rather than lua
+// route options. They are taken out of Extra so the lua table does not carry them too.
+type llmRouteData struct {
+	RouteData
+	// MaxBodySize: this route's client_max_body_size, from nginx.values.max_body_size. Empty = inherit
+	// the engine's http-level default (10m). The openresty image must not set the directive in
+	// router_locations.inc any more, or nginx -t fails on the duplicate.
+	MaxBodySize string
+}
+
+// nginxSizeRe: an nginx size (client_max_body_size and friends) -- digits, optional k/m/g. The CRD
+// refuses anything else at apply time; checked again here so a malformed value can never reach nginx
+// -t, where it would stop the reload for every route on that openresty.
+var nginxSizeRe = regexp.MustCompile(`^[0-9]+[kKmMgG]?$`)
+
 func RenderRoute(d RouteData) (string, error) {
 	if d.ModelType == ModelTypeVideo {
 		return renderVideoRoute(d)
+	}
+	data := llmRouteData{RouteData: d}
+	if v, ok := d.Extra["max_body_size"]; ok {
+		v = strings.TrimSpace(v)
+		if !nginxSizeRe.MatchString(v) {
+			return "", fmt.Errorf("max_body_size %q is not an nginx size (digits with an optional k/m/g suffix, e.g. 10m)", d.Extra["max_body_size"])
+		}
+		data.MaxBodySize = v
+		extra := make(map[string]string, len(d.Extra))
+		for k, val := range d.Extra {
+			if k != "max_body_size" {
+				extra[k] = val
+			}
+		}
+		data.Extra = extra
 	}
 	tmpl, err := template.New("route").Funcs(template.FuncMap{"luaVal": luaVal}).Parse(defaultRouteTmpl)
 	if err != nil {
 		return "", fmt.Errorf("parse template: %w", err)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, d); err != nil {
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil

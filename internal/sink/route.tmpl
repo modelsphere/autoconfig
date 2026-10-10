@@ -43,5 +43,10 @@ server {
         return ""
     }
 
+{{- if .MaxBodySize}}
+    # max_body_size (ModelRoute nginx.values): this route's request body limit. Default 10m comes from the
+    # engine's http level; the dispatch server's 100m is the ceiling. Behind CART, CART's own limit applies too.
+    client_max_body_size {{.MaxBodySize}};
+{{- end}}
     include conf.d/router_locations.inc;
 }
