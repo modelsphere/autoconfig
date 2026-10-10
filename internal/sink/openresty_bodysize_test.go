@@ -47,7 +47,8 @@ func TestRenderRoute_LLMMaxBodySize(t *testing.T) {
 // A value nginx would not accept is an error, not a rendered conf: nginx -t failing stops the reload
 // for every route on that openresty.
 func TestRenderRoute_LLMMaxBodySizeRejectsMalformed(t *testing.T) {
-	for _, bad := range []string{"50 MB", "50mb", "1.5m", "", "-1m", "50m;"} {
+	// 0 means "no limit" to nginx; 20 digits overflow its size parser and fail nginx -t.
+	for _, bad := range []string{"50 MB", "50mb", "1.5m", "", "-1m", "50m;", "0", "0m", "010m", "99999999999999999999g"} {
 		if _, err := RenderRoute(llmData(map[string]string{"max_body_size": bad})); err == nil {
 			t.Errorf("max_body_size %q: want an error", bad)
 		}

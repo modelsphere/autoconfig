@@ -237,10 +237,12 @@ type llmRouteData struct {
 	MaxBodySize string
 }
 
-// nginxSizeRe: an nginx size (client_max_body_size and friends) -- digits, optional k/m/g. The CRD
-// refuses anything else at apply time; checked again here so a malformed value can never reach nginx
-// -t, where it would stop the reload for every route on that openresty.
-var nginxSizeRe = regexp.MustCompile(`^[0-9]+[kKmMgG]?$`)
+// nginxSizeRe: an nginx size (client_max_body_size and friends) -- 1 to 7 digits without a leading zero,
+// optional k/m/g. Bounded because nginx's size parser rejects an overflowing value (nginx -t fails), and
+// no 0 because client_max_body_size 0 means "no limit". The CRD refuses anything else at apply time;
+// checked again here so a bad value can never reach nginx -t, where it would stop the reload for every
+// route on that openresty.
+var nginxSizeRe = regexp.MustCompile(`^[1-9][0-9]{0,6}[kKmMgG]?$`)
 
 func RenderRoute(d RouteData) (string, error) {
 	if d.ModelType == ModelTypeVideo {
@@ -250,7 +252,7 @@ func RenderRoute(d RouteData) (string, error) {
 	if v, ok := d.Extra["max_body_size"]; ok {
 		v = strings.TrimSpace(v)
 		if !nginxSizeRe.MatchString(v) {
-			return "", fmt.Errorf("max_body_size %q is not an nginx size (digits with an optional k/m/g suffix, e.g. 10m)", d.Extra["max_body_size"])
+			return "", fmt.Errorf("max_body_size %q is not an nginx size (1-7 digits, no leading zero, optional k/m/g suffix, e.g. 10m)", d.Extra["max_body_size"])
 		}
 		data.MaxBodySize = v
 		extra := make(map[string]string, len(d.Extra))

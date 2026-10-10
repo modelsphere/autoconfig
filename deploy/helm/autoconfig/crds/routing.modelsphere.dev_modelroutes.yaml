@@ -306,10 +306,11 @@ spec:
                 works on both)'
               rule: (has(self.modelType) && self.modelType == 'video') || !has(self.nginx.values)
                 || self.nginx.values.all(k, !(k in ['proxy_timeout','connect_timeout','rate_limit','upload_conn_limit','upload_req_limit','upload_req_burst','upload_limit_key','download_conn_limit','auth','auth_public_paths']))
-            - message: 'nginx.values.max_body_size must be an nginx size: digits with
-                an optional k/m/g suffix, e.g. 10m or 64m'
+            - message: 'nginx.values.max_body_size must be an nginx size: 1 to 7 digits,
+                no leading zero, optional k/m/g suffix, e.g. 10m or 64m (0 would mean
+                unlimited; more digits can overflow nginx''s parser)'
               rule: '!has(self.nginx.values) || !(''max_body_size'' in self.nginx.values)
-                || self.nginx.values[''max_body_size''].matches(''^[0-9]+[kKmMgG]?$'')'
+                || self.nginx.values[''max_body_size''].matches(''^[1-9][0-9]{0,6}[kKmMgG]?$'')'
             - message: nginx.peers 用了 cart,但没配 spec.cart
               rule: '!self.nginx.peers.exists(s, s.use == ''cart'') || has(self.cart)'
             - message: cart 用了 maxConcurrencyFromBackend,必须给 backend 组配 maxConcurrency(>
