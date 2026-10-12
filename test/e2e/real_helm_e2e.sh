@@ -5,12 +5,12 @@
 # Run it where kubectl and helm reach the cluster. Needs charts/{autoconfig,openresty,cache_aware_router,monitor}
 # next to it (the autoconfig chart carries the CRD, RBAC and controller).
 #   openresty / monitor / cache_aware_router chart 各在其仓(llm-openresty / llm-monitor / cache_aware_router)的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor,cache_aware_router}。
-#   IMG_TAG=0.4.0 bash real_helm_e2e.sh [--keep]
+#   IMG_TAG=0.4.1 bash real_helm_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-helm}
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.4.0}
+TAG=${IMG_TAG:-0.4.1}
 CHARTS=${CHARTS:-$HERE/charts}
 AC=4pdosc/autoconfig
 ACR=4pdosc/autoconfig-reload:$TAG

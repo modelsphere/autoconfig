@@ -3,7 +3,7 @@
 # 后端用可扩缩 mock(autoconfig 发现行为不需真推理);真推理/GPU 数据在 resilience/opt 用真 opt-125m。
 set -uo pipefail
 NS=${NS:-llm-route}; CTRL_NS=autoconfig; CHARTS=~/prod-e2e/charts
-H=4pdosc; TAG=${IMG_TAG:-0.4.0}
+H=4pdosc; TAG=${IMG_TAG:-0.4.1}
 AC=$H/autoconfig; ACR=$H/autoconfig-reload:$TAG; AH=$H/autoconfig-hagate:$TAG
 OR_IMG=$H/llm-openresty:0.1.20; CART_IMG=$H/cache_aware_router:0.6.5; MON_IMG=${MON_IMG:?set MON_IMG to an llm-monitor image}; MOCK=python:3.12-alpine
 KEEP=${KEEP:-0}; FAIL=0
