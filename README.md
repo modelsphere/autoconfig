@@ -225,6 +225,10 @@ spec:
     values:                       # 任意 key 原样渲染进 lua register_route opts(值必须字符串)
       tps_limit_tps: "30"         # 解码速率下限(tok/s):EWMA 低于它→AIMD 缩并发,高于它→涨(= opt-in 闸门)
       # adaptive_cc_min: "10"     # 可选:并发下限(不配 = 静态 max × 全局 min_frac 派生)
+      # max_body_size: "50m"      # optional: this route's request body limit (nginx size; default 10m from the
+      #                           # openresty image, dispatch 100m is the ceiling; behind CART raise CART's too).
+      #                           # Needs an openresty image that no longer sets it in router_locations.inc --
+      #                           # on an older one nginx -t fails on the duplicate and no route reloads.
       # ttft_limit_ms: "60000"    # 可选:TTFT 软控阈值
       # adaptive_cc: "false"      # 可选:显式关自适应,走静态硬熔断
     peers:
