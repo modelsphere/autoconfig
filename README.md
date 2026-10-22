@@ -245,7 +245,7 @@ spec:
 |---|---|---|---|
 | `use` | enum | ✅ `cart`\|`backend`\|`backend-svc` | 见下「三档 `use`」 |
 | `priority` | int | — | openresty peer 优先级(建议 cart=3、backend=2、backend-svc=1) |
-| `maxConcurrency` | int | 省略用 `values.default_max` | 该组所有 peer 的并发上限 |
+| `maxConcurrency` | int | omitted: `backend-svc` gets backend `maxConcurrency` × number of backends; other tiers use `values.default_max` | 该组所有 peer 的并发上限 |
 | `maxConcurrencyFromBackend` | bool | 仅 `use:cart` 有意义 | `true` = cart 并发上限动态 = 后端单实例并发 × 后端数(CART 扇出到 N 后端,容量随扩缩自动变);设了则忽略静态 `maxConcurrency`,且**要求 `backend` 组 `maxConcurrency>0`** 作乘数 |
 | `probePath` | string | 省略见右 | openresty 健康探测路径覆盖(GET,状态行含 200=健康否则 ban)。`use:cart` 默认 `/health`(CART 的 `/v1/models` 是缓存端点、worker 全挂也返 200,不能当信号);其余层默认空 = 用 route 的 `health_probe_path` |
 
@@ -257,6 +257,9 @@ spec:
   **autoconfig 本身宕 + 后端 rollout** 时 pod-IP 层是死 IP 又没人重写 → 若无兜底会全断;
   VIP 由 kube-proxy 维护、不依赖 autoconfig 存活,pod-IP 层全 banned 后级联到它 →
   **降级(走 kube-proxy、无亲和)但不全断**。需 `discovery.service`(selector 模式无 VIP,自动跳过)。
+  Without its own `maxConcurrency` its cap is the backend tier's `maxConcurrency` × number of
+  backends, the same capacity it fronts. Before, it fell back to openresty's `default_max` (20),
+  so a failover to this tier capped the whole route at 20.
 
 **`spec.monitor`** —— 可选;监控组件自身每 60s 热加载,**无 reload sidecar**(区别于 nginx/CART)。每模型一个 key,三类行:
 

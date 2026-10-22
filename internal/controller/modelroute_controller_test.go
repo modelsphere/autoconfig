@@ -127,8 +127,10 @@ func TestReconcileGLM(t *testing.T) {
 	// cart 走 CART Service 的 ClusterIP(VIP);动态并发 = 后端 100 × 2 = 200;探针默认 /health(worker-aware,
 	// 因 cart 的 /v1/models 是缓存端点、worker 全挂也返 200,不能当健康信号 → 否则 cart 永不 ban、兜底被 mask)。
 	wantCart := `{ "10.96.0.71", 8071, "cart-0", 3, 200, probe = "/health" },`
-	wantBe := `{ "10.1.0.1", 8050, "backend-0", 2, 100 },`        // 后端 pod IP,maxConcurrency 100,不带 probe → 探 /v1/models
-	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", 1 },` // 后端 Service VIP 静态兜底,priority 1(最低),探 /v1/models
+	wantBe := `{ "10.1.0.1", 8050, "backend-0", 2, 100 },` // 后端 pod IP,maxConcurrency 100,不带 probe → 探 /v1/models
+	// Backend Service VIP fallback, priority 1 (lowest), probes /v1/models. No maxConcurrency of
+	// its own, so it gets backend 100 x 2 = 200 rather than openresty's default_max.
+	wantFallback := `{ "10.96.0.50", 8050, "backend-svc-0", 1, 200 },`
 	// 有 backend-svc VIP 兜底层 → 自动注入跨层 retry(高优层 5xx 单请求即刻兜到低优 VIP)
 	for _, w := range []string{wantCart, wantBe, wantFallback, "listen unix:/usr/local/openresty/nginx/sock/glm.sock", "ttft_limit_ms = 60000", "cross_tier_fallback = true", "max_more_tries = 3"} {
 		if !strings.Contains(conf, w) {
@@ -1035,5 +1037,27 @@ func TestReconcileCart_DefaultKeyStillSkipsOnEmpty(t *testing.T) {
 	}
 	if len(or.Data) == 0 {
 		t.Error("cart 底稿为空不该拦住 openresty 的写入")
+	}
+}
+
+func TestPeerMaxConcurrency(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		peer   routingv1.RoutePeer
+		per, n int
+		want   int
+	}{
+		{"cart from backend", routingv1.RoutePeer{Use: "cart", MaxConcurrencyFromBackend: true, MaxConcurrency: 7}, 100, 2, 200},
+		{"cart static", routingv1.RoutePeer{Use: "cart", MaxConcurrency: 400}, 100, 2, 400},
+		{"backend", routingv1.RoutePeer{Use: "backend", MaxConcurrency: 100}, 100, 2, 100},
+		{"backend-svc derived", routingv1.RoutePeer{Use: "backend-svc"}, 100, 2, 200},
+		{"backend-svc follows scaling", routingv1.RoutePeer{Use: "backend-svc"}, 100, 4, 400},
+		{"backend-svc explicit wins", routingv1.RoutePeer{Use: "backend-svc", MaxConcurrency: 50}, 100, 4, 50},
+		{"backend-svc, no backend cap", routingv1.RoutePeer{Use: "backend-svc"}, 0, 2, 0},
+		{"backend-svc, no backends", routingv1.RoutePeer{Use: "backend-svc"}, 100, 0, 0},
+	} {
+		if got := peerMaxConcurrency(c.peer, c.per, c.n); got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
 	}
 }
