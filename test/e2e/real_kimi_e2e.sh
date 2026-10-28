@@ -5,12 +5,12 @@
 #       真发一条 /v1/chat/completions 经 openresty→CART→kimi 拿真实回答。
 # 依赖同目录:charts/{autoconfig,openresty,cache_aware_router,monitor}(autoconfig chart 含 CRD+RBAC+controller)。
 #   openresty / monitor / cache_aware_router chart 各在其仓(llm-openresty / llm-monitor / cache_aware_router)的 k8s/helm/ —— 跑前拷进 charts/{openresty,monitor,cache_aware_router}。
-#   IMG_TAG=0.4.1 bash real_kimi_e2e.sh [--keep]
+#   IMG_TAG=0.4.2 bash real_kimi_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-kimi}                      # 与 kimi LWS 同 ns(discovery 同 ns)
 CTRL_NS=${CTRL_NS:-autoconfig}
-TAG=${IMG_TAG:-0.4.1}
+TAG=${IMG_TAG:-0.4.2}
 CHARTS=${CHARTS:-$HERE/charts}
 KIMI_SVC=${KIMI_SVC:-kimi-k26-leader}
 MODEL=${MODEL:-kimi-k2.6}

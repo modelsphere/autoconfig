@@ -2,4 +2,4 @@ resources:
 - manager.yaml
 images:
 - name: 4pdosc/autoconfig
-  newTag: "0.4.1"
+  newTag: "0.4.2"
