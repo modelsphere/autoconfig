@@ -15,7 +15,10 @@ ARG GO_BASE=golang:1.23.3-alpine3.20
 ARG RUNTIME_BASE=python:3.12-alpine
 ARG GOPROXY=https://proxy.golang.org,direct
 
-FROM ${GO_BASE} AS build
+# The build stage runs on the builder's own platform and cross-compiles (CGO is off, GOARCH comes
+# from TARGETARCH below). Without --platform the arm64 build ran the Go toolchain under QEMU, which
+# took 20-30 minutes for the three images; the runtime stage only copies the binary.
+FROM --platform=$BUILDPLATFORM ${GO_BASE} AS build
 ARG GOPROXY
 # TARGETARCH is set by buildx to the platform being built, so a multi-platform build
 # compiles each image for its own arch. It was hardcoded to amd64, which put an amd64
