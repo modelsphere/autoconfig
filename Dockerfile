@@ -17,7 +17,12 @@ ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ${GO_BASE} AS build
 ARG GOPROXY
-ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# TARGETARCH is set by buildx to the platform being built, so a multi-platform build
+# compiles each image for its own arch. It was hardcoded to amd64, which put an amd64
+# binary into the published arm64 image. A plain `docker build` leaves it empty and Go
+# then builds for the host, as before.
+ARG TARGETARCH
+ENV GOPROXY=${GOPROXY} GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
