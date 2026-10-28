@@ -4,13 +4,13 @@
 # → 验 cart-config workers + openresty CART优先/后端兜底 peers + status → scale 跟随 → 删除清理。
 #
 # 依赖:autoconfig helm chart(默认 $HERE/charts/autoconfig,含 CRD+RBAC+controller)。
-# 用法:NS=ac-e2e IMG=4pdosc/autoconfig:0.4.2 bash crd_e2e.sh [--keep]
+# 用法:NS=ac-e2e IMG=4pdosc/autoconfig:0.4.3 bash crd_e2e.sh [--keep]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NS=${NS:-ac-e2e}
 CTRL_NS=${CTRL_NS:-autoconfig}
 AC_CHART=${AC_CHART:-$HERE/charts/autoconfig}
-IMG=${IMG:-4pdosc/autoconfig:0.4.2}
+IMG=${IMG:-4pdosc/autoconfig:0.4.3}
 MOCK=${MOCK:-python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
