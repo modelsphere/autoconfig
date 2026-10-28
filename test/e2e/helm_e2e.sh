@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CHART=${CHART:-$HERE/autoconfig}
 NS=${NS:-autoconfig}
 TNS=${TNS:-ac-helm-e2e}
-IMG_TAG=${IMG_TAG:-0.4.1}
+IMG_TAG=${IMG_TAG:-0.4.2}
 MOCK=${MOCK:-python:3.12-alpine}
 KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 FAIL=0
