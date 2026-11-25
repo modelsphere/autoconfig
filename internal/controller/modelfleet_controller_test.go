@@ -1055,6 +1055,70 @@ func TestFleetExplicitlyZeroedPolicyIsNotAnEvenSplit(t *testing.T) {
 	}
 }
 
+// A policy that exists is authoritative, so a member it does not mention gets no traffic.
+// That is the right rule - otherwise nothing could ever take a member out - but a writer that
+// lists only the members it has measurements for would retire the rest without meaning to.
+// The fleet keeps serving; it says so on PolicyApplied rather than only in the gateway's
+// counters.
+func TestFleetReportsMembersAPolicyLeavesOut(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.TrafficPolicy.Members = []routingv1.PolicyMember{{Name: "h100", Tier: 0, Weight: 10000}}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the fleet stopped syncing over an incomplete policy: %+v", fleet.Status.Conditions)
+	}
+	var policy *metav1.Condition
+	for i := range fleet.Status.Conditions {
+		if fleet.Status.Conditions[i].Type == condPolicyApplied {
+			policy = &fleet.Status.Conditions[i]
+		}
+	}
+	if policy == nil || policy.Reason != "MembersNotInPolicy" {
+		t.Fatalf("PolicyApplied = %+v, want MembersNotInPolicy", policy)
+	}
+	if !strings.Contains(policy.Message, "ascend") {
+		t.Fatalf("the omitted member is not named: %q", policy.Message)
+	}
+	// ...and the member really is out of rotation, which is what the report is about.
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	for _, b := range backends {
+		if id, _, _ := unstructured.NestedString(b.(map[string]any), "id"); id == "ascend" {
+			t.Fatal("a member absent from the policy still got traffic")
+		}
+	}
+}
+
+// The report is only for a policy that exists. With no policy every member is served, so
+// there is nothing to warn about - and a warning there would be permanent noise on every
+// fleet that has not been tuned yet.
+func TestFleetWithNoPolicyReportsNothingUncovered(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.TrafficPolicy = nil
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	for _, cond := range fleet.Status.Conditions {
+		if cond.Type == condPolicyApplied && cond.Status != metav1.ConditionTrue {
+			t.Fatalf("PolicyApplied=%s with no policy written: %s", cond.Status, cond.Message)
+		}
+	}
+}
+
 func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 	t.Helper()
 	o := &unstructured.Unstructured{}

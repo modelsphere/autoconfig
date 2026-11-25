@@ -138,6 +138,9 @@ type fleetRender struct {
 	// it is set explicitly only when withdrawing rules from a namespace the spec no longer
 	// points at.
 	gatewayNS string
+	// uncovered: members a traffic policy exists but does not mention, and which are
+	// therefore out of rotation.
+	uncovered []string
 	// appliedExtras: the extraPlugins keys written this round, for status.
 	appliedExtras []string
 	// orphans: trafficPolicy entries naming members that no longer exist. Reported, never
@@ -437,6 +440,20 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 			}
 		}
 		sort.Strings(rend.orphans)
+		// ...and the other direction: a member the policy does NOT mention is out of
+		// rotation, because a policy that exists is authoritative. That is the right rule -
+		// otherwise whoever writes the policy cannot take a member out - but it is a sharp
+		// edge for a writer that only lists the members it has measurements for: a fleet of
+		// three, with data for two, silently drops the third. Reported rather than changed,
+		// so it is visible in the object instead of only in the gateway's counters.
+		if !undecided {
+			for _, m := range fleet.Spec.Members {
+				if _, ok := policy[m.Name]; !ok {
+					rend.uncovered = append(rend.uncovered, m.Name)
+				}
+			}
+			sort.Strings(rend.uncovered)
+		}
 	}
 	// Status reports the share actually in force, which differs from the table's weights
 	// when everything falls through to the default member (see sink.TrafficShares).
@@ -1039,6 +1056,14 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 			st.TotalCapacity = totalCapacity(st.Members, &fleet)
 
 			policyOK, policyReason, policyMsg := metav1.ConditionTrue, "Applied", "traffic policy applied"
+			if len(rend.uncovered) > 0 {
+				// Not a failure: the policy is applied exactly as written. But a member with
+				// no entry gets no traffic, and a writer that listed only what it measured
+				// did not necessarily mean to retire the rest.
+				policyOK, policyReason = metav1.ConditionFalse, "MembersNotInPolicy"
+				policyMsg = "trafficPolicy does not mention these members, so they receive no " +
+					"traffic: " + strings.Join(rend.uncovered, ", ")
+			}
 			if len(rend.orphans) > 0 {
 				// Degraded, not failed: the rest of the policy is still applied.
 				policyOK, policyReason = metav1.ConditionFalse, "OrphanMembers"
