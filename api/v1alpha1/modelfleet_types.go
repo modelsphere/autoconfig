@@ -28,9 +28,16 @@ type Hardware struct {
 // purpose: the path prefix, the port and the concurrency ceiling all have an authoritative
 // value in the ModelRoute already, and copying them here would make two sources of truth.
 type MemberBackend struct {
-	// ModelRouteRef: a ModelRoute in this namespace ("ns/name" to cross namespaces), the one
-	// swiss created for this hardware type. The gateway path prefix is derived from its
-	// spec.nginx.route (falling back to its metadata.name, same rule the ModelRoute itself uses).
+	// ModelRouteRef: a ModelRoute in this fleet's own namespace, the one swiss created for
+	// this hardware type. The gateway path prefix is derived from its spec.nginx.route
+	// (falling back to its metadata.name, same rule the ModelRoute itself uses).
+	//
+	// Same namespace only, and not merely as a convention: the fleet's Ingress sends every
+	// member's path to the openresty in the fleet's namespace (an Ingress backend cannot name
+	// a Service anywhere else), and that openresty serves the routes of its own namespace. A
+	// member whose ModelRoute lives elsewhere would get a path that this openresty does not
+	// serve - a 404 on a route the fleet reports as healthy. An "ns/" prefix naming another
+	// namespace is refused rather than accepted and then silently dead.
 	// +kubebuilder:validation:MinLength=1
 	ModelRouteRef string `json:"modelRouteRef"`
 }
@@ -213,12 +220,19 @@ type GatewaySpec struct {
 	// definitions (and their keys) stay in the gateway chart's defaultConfig — only the
 	// allow-list for this route is ours to write, so no key ever lands in this CR.
 	//
+	// Required, because the gateway runs with global_auth=false: a route with no key-auth
+	// match rule is not denied, it is OPEN. An empty list would therefore publish a public
+	// route while reporting a healthy sync, which is the one outcome this controller orders
+	// its writes to avoid. ["*"] is how a public route is asked for on purpose — it writes no
+	// rule, exactly as an empty list used to, but it says so in the object.
+	//
 	// Names are checked against what key-auth actually defines before the route is published:
 	// a name with a typo is accepted by both the API server and the plugin, and then denies
 	// every caller with 403 while this CR reports a healthy sync.
-	// +optional
+	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
-	AuthConsumers []string `json:"authConsumers,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="!self.exists(c, c == '*') || size(self) == 1",message="authConsumers: \"*\" means \"no authentication on this route\" and cannot be combined with consumer names"
+	AuthConsumers []string `json:"authConsumers"`
 }
 
 // ModelFleetSpec aggregates several single-hardware services into one externally visible model.
@@ -339,7 +353,17 @@ type ModelFleetStatus struct {
 	// +optional
 	// +listType=set
 	AppliedExtraPlugins []string `json:"appliedExtraPlugins,omitempty"`
-	// LastSyncTime: when the gateway objects were last written.
+	// AppliedGatewayNamespace: the gateway namespace this fleet's rules were last written to,
+	// for the same reason appliedExtraPlugins exists. Rules are written into WasmPlugins in
+	// spec.gateway.namespace, and the reconciler only ever sees the namespace that is there
+	// now: change the field and the rules in the old namespace would stay bound to this
+	// fleet's Ingress reference forever, with nothing in the CR pointing at them.
+	// +optional
+	AppliedGatewayNamespace string `json:"appliedGatewayNamespace,omitempty"`
+	// LastSyncTime: when this fleet was last reconciled — set on every pass, including the
+	// ones that failed before writing anything. It answers "is the controller still looking
+	// at this object", not "when did the gateway last change"; observedGeneration and
+	// GatewaySynced answer the latter.
 	// +optional
 	LastSyncTime *metav1.Time `json:"lastSyncTime,omitempty"`
 	// Conditions: Ready (serving), GatewaySynced (objects written), PolicyApplied (the policy
@@ -354,7 +378,10 @@ type ModelFleetStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=mf
 // +kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.status.modelName`
-// +kubebuilder:printcolumn:name="Members",type=integer,JSONPath=`.status.totalCapacity.readyReplicas`
+// Members is the number of members, so it counts status.members - readyReplicas is a count
+// of engine replicas across the fleet, which is a different (and usually larger) number.
+// +kubebuilder:printcolumn:name="Members",type=integer,JSONPath=`.status.members.length()`
+// +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.totalCapacity.readyReplicas`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

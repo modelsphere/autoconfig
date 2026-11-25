@@ -134,6 +134,10 @@ type fleetRender struct {
 	upstreamKey string
 	// upstreamKeyDefaulted: the credential came from the default Secret, not from a named one.
 	upstreamKeyDefaulted bool
+	// gatewayNS: which gateway namespace to write to. Empty means the one the spec names;
+	// it is set explicitly only when withdrawing rules from a namespace the spec no longer
+	// points at.
+	gatewayNS string
 	// appliedExtras: the extraPlugins keys written this round, for status.
 	appliedExtras []string
 	// orphans: trafficPolicy entries naming members that no longer exist. Reported, never
@@ -173,16 +177,14 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err := r.cleanupPluginRules(ctx, &fleet); err != nil {
 				return ctrl.Result{}, err
 			}
-			controllerutil.RemoveFinalizer(&fleet, fleetFinalizer)
-			if err := r.Update(ctx, &fleet); err != nil {
+			if err := r.patchFinalizer(ctx, &fleet, false); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 		return ctrl.Result{}, nil
 	}
 	if !controllerutil.ContainsFinalizer(&fleet, fleetFinalizer) {
-		controllerutil.AddFinalizer(&fleet, fleetFinalizer)
-		if err := r.Update(ctx, &fleet); err != nil {
+		if err := r.patchFinalizer(ctx, &fleet, true); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -220,6 +222,82 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	log.V(1).Info("fleet synced", "model", rend.modelName, "members", len(rend.members))
 	r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue, "Synced", "gateway objects written")
 	return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+}
+
+// patchFinalizer adds or removes our finalizer with a merge patch touching nothing else.
+//
+// A typed Update would send the whole object as this binary's Go types understand it, which
+// DROPS any spec field those types do not know - precisely the mechanism that had a build
+// from before gateway.extraPlugins existed stripping that field out of every fleet it wrote
+// back. Today the controller only ever writes the finalizer, so the exposure is one pass per
+// object; but during a rollout, an old replica adding the finalizer to a newly created fleet
+// would silently erase the fields the new CRD just accepted. A patch cannot do that.
+func (r *ModelFleetReconciler) patchFinalizer(ctx context.Context, fleet *routingv1.ModelFleet, add bool) error {
+	before := fleet.DeepCopy()
+	if add {
+		if !controllerutil.AddFinalizer(fleet, fleetFinalizer) {
+			return nil
+		}
+	} else if !controllerutil.RemoveFinalizer(fleet, fleetFinalizer) {
+		return nil
+	}
+	return r.Patch(ctx, fleet, client.MergeFrom(before))
+}
+
+// withdrawFromOldGatewayNamespace takes this fleet's rules back out of the gateway namespace
+// it used to write to. Without it, changing spec.gateway.namespace leaves a full set of rules
+// in the old namespace bound to this fleet's Ingress reference, which nothing will ever
+// remove: the reconciler only ever sees the namespace that is there now, and the finalizer
+// cleans up the current one.
+func (r *ModelFleetReconciler) withdrawFromOldGatewayNamespace(ctx context.Context, rend *fleetRender) error {
+	old := rend.fleet.Status.AppliedGatewayNamespace
+	if old == "" || old == gatewayNamespace(rend.fleet) {
+		return nil
+	}
+	stale := &fleetRender{fleet: rend.fleet, ingressRef: rend.ingressRef, gatewayNS: old}
+	var errs []string
+	for _, p := range pluginsEverWritten(rend.fleet) {
+		if err := r.upsertMatchRule(ctx, stale, p, nil); err != nil && !isAbsent(err) {
+			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("withdraw rules from the previous gateway namespace %q: %s",
+			old, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// pluginsEverWritten: every plugin this fleet could have a rule in - the built-in ones, the
+// passthrough keys in the spec, and the ones status says were written. Used wherever rules
+// have to be taken back rather than written.
+func pluginsEverWritten(fleet *routingv1.ModelFleet) []fleetPlugin {
+	plugins := fleetPlugins()
+	seen := map[string]bool{}
+	for _, p := range plugins {
+		seen[p.name] = true
+	}
+	for name := range fleet.Spec.Gateway.ExtraPlugins {
+		if !seen[name] {
+			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
+		}
+	}
+	for _, name := range fleet.Status.AppliedExtraPlugins {
+		if !seen[name] {
+			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
+		}
+	}
+	return plugins
+}
+
+// isPublicRoute: ["*"] in authConsumers, the explicit opt-out from authentication.
+//
+// The gateway runs with global_auth=false, so a route with no key-auth match rule is open
+// rather than denied - which is why an empty list is refused outright instead of quietly
+// meaning this. The sentinel keeps the two apart: an open route is a sentence someone wrote.
+func isPublicRoute(fleet *routingv1.ModelFleet) bool {
+	c := fleet.Spec.Gateway.AuthConsumers
+	return len(c) == 1 && c[0] == "*"
 }
 
 // checkModelNameIsUnique refuses a model name another fleet on the same gateway already
@@ -285,6 +363,22 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	}
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
 		return nil, err
+	}
+	// Belt and braces with the CRD's MinItems: an older CRD on a cluster that has not been
+	// updated would let an empty list through, and the result of that is a public route.
+	for _, m := range fleet.Spec.Members {
+		if ns, _ := splitRef(m.Backend.ModelRouteRef, fleet.Namespace); ns != fleet.Namespace {
+			return nil, fmt.Errorf("member %q: modelRouteRef %q names namespace %q, but this "+
+				"fleet's Ingress can only reach the openresty in its own namespace (%q), which "+
+				"serves only that namespace's routes - the member's path would 404 on a route "+
+				"reported as healthy", m.Name, m.Backend.ModelRouteRef, ns, fleet.Namespace)
+		}
+	}
+	if len(fleet.Spec.Gateway.AuthConsumers) == 0 {
+		return nil, fmt.Errorf("gateway.authConsumers is empty: the gateway runs with " +
+			"global_auth=false, so a route with no key-auth rule is open to anyone rather " +
+			`than denied. Name the consumers allowed on this route, or ["*"] to publish a ` +
+			"public route on purpose")
 	}
 
 	policy := map[string]routingv1.PolicyMember{}
@@ -409,14 +503,16 @@ func firstOpenrestyAPIKey(spec string) (string, error) {
 // CR reports a healthy sync. The gateway chart used to catch this at render time; now that the
 // allow-list is written here, the check belongs here too.
 func (r *ModelFleetReconciler) checkAuth(ctx context.Context, fleet *routingv1.ModelFleet, rend *fleetRender) error {
-	if len(fleet.Spec.Gateway.AuthConsumers) == 0 && rend.upstreamKey == "" {
+	// A public route names no consumers to check, and a fleet with no upstream credential has
+	// nothing that could collide with one.
+	if isPublicRoute(fleet) && rend.upstreamKey == "" {
 		return nil
 	}
 	gwNS := gatewayNamespace(fleet)
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(wasmPluginGVK)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
-		if isAbsent(err) && len(fleet.Spec.Gateway.AuthConsumers) == 0 {
+		if isAbsent(err) && isPublicRoute(fleet) {
 			return nil // nothing to check; the missing plugin is handled where rules are written
 		}
 		// Name the namespace: gateway.namespace defaults to higress-system and must match the
@@ -441,6 +537,9 @@ func (r *ModelFleetReconciler) checkAuth(ctx context.Context, fleet *routingv1.M
 	}
 	var unknown []string
 	for _, want := range fleet.Spec.Gateway.AuthConsumers {
+		if want == "*" {
+			continue // the sentinel is not a consumer name
+		}
 		if !known[want] {
 			unknown = append(unknown, want)
 		}
@@ -538,8 +637,13 @@ func fleetPlugins() []fleetPlugin {
 		// Without a rule here the route is not in any consumer's allow-list: 403. Missing
 		// plugin + a requested allow-list = an unauthenticated route, so that fails the sync.
 		name: "key-auth",
+		// A fleet that asked to be public has no rule here, so the plugin's absence is not a
+		// problem; one that named consumers is a different matter, handled below.
+		tolerateMissing: func(f *fleetRender) bool { return isPublicRoute(f.fleet) },
 		config: func(f *fleetRender) (any, error) {
-			if len(f.fleet.Spec.Gateway.AuthConsumers) == 0 {
+			if isPublicRoute(f.fleet) {
+				// No rule at all. With global_auth=false that is what "open" looks like on
+				// this gateway, and it is what ["*"] asks for.
 				return nil, nil
 			}
 			return sink.RenderKeyAuth(f.fleet.Spec.Gateway.AuthConsumers), nil
@@ -571,8 +675,10 @@ func fleetPlugins() []fleetPlugin {
 }
 
 // renderedPlugins: the plugins this controller renders itself. The passthrough path must
-// never write to one of these - the CRD refuses it at apply time, and this is the belt to
-// that pair of braces, since a stale CRD on an older cluster would otherwise let it through.
+// never write to one of these, and this check is the ONLY thing stopping it: a CEL rule on
+// gateway.extraPlugins cannot exist, because the API server leaves a map whose values carry
+// x-kubernetes-preserve-unknown-fields out of the CEL type system and would reject the whole
+// CRD. Verbatim passthrough and API-server-side validation of the keys cannot both be had.
 func renderedPlugins() map[string]bool {
 	out := map[string]bool{}
 	for _, p := range fleetPlugins() {
@@ -585,6 +691,11 @@ func renderedPlugins() map[string]bool {
 
 func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleetRender) error {
 	var errs []string
+	if err := r.withdrawFromOldGatewayNamespace(ctx, rend); err != nil {
+		// Not fatal: the new namespace still gets its rules, and the stale ones are retried
+		// every resync. Reported, because a rule nobody can see is the thing to avoid.
+		errs = append(errs, err.Error())
+	}
 	extra := rend.fleet.Spec.Gateway.ExtraPlugins
 	rendered := renderedPlugins()
 	for _, p := range fleetPlugins() {
@@ -738,7 +849,10 @@ func isAbsent(err error) bool {
 }
 
 func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetRender, p fleetPlugin, cfg map[string]any) error {
-	ns := gatewayNamespace(rend.fleet)
+	ns := rend.gatewayNS
+	if ns == "" {
+		ns = gatewayNamespace(rend.fleet)
+	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(wasmPluginGVK)
@@ -818,23 +932,9 @@ func (r *ModelFleetReconciler) deleteIngress(ctx context.Context, fleet *routing
 func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *routingv1.ModelFleet) error {
 	rend := &fleetRender{fleet: fleet, ingressRef: fleet.Namespace + "/" + ingressName(fleet)}
 	var errs []string
-	plugins := fleetPlugins()
 	// Passthrough plugins were written by us too, so they have to be withdrawn by us - both
 	// the ones still in the spec and any we recorded having written.
-	seen := map[string]bool{}
-	for _, p := range plugins {
-		seen[p.name] = true
-	}
-	for name := range fleet.Spec.Gateway.ExtraPlugins {
-		if !seen[name] {
-			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
-		}
-	}
-	for _, name := range fleet.Status.AppliedExtraPlugins {
-		if !seen[name] {
-			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
-		}
-	}
+	plugins := pluginsEverWritten(fleet)
 	// key-auth last. The Ingress is already gone by the time this runs, so nothing is
 	// reachable either way, but if that ever stops being true this ordering means the rule
 	// that keeps the route closed is the last thing to go rather than the second.
@@ -844,6 +944,16 @@ func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *ro
 	for _, p := range plugins {
 		if err := r.upsertMatchRule(ctx, rend, p, nil); err != nil && !isAbsent(err) {
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
+		}
+	}
+	// A fleet whose gateway namespace changed may still have rules in the old one; deleting
+	// the object is the last chance to take them back.
+	if old := fleet.Status.AppliedGatewayNamespace; old != "" && old != gatewayNamespace(fleet) {
+		stale := &fleetRender{fleet: fleet, ingressRef: rend.ingressRef, gatewayNS: old}
+		for _, p := range plugins {
+			if err := r.upsertMatchRule(ctx, stale, p, nil); err != nil && !isAbsent(err) {
+				errs = append(errs, fmt.Sprintf("%s in %s: %v", p.name, old, err))
+			}
 		}
 	}
 	if len(errs) > 0 {
@@ -911,6 +1021,11 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 			}
 			st.Members = memberStatuses(&fleet, rend)
 			st.AppliedExtraPlugins = rend.appliedExtras
+			if syncStatus == metav1.ConditionTrue {
+				// Only on success: claiming a namespace whose rules were not written would
+				// make the next round withdraw from the namespace it is trying to write to.
+				st.AppliedGatewayNamespace = gatewayNamespace(&fleet)
+			}
 			st.TotalCapacity = totalCapacity(st.Members, &fleet)
 
 			policyOK, policyReason, policyMsg := metav1.ConditionTrue, "Applied", "traffic policy applied"

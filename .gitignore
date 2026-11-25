@@ -1,2 +1,6 @@
 # Build output: `make build` drops cross-compiled binaries here.
 bin/
+
+# Packet captures and dumps from debugging: they carry real request bodies and internal
+# addresses, and this repository is public.
+/debug/

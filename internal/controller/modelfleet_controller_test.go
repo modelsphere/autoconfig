@@ -54,13 +54,30 @@ func wasmPlugin(name string, rules ...any) *unstructured.Unstructured {
 
 func getPlugin(t *testing.T, c client.Client, name string) []any {
 	t.Helper()
+	return getPluginIn(t, c, "higress-system", name)
+}
+
+func getPluginIn(t *testing.T, c client.Client, ns, name string) []any {
+	t.Helper()
 	o := &unstructured.Unstructured{}
 	o.SetGroupVersionKind(wasmPluginGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "higress-system", Name: name}, o); err != nil {
-		t.Fatalf("get %s: %v", name, err)
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, o); err != nil {
+		t.Fatalf("get %s/%s: %v", ns, name, err)
 	}
 	rules, _, _ := unstructured.NestedSlice(o.Object, "spec", "matchRules")
 	return rules
+}
+
+func wasmPluginIn(ns, name string, rules ...any) *unstructured.Unstructured {
+	o := wasmPlugin(name, rules...)
+	o.SetNamespace(ns)
+	return o
+}
+
+func keyAuthPluginIn(ns string, consumers map[string]string) *unstructured.Unstructured {
+	o := keyAuthPlugin(consumers)
+	o.SetNamespace(ns)
+	return o
 }
 
 func modelRoute(name, ns, route string, backends int, ready bool) *routingv1.ModelRoute {
@@ -377,7 +394,7 @@ func TestFleetUpstreamKeyFromSecret(t *testing.T) {
 // the rest from being programmed.
 func TestFleetMissingPluginWithNothingToWriteIsNotFatal(t *testing.T) {
 	f := fleetFixture()
-	f.Spec.Gateway.AuthConsumers = nil // nothing to put in an allow-list
+	f.Spec.Gateway.AuthConsumers = []string{"*"} // a deliberately public route: no rule to write
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
@@ -799,6 +816,109 @@ func TestFleetDeleteTakesTheRouteDownBeforeItsGuards(t *testing.T) {
 	}
 }
 
+// The gateway runs with global_auth=false, so a route with no key-auth rule is OPEN, not
+// denied. An empty authConsumers would therefore publish a public route while reporting a
+// healthy sync - the exact outcome the write order elsewhere in this controller exists to
+// prevent. It is refused; ["*"] is how a public route is asked for on purpose.
+func TestFleetEmptyAuthConsumersIsRefused(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.AuthConsumers = nil
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("an empty allow-list published a route")
+	}
+	// Nothing published at all: no Ingress, so nothing is reachable without a rule.
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
+		t.Fatal("an Ingress was published for a fleet with no allow-list")
+	}
+
+	// ...and the sentinel publishes, with no key-auth rule, which is what open looks like here.
+	fleet.Spec.Gateway.AuthConsumers = []string{"*"}
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	_ = c.Get(context.Background(), nn, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf(`authConsumers: ["*"] did not publish: %+v`, fleet.Status.Conditions)
+	}
+	if n := len(getPlugin(t, c, "key-auth")); n != 0 {
+		t.Fatalf("key-auth rules = %d for a public route, want 0", n)
+	}
+}
+
+// modelRouteRef used to advertise "ns/name". The fleet's Ingress can only send traffic to the
+// openresty in its own namespace, and that openresty serves only its own namespace's routes,
+// so a member from elsewhere gets a path that 404s on a route reported as healthy.
+func TestFleetMemberFromAnotherNamespaceIsRefused(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members[1].Backend.ModelRouteRef = "other-ns/glm-53-ascend"
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "other-ns", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("a member in another namespace was accepted")
+	}
+}
+
+// Rules are written into WasmPlugins in spec.gateway.namespace, and the reconciler only sees
+// the namespace that is there now. Changing the field would otherwise leave a full set of
+// rules behind, bound to this fleet's Ingress reference, that nothing would ever remove.
+func TestFleetMovingGatewayNamespaceWithdrawsTheOldRules(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.Namespace = "higress-system"
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPluginIn("gw-two", "ai-backend-router"), keyAuthPluginIn("gw-two", map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+	if n := len(getPluginIn(t, c, "higress-system", "ai-backend-router")); n != 1 {
+		t.Fatalf("precondition: rules in the first namespace = %d", n)
+	}
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if got := fleet.Status.AppliedGatewayNamespace; got != "higress-system" {
+		t.Fatalf("status.appliedGatewayNamespace = %q", got)
+	}
+
+	fleet.Spec.Gateway.Namespace = "gw-two"
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	if n := len(getPluginIn(t, c, "gw-two", "ai-backend-router")); n != 1 {
+		t.Fatalf("rules in the new namespace = %d, want 1", n)
+	}
+	if n := len(getPluginIn(t, c, "higress-system", "ai-backend-router")); n != 0 {
+		t.Fatalf("rules left behind in the old namespace = %d, want 0", n)
+	}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if got := fleet.Status.AppliedGatewayNamespace; got != "gw-two" {
+		t.Fatalf("status.appliedGatewayNamespace = %q, want gw-two", got)
+	}
+}
+
 func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 	t.Helper()
 	o := &unstructured.Unstructured{}
@@ -814,7 +934,7 @@ func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 // every 30s resync push an identical config to the gateway.
 func TestFleetUnchangedEmptyPluginIsNotRewritten(t *testing.T) {
 	f := fleetFixture()
-	f.Spec.Gateway.AuthConsumers = nil // nothing to write into key-auth
+	f.Spec.Gateway.AuthConsumers = []string{"*"} // a deliberately public route: no rule to write
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),

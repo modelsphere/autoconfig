@@ -329,13 +329,17 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 |---|---|---|
 | `Ingress`(每 fleet 一条) | 匹配 model-router 写的 `x-higress-llm-model` 头;**不配 rewrite-path** | 路由不生效 / 所有成员被钉死在同一路径 |
 | `ai-backend-router` | `trafficPolicy` → 决策表(backend id、path、tier、weight) | 没有后端表,无法分流 |
-| `key-auth` | 把本路由加进 allow 名单(**key 不经本 CR**,consumer 定义仍在网关 chart) | 403 |
+| `key-auth` | 把本路由加进 allow 名单(**key 不经本 CR**,consumer 定义仍在网关 chart) | **路由变成开放的**(网关 `global_auth: false`,没有规则 = 不鉴权,不是 403) |
 | `ai-proxy` | 网关给 openresty 的 key(从 Secret 读) | 401 |
 | `ai-statistics` | 把本路由加进列表 | 没有 token 指标 |
 
 **先写插件规则,最后建 Ingress**。Ingress 是「路由可达」的那一步,守它的东西必须先就位 ——
 反过来写,插件中途失败就会留下一条**已经可达、但 key-auth 规则没写进去**的路由:不带 key 也返 200,
 而现场只有 CR 上一个 `GatewaySynced=False`。规则里引用一条还不存在的 Ingress 是惰性的,所以这个顺序自己不开窗口。
+
+**`authConsumers` 是必填的**,因为网关跑在 `global_auth: false` 下:一条没有 key-auth 规则的路由
+不是被拒,而是**开放的**。空名单于是等于「发布一条公开路由并报告同步正常」—— 正是上面那个写入顺序
+要避免的结果。要公开路由就显式写 `authConsumers: ["*"]`:它同样不写规则,但这句话是人写下来的。
 
 **`authConsumers` 的名字在发布前对着 key-auth 的 `defaultConfig.consumers` 校验**。
 名字写错插件不会报错,只会对所有调用方回 403,而 CR 显示同步正常 —— 以前这是网关 chart 在渲染时拦下的,
@@ -359,8 +363,11 @@ gateway:
 **哪些插件必须类型化、不能透传**:配置依赖「写入方看不见的东西」时 ——
 `ai-backend-router` 的表是算出来的(路径来自 ModelRoute、权重按就绪成员归一,都是集群实时状态);
 `ai-proxy` 的内容是密钥(透传等于把明文写进 CR);`key-auth` 的 allow 要对着网关的 consumers 交叉校验,
-而且「谁能用这个模型」是 console 要当一等字段读写的策略。这三个写进 `extraPlugins` 会被拒
-(CEL 在 apply 时拦,controller 里还有一道,防老集群 CRD 没更新)。`ai-statistics` 不在此列,可以覆盖。
+而且「谁能用这个模型」是 console 要当一等字段读写的策略。这三个写进 `extraPlugins` 会被 reconciler 拒掉
+(`GatewaySynced=False`,什么都不写)。**这里没有 CEL 这一道**:API server 会把「value 带
+`x-kubernetes-preserve-unknown-fields` 的 map」整个排除在 CEL 的类型系统之外,给这个字段写规则会让
+整个 CRD 装不上去 —— 原样透传和 API server 侧校验,在同一个字段上只能要一个。`ai-statistics` 不在此列,
+可以覆盖。
 
 ⚠️ **透传的内容不校验**。插件的校验在网关侧,写错了 apply 照样成功,要到网关加载插件时才炸,
 而一个插件出问题会连带卡住所有插件的配置下发。用它就等同于直接写网关配置。
@@ -371,6 +378,10 @@ gateway:
 一律跳过;`ai-proxy` 缺了**且凭证是默认来的**(没显式写 `upstreamAuthSecretRef`)也跳过 ——
 一个从没部署过 ai-proxy、也从没指定过 Secret 的集群,就是 openresty 不收 key 的集群,
 不该因为加了默认值就变成「fleet 拒绝发布」。**显式写了 `upstreamAuthSecretRef` 则是指令,照样失败。**
+
+⚠️ 这个例外只在**默认的那个 Secret 存在**时才走到:凭证是先解析的,`openresty-api-keys` 不在
+fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失」那一步。而一个没装 ai-proxy 的集群
+通常也没有那个 Secret —— 那种集群要发布 fleet,得显式写 `upstreamAuthSecretRef: none`。
 
 **`status.observedGeneration` 只在同步成功时推进**。它是 console 和 decision-gen 轮询的收敛信号,
 失败时也推进就等于告诉它们「新的分流已经生效」,而实际上什么都没写、表还冻在上一次好值。
