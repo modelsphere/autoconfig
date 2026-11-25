@@ -816,11 +816,12 @@ func TestFleetDeleteTakesTheRouteDownBeforeItsGuards(t *testing.T) {
 	}
 }
 
-// The gateway runs with global_auth=false, so a route with no key-auth rule is OPEN, not
-// denied. An empty authConsumers would therefore publish a public route while reporting a
-// healthy sync - the exact outcome the write order elsewhere in this controller exists to
-// prevent. It is refused; ["*"] is how a public route is asked for on purpose.
-func TestFleetEmptyAuthConsumersIsRefused(t *testing.T) {
+// Omitting authConsumers must close the route, not open it. The two cases are different
+// WRITES, not different values: `allow: []` is a rule the plugin reads as "nobody is
+// allowed" (403), while NO rule at all means the plugin never runs for this route, and with
+// global_auth=false that is open. Omission therefore has to produce the empty rule, and only
+// ["*"] produces no rule.
+func TestFleetEmptyAuthConsumersDeniesEveryone(t *testing.T) {
 	f := fleetFixture()
 	f.Spec.Gateway.AuthConsumers = nil
 	r, c := newFleetReconciler(t, f,
@@ -833,17 +834,31 @@ func TestFleetEmptyAuthConsumersIsRefused(t *testing.T) {
 	var fleet routingv1.ModelFleet
 	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
 	_ = c.Get(context.Background(), nn, &fleet)
-	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
-		t.Fatal("an empty allow-list published a route")
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a closed route failed to publish: %+v", fleet.Status.Conditions)
 	}
-	// Nothing published at all: no Ingress, so nothing is reachable without a rule.
-	var ing networkingv1.Ingress
-	if err := c.Get(context.Background(), types.NamespacedName{
-		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
-		t.Fatal("an Ingress was published for a fleet with no allow-list")
+	rules := getPlugin(t, c, "key-auth")
+	if len(rules) != 1 {
+		t.Fatalf("key-auth rules = %d, want 1 (an empty allow-list is still a rule)", len(rules))
+	}
+	allow, found, _ := unstructured.NestedSlice(rules[0].(map[string]any), "config", "allow")
+	if !found {
+		t.Fatalf("no allow key in the rule: %v", rules[0])
+	}
+	if len(allow) != 0 {
+		t.Fatalf("allow = %v, want empty", allow)
+	}
+	// allow: null would fail the plugin's array parse, and a rule it cannot parse denies
+	// nobody - so the empty list has to survive a round trip as [].
+	b, err := json.Marshal(rules[0].(map[string]any)["config"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{"allow":[]}` {
+		t.Fatalf("rendered config = %s, want {\"allow\":[]}", b)
 	}
 
-	// ...and the sentinel publishes, with no key-auth rule, which is what open looks like here.
+	// ...and the sentinel is the one case that writes no rule, which is what open looks like.
 	fleet.Spec.Gateway.AuthConsumers = []string{"*"}
 	if err := c.Update(context.Background(), &fleet); err != nil {
 		t.Fatal(err)

@@ -364,8 +364,6 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
 		return nil, err
 	}
-	// Belt and braces with the CRD's MinItems: an older CRD on a cluster that has not been
-	// updated would let an empty list through, and the result of that is a public route.
 	for _, m := range fleet.Spec.Members {
 		if ns, _ := splitRef(m.Backend.ModelRouteRef, fleet.Namespace); ns != fleet.Namespace {
 			return nil, fmt.Errorf("member %q: modelRouteRef %q names namespace %q, but this "+
@@ -373,12 +371,6 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 				"serves only that namespace's routes - the member's path would 404 on a route "+
 				"reported as healthy", m.Name, m.Backend.ModelRouteRef, ns, fleet.Namespace)
 		}
-	}
-	if len(fleet.Spec.Gateway.AuthConsumers) == 0 {
-		return nil, fmt.Errorf("gateway.authConsumers is empty: the gateway runs with " +
-			"global_auth=false, so a route with no key-auth rule is open to anyone rather " +
-			`than denied. Name the consumers allowed on this route, or ["*"] to publish a ` +
-			"public route on purpose")
 	}
 
 	policy := map[string]routingv1.PolicyMember{}
@@ -638,7 +630,8 @@ func fleetPlugins() []fleetPlugin {
 		// plugin + a requested allow-list = an unauthenticated route, so that fails the sync.
 		name: "key-auth",
 		// A fleet that asked to be public has no rule here, so the plugin's absence is not a
-		// problem; one that named consumers is a different matter, handled below.
+		// problem. Every other fleet has one - including a fleet with an empty allow-list,
+		// which is how "nobody" is said - so a missing plugin then fails the sync.
 		tolerateMissing: func(f *fleetRender) bool { return isPublicRoute(f.fleet) },
 		config: func(f *fleetRender) (any, error) {
 			if isPublicRoute(f.fleet) {

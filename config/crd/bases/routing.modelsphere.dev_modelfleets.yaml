@@ -89,11 +89,12 @@ spec:
                       definitions (and their keys) stay in the gateway chart's defaultConfig — only the
                       allow-list for this route is ours to write, so no key ever lands in this CR.
 
-                      Required, because the gateway runs with global_auth=false: a route with no key-auth
-                      match rule is not denied, it is OPEN. An empty list would therefore publish a public
-                      route while reporting a healthy sync, which is the one outcome this controller orders
-                      its writes to avoid. ["*"] is how a public route is asked for on purpose — it writes no
-                      rule, exactly as an empty list used to, but it says so in the object.
+                      Omitted or empty = nobody may call this route. It renders `allow: []`, which the plugin
+                      reads as "nobody is allowed" and answers with 403. That is deliberately NOT the same as
+                      writing no rule at all: the gateway runs with global_auth=false, so a route with no
+                      key-auth rule is not denied but OPEN, and omitting a field must never be the way a
+                      public route comes about. ["*"] is how one is asked for on purpose — that, and only
+                      that, writes no rule.
 
                       Names are checked against what key-auth actually defines before the route is published:
                       a name with a typo is accepted by both the API server and the plugin, and then denies
@@ -101,7 +102,6 @@ spec:
                     items:
                       type: string
                     maxItems: 64
-                    minItems: 1
                     type: array
                     x-kubernetes-validations:
                     - message: 'authConsumers: "*" means "no authentication on this
@@ -183,8 +183,6 @@ spec:
                       missing default Secret fails the sync rather than quietly publishing a route that will
                       401 on its first real request.
                     type: string
-                required:
-                - authConsumers
                 type: object
               members:
                 description: 'Members: one entry per hardware type, each pointing

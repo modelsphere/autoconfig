@@ -329,7 +329,7 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 |---|---|---|
 | `Ingress`(每 fleet 一条) | 匹配 model-router 写的 `x-higress-llm-model` 头;**不配 rewrite-path** | 路由不生效 / 所有成员被钉死在同一路径 |
 | `ai-backend-router` | `trafficPolicy` → 决策表(backend id、path、tier、weight) | 没有后端表,无法分流 |
-| `key-auth` | 把本路由加进 allow 名单(**key 不经本 CR**,consumer 定义仍在网关 chart) | **路由变成开放的**(网关 `global_auth: false`,没有规则 = 不鉴权,不是 403) |
+| `key-auth` | 本路由的 allow 名单(**key 不经本 CR**,consumer 定义仍在网关 chart);空名单 = `allow: []` = 403 | **路由变成开放的**(网关 `global_auth: false`,没有规则 = 插件不跑,不是 403) |
 | `ai-proxy` | 网关给 openresty 的 key(从 Secret 读) | 401 |
 | `ai-statistics` | 把本路由加进列表 | 没有 token 指标 |
 
@@ -337,9 +337,10 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 反过来写,插件中途失败就会留下一条**已经可达、但 key-auth 规则没写进去**的路由:不带 key 也返 200,
 而现场只有 CR 上一个 `GatewaySynced=False`。规则里引用一条还不存在的 Ingress 是惰性的,所以这个顺序自己不开窗口。
 
-**`authConsumers` 是必填的**,因为网关跑在 `global_auth: false` 下:一条没有 key-auth 规则的路由
-不是被拒,而是**开放的**。空名单于是等于「发布一条公开路由并报告同步正常」—— 正是上面那个写入顺序
-要避免的结果。要公开路由就显式写 `authConsumers: ["*"]`:它同样不写规则,但这句话是人写下来的。
+**不填 `authConsumers` = 谁都不许调**,渲染成 `allow: []`,插件读作「nobody is allowed」回 403。
+这和「不写规则」是两件不同的事,而不是同一件事的两种值:网关跑在 `global_auth: false` 下,
+一条**没有 key-auth 规则**的路由不是被拒而是**开放的**(插件对它根本不跑)。所以漏填一个字段
+绝不能成为公开路由的来路 —— 要公开就显式写 `authConsumers: ["*"]`,只有它不写规则。
 
 **`authConsumers` 的名字在发布前对着 key-auth 的 `defaultConfig.consumers` 校验**。
 名字写错插件不会报错,只会对所有调用方回 403,而 CR 显示同步正常 —— 以前这是网关 chart 在渲染时拦下的,

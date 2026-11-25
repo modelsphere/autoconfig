@@ -274,8 +274,15 @@ type KeyAuthAllow struct {
 }
 
 // RenderKeyAuth builds the allow-list for one fleet's route.
+//
+// An empty list renders `allow: []`, which the plugin reads as "nobody is allowed" and
+// answers with 403 — NOT the same as writing no rule at all, which on a gateway with
+// global_auth=false leaves the route open. The slice is therefore never nil: `allow: null`
+// fails the plugin's array parse, and a rule the plugin could not parse is a rule that does
+// not deny anyone.
 func RenderKeyAuth(consumers []string) *KeyAuthAllow {
-	out := append([]string(nil), consumers...)
+	out := make([]string, 0, len(consumers))
+	out = append(out, consumers...)
 	sort.Strings(out)
 	return &KeyAuthAllow{Allow: out}
 }

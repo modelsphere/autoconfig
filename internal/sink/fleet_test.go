@@ -188,9 +188,24 @@ func TestRenderAIProxyRejectsEmptyToken(t *testing.T) {
 }
 
 func TestRenderKeyAuthSorts(t *testing.T) {
-	got := RenderKeyAuth([]string{"ops", "tenant-a"})
+	got := RenderKeyAuth([]string{"tenant-a", "ops"})
 	if got.Allow[0] != "ops" || got.Allow[1] != "tenant-a" {
 		t.Fatalf("allow = %v", got.Allow)
+	}
+}
+
+// An empty allow-list has to serialise as [] and never as null. The plugin reads an empty
+// array as "nobody is allowed" and answers 403, which is what an omitted allow-list must
+// mean; `allow: null` fails its array parse, and a rule it could not parse denies nobody.
+func TestRenderKeyAuthEmptyIsAnEmptyArrayNotNull(t *testing.T) {
+	for _, in := range [][]string{nil, {}} {
+		b, err := json.Marshal(RenderKeyAuth(in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != `{"allow":[]}` {
+			t.Fatalf("RenderKeyAuth(%v) = %s, want {\"allow\":[]}", in, b)
+		}
 	}
 }
 
