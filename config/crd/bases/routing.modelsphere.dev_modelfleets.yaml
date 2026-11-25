@@ -66,8 +66,6 @@ spec:
               unusable, so a dangling name is a hole in the one path that is supposed to have no holes.
               Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
               setting that will never take effect.
-              A plugin this controller renders itself cannot also be passed through: one rule, two
-              writers, and the passed-through one would be overwritten on the next reconcile.
             properties:
               defaultMember:
                 description: |-
@@ -127,7 +125,12 @@ spec:
                       because the two writers would fight over one rule: the backend router's table is
                       computed from live ModelRoute state, key-auth's allow-list is cross-checked against the
                       gateway's consumers, and ai-proxy's credential is resolved from a Secret so it never
-                      lands in this object.
+                      lands in this object. That is refused at reconcile time (GatewaySynced=False, nothing
+                      written) rather than by a CEL rule on this field, because a CEL rule on it cannot exist:
+                      the API server drops a map whose values carry x-kubernetes-preserve-unknown-fields from
+                      the CEL type system, so `self.gateway.extraPlugins` is an undefined field and the whole
+                      CRD is rejected at install time. Verbatim passthrough and API-server-side key validation
+                      cannot both be had on one field.
 
                       ⚠ The content is NOT validated: plugin config is checked at the gateway, not by the API
                       server, so a wrong field here applies cleanly and then fails when the gateway loads the
@@ -349,11 +352,6 @@ spec:
             - message: trafficPolicy.stickiness is not supported by ai-backend-router
                 yet; it would be silently ignored, so it is refused here
               rule: '!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)'
-            - message: 'gateway.extraPlugins cannot carry ai-backend-router, key-auth
-                or ai-proxy: this controller renders those itself from members, authConsumers
-                and upstreamAuthSecretRef'
-              rule: '!has(self.gateway) || !has(self.gateway.extraPlugins) || self.gateway.extraPlugins.all(k,
-                !(k in [''ai-backend-router'',''key-auth'',''ai-proxy'']))'
           status:
             description: ModelFleetStatus is written only by this controller, through
               the status subresource.

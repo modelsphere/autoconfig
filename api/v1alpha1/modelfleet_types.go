@@ -171,7 +171,12 @@ type GatewaySpec struct {
 	// because the two writers would fight over one rule: the backend router's table is
 	// computed from live ModelRoute state, key-auth's allow-list is cross-checked against the
 	// gateway's consumers, and ai-proxy's credential is resolved from a Secret so it never
-	// lands in this object.
+	// lands in this object. That is refused at reconcile time (GatewaySynced=False, nothing
+	// written) rather than by a CEL rule on this field, because a CEL rule on it cannot exist:
+	// the API server drops a map whose values carry x-kubernetes-preserve-unknown-fields from
+	// the CEL type system, so `self.gateway.extraPlugins` is an undefined field and the whole
+	// CRD is rejected at install time. Verbatim passthrough and API-server-side key validation
+	// cannot both be had on one field.
 	//
 	// ⚠ The content is NOT validated: plugin config is checked at the gateway, not by the API
 	// server, so a wrong field here applies cleanly and then fails when the gateway loads the
@@ -229,9 +234,6 @@ type GatewaySpec struct {
 // Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
 // setting that will never take effect.
 // +kubebuilder:validation:XValidation:rule="!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)",message="trafficPolicy.stickiness is not supported by ai-backend-router yet; it would be silently ignored, so it is refused here"
-// A plugin this controller renders itself cannot also be passed through: one rule, two
-// writers, and the passed-through one would be overwritten on the next reconcile.
-// +kubebuilder:validation:XValidation:rule="!has(self.gateway) || !has(self.gateway.extraPlugins) || self.gateway.extraPlugins.all(k, !(k in ['ai-backend-router','key-auth','ai-proxy']))",message="gateway.extraPlugins cannot carry ai-backend-router, key-auth or ai-proxy: this controller renders those itself from members, authConsumers and upstreamAuthSecretRef"
 type ModelFleetSpec struct {
 	// ModelName is what the client sends as body.model, and what model-router copies into the
 	// x-higress-llm-model header the Ingress matches on. Defaults to metadata.name.

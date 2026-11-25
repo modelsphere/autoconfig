@@ -502,6 +502,7 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	written := make([]string, 0, len(names))
 	for _, name := range names {
 		if rendered[name] {
 			errs = append(errs, fmt.Sprintf("%s: rendered by this controller, cannot be passed through", name))
@@ -524,14 +525,22 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 		// the route goes live without something it was told to have.
 		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: name}, raw); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+			continue
 		}
+		written = append(written, name)
 	}
-	rend.appliedExtras = names
+	// Only the keys whose rules are actually on the gateway: status.appliedExtraPlugins is
+	// what the next round withdraws from, so recording a key we refused or failed to write
+	// would make a later reconcile withdraw a rule it never wrote.
+	rend.appliedExtras = written
 
 	// Keys that were in the spec last time and are not now: we wrote those rules, so we take
 	// them back. Nothing else will - the reconciler only ever sees the current spec, so a
 	// removed rate-limit entry would keep being enforced on a live route with nothing in the
 	// CR to say so.
+	// Keyed on what the spec asks for, not on what was written: a key whose write failed this
+	// round is still wanted, and withdrawing it over a transient error would take a live rule
+	// off the route on the way to retrying it.
 	desired := map[string]bool{}
 	for _, n := range names {
 		desired[n] = true
