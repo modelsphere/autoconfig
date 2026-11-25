@@ -275,6 +275,90 @@ spec:
 ② `nginx.peers` 用了 `cart` 必须配 `spec.cart`;③ `cart` 用 `maxConcurrencyFromBackend` 必须给
 `backend` 组配 `maxConcurrency>0`。
 
+## ModelFleet CRD
+
+**一个模型跑在多类算力上,对外只有一个模型名和一个地址。** `ModelRoute` 的粒度天生是
+「一个模型 + 一桶同质后端」—— 一类硬件一条。`ModelFleet` 是它之上的聚合层:把若干条
+`ModelRoute` 聚成一个对外模型,在**网关**上做统一入口与按权重/优先级分流。
+openresty、CART、引擎都不动,swiss 的创建流程也不变。
+
+```yaml
+apiVersion: routing.modelsphere.dev/v1alpha1
+kind: ModelFleet
+metadata: {name: glm-5.3, namespace: llm-route}
+spec:
+  modelName: glm-5.3            # 客户端 body.model
+  defaultMember: h100           # 没有成员可选时的落点(插件必填)
+  gateway:
+    namespace: higress-system   # WasmPlugin 所在 ns
+    service: openresty:8080     # Ingress 的后端;成员靠【路径】区分
+    externalURL: http://<gw>:31080        # 发布成 status.endpoint + /v1
+    authConsumers: [ops]                  # key-auth 本路由的 allow 名单
+    upstreamAuthSecretRef: openresty-keys:gateway   # 网关给 openresty 的 key(读 Secret)
+  members:                      # 成员【引用】ModelRoute,不重抄地址
+  - name: h100                  # = 决策表 backend id = 网关指标标签,改名等于删了重建
+    hardware: {vendor: nvidia, model: H100, replicas: 2}
+    backend: {modelRouteRef: glm-53-h100}           # 路径前缀从 ModelRoute 的 nginx.route 读
+    capabilities: {maxContextTokens: 131072, maxConcurrency: 16}
+  - name: ascend
+    hardware: {vendor: huawei, model: 910B4, replicas: 1}
+    backend: {modelRouteRef: glm-53-ascend}
+  trafficPolicy:                # decision-gen 写这一段
+    revision: 42                # 仅审计标签;收敛判定用 generation/observedGeneration
+    members:                    # tier 小的优先;weight 同 tier 内相对值,0 = 摘掉
+    - {name: h100,   tier: 0, weight: 8000}
+    - {name: ascend, tier: 0, weight: 2000}
+```
+
+**三方写同一个对象,各占一棵互不相交的子树**,靠 Server-Side Apply + 各自的 fieldManager:
+
+| 字段 | 写入方 | 读取方 |
+|---|---|---|
+| `modelName` / `gateway` / `defaultMember` / `members[]` | console | reconciler、decision-gen |
+| `trafficPolicy` | decision-gen | reconciler、console(展示意图值) |
+| `status.*` | 本 controller(status 子资源) | console、decision-gen |
+
+⚠️ **必须 `kubectl apply --server-side --field-manager=<你自己的名字>`**。
+client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种都会把对方的字段整段抹掉
+且不报错(helm 把 CART 的 live 调优写回底稿就是这么丢的)。
+
+**reconciler 在网关上改这四个对象**(每个 fleet 一条规则,绑在自己那条 Ingress 上):
+
+| 网关对象 | 写什么 | 漏了会怎样 |
+|---|---|---|
+| `Ingress`(每 fleet 一条) | 匹配 model-router 写的 `x-higress-llm-model` 头;**不配 rewrite-path** | 路由不生效 / 所有成员被钉死在同一路径 |
+| `ai-backend-router` | `trafficPolicy` → 决策表(backend id、path、tier、weight) | 没有后端表,无法分流 |
+| `key-auth` | 把本路由加进 allow 名单(**key 不经本 CR**,consumer 定义仍在网关 chart) | 403 |
+| `ai-proxy` | 网关给 openresty 的 key(从 Secret 读) | 401 |
+| `ai-statistics` | 把本路由加进列表 | 没有 token 指标 |
+
+除 `ai-backend-router` 外三个都是 optional:插件没部署只跳过,不拖垮整次同步;
+`ai-backend-router` 缺了则 `GatewaySynced=False` —— 没有它就没有分流,不该静默只服务一个成员。
+
+**几个容易想当然的点**:
+
+- **权重按 tier 在「真正 ready 的成员」之间重新归一**,用最大余数法,每个 tier 恰好合计 10000。
+  成员挂了它那份要**重新分配**,不能扣进黑洞;decision-gen 必须读 `status.members[].effectiveWeight`
+  而不是自己上次写的值,否则是拿没发生过的流量算下一轮。
+- **不 ready 的成员整条不进表**,而不是进表带 weight 0 —— weight 0 仍是合法的溢出落点,
+  往一个没有后端的成员溢出,会把「降级」变成「故障」。**唯一例外是 `defaultMember`**:
+  插件按 id 在表里解析 `default`,它不在表里就成了网关错误。
+- **把权重全设 0 不等于停服**,等于「全压到 defaultMember」。停服是摘成员或下线路由。
+- **`matchRules` 在 WasmPlugin CRD 里是裸数组、没有 listType** → SSA 下是 atomic,
+  apply 会整份替换、把网关 chart 写的规则全抹掉。所以这四个对象走 read-modify-write、
+  按「规则绑的是哪条 Ingress」认自己那条,**内容没变就不写**(每次写都是一次全数据面的配置下发)。
+- **孤儿引用只报不拒**:`trafficPolicy` 里引用了已被 console 删掉的成员,记在 `PolicyApplied`
+  condition 上并忽略该条,不拒收整份策略 —— 拒了就是 console 的删除和 decision-gen 的旧策略互锁。
+- **`stickiness` 在 apply 时直接拒**:ai-backend-router 目前只有 WeightedRandom、没有 hash picker,
+  收下它等于配了个永远不生效的开关。
+- `capabilities` 的两个字段目前都是**保留字段**:并发准入在 openresty 不在网关,
+  按上下文长度准入插件没有落点。只用于展示与 `status.totalCapacity` 求和。
+
+**CRD 装在 chart 的 `crds/` 目录,而 `helm upgrade` 不会更新它** —— 以后给 ModelFleet 加字段,
+升级 autoconfig 不生效,必须单独 `kubectl apply --server-side -f` 那份 CRD。
+
+端到端验证脚本(测试集群 k8s-cpu-16)见 `tools/modelfleet/e2e_cpu16.sh`(在 vllm 仓)。
+
 ## 消费方接入
 
 autoconfig 只负责把配置**写进已有的 ConfigMap**(不创建 chart、不创建 ConfigMap);消费方各自 chart 建初始
