@@ -639,7 +639,10 @@ func TestFleetUpstreamKeyMustNotBeAConsumerCredential(t *testing.T) {
 }
 
 // The upstream credential defaults to where that key already lives on these clusters, so a
-// fleet does not have to restate one cluster-wide fact.
+// fleet does not have to restate one cluster-wide fact. That file is openresty's own, and its
+// format is "key[:owner]" - sending the file's bytes as the bearer token sends "sk-...:admin",
+// which openresty refuses with 401 on every request while the sync still reports success.
+// Measured on a test cluster, where the key in the file was the right one and still 401'd.
 func TestFleetUpstreamKeyDefaultsToOpenrestySecret(t *testing.T) {
 	f := fleetFixture()
 	f.Spec.Gateway.UpstreamAuthSecretRef = "" // not stated
@@ -650,7 +653,8 @@ func TestFleetUpstreamKeyDefaultsToOpenrestySecret(t *testing.T) {
 		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "openresty-api-keys", Namespace: "llm-route"},
-			Data:       map[string][]byte{"keys": []byte("sk-default\n")},
+			// The real shape of that file on these clusters, owner label and all.
+			Data: map[string][]byte{"keys": []byte("sk-default:admin\n")},
 		},
 	)
 	reconcileFleet(t, r)
@@ -658,7 +662,31 @@ func TestFleetUpstreamKeyDefaultsToOpenrestySecret(t *testing.T) {
 	rule := getPlugin(t, c, "ai-proxy")[0].(map[string]any)
 	tokens, _, _ := unstructured.NestedStringSlice(rule, "config", "provider", "apiTokens")
 	if len(tokens) != 1 || tokens[0] != "sk-default" {
-		t.Fatalf("apiTokens = %v, want the default secret's key", tokens)
+		t.Fatalf("apiTokens = %v, want the key alone, without the owner label", tokens)
+	}
+}
+
+// The file holds several keys while one is being rotated out, and openresty accepts all of
+// them, so any single one is a working credential.
+func TestFirstOpenrestyAPIKey(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"sk-one:admin", "sk-one"},
+		{"sk-one", "sk-one"},                      // no owner label
+		{" sk-one:admin , sk-two:ops ", "sk-one"}, // rotation in progress
+		{",,sk-two:ops", "sk-two"},                // empty entries skipped
+		{"sk-one:", "sk-one"},                     // colon, no owner
+	} {
+		got, err := firstOpenrestyAPIKey(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("firstOpenrestyAPIKey(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+	// Nothing usable must be an error, not an empty token: an empty bearer is a 401 on every
+	// request, reported as a healthy sync.
+	for _, in := range []string{"", "   ", ",,", ":nobody"} {
+		if got, err := firstOpenrestyAPIKey(in); err == nil {
+			t.Errorf("firstOpenrestyAPIKey(%q) = %q, want an error", in, got)
+		}
 	}
 }
 

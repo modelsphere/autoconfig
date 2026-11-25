@@ -274,12 +274,47 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 			}
 			return nil, err
 		}
+		if defaulted {
+			// That Secret is openresty's own key file, and its format is
+			// "key[:owner][,key[:owner]...]" - not a bare token. Sending the file's contents
+			// as the bearer token means sending "sk-...:admin", which openresty rejects with
+			// 401 on every request while this reconcile reports a healthy sync. Measured on a
+			// test cluster: the gateway presented exactly the bytes in openresty's own key
+			// file and openresty refused them.
+			//
+			// Only for the defaulted ref. An explicitly named Secret was made for this
+			// purpose and holds the token verbatim, and guessing at the format of a
+			// credential someone handed us is worse than using it as given.
+			if key, err = firstOpenrestyAPIKey(key); err != nil {
+				return nil, fmt.Errorf("%s: %w", ref, err)
+			}
+		}
 		rend.upstreamKey = key
 	}
 	if err := r.checkAuth(ctx, fleet, rend); err != nil {
 		return nil, err
 	}
 	return rend, nil
+}
+
+// firstOpenrestyAPIKey takes the first key out of openresty's api-keys file, whose format is
+// "key[:owner][,key[:owner]...]" - the same parse openresty itself does, so a file it accepts
+// is a file this understands. Any listed key is accepted upstream (that is what makes
+// rotation possible), so the first one is as good as any.
+func firstOpenrestyAPIKey(spec string) (string, error) {
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if i := strings.Index(item, ":"); i >= 0 {
+			item = strings.TrimSpace(item[:i]) // "key:owner" - the owner is a label, not part of the key
+		}
+		if item != "" {
+			return item, nil
+		}
+	}
+	return "", fmt.Errorf("no api key in the openresty key file (expected \"key[:owner][,...]\")")
 }
 
 // checkAuth validates this fleet's auth settings against the gateway's own key-auth config,
