@@ -379,6 +379,18 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 			policy[pm.Name] = pm
 		}
 	}
+	// No policy yet: every member shares tier 0 evenly. A fleet is a set of services someone
+	// put behind one name because they all serve that model, so the honest reading of "no
+	// decision has been made" is "use them all", not "use one and leave the rest idle until
+	// decision-gen says otherwise" - the latter means a console that adds hardware sees
+	// nothing happen. The split is over READY members (EffectiveWeights drops the rest), so a
+	// member that is not up yet does not hold back a share.
+	//
+	// A policy that exists is obeyed exactly as written, including the members it leaves out:
+	// once something has decided a split, omission is part of that decision. An explicit
+	// all-zero policy therefore still means "everything to the default member", which is the
+	// one way to drain a fleet without deleting it.
+	undecided := len(policy) == 0
 	declared := map[string]bool{}
 
 	for _, m := range fleet.Spec.Members {
@@ -386,6 +398,10 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		view := sink.FleetMemberView{Name: m.Name}
 		if pm, ok := policy[m.Name]; ok {
 			view.Tier, view.Weight = pm.Tier, pm.Weight
+		} else if undecided {
+			// Equal relative weights; EffectiveWeights renormalises the tier to exactly
+			// 10000, so three members come out 3334/3333/3333 rather than drifting.
+			view.Weight = 1
 		}
 		if m.Capabilities != nil {
 			view.MaxConcurrency = m.Capabilities.MaxConcurrency

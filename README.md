@@ -304,7 +304,7 @@ spec:
   - name: ascend
     hardware: {vendor: huawei, model: 910B4, replicas: 1}
     backend: {modelRouteRef: glm-53-ascend}
-  trafficPolicy:                # decision-gen 写这一段
+  trafficPolicy:                # decision-gen 写这一段;整段省略 = 成员间平均分
     revision: 42                # 仅审计标签;收敛判定用 generation/observedGeneration
     members:                    # tier 小的优先;weight 同 tier 内相对值,0 = 摘掉
     - {name: h100,   tier: 0, weight: 8000}
@@ -393,8 +393,15 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
 
 **几个容易想当然的点**:
 
+- **没写 `trafficPolicy` = 成员间平均分**,不是「全压给 `defaultMember`」。fleet 是有人把
+  一组都在服务同一个模型的服务放到一个名字后面,所以「还没人决定怎么分」的诚实读法是「都用上」。
+  否则给 fleet 加一块硬件在 console 上什么都不会发生:新成员显示 Ready 却一直闲着,
+  要等 decision-gen 开口。**一旦写了 policy 就完全照写的来**,包括它没列的成员 —— 那时
+  「没列」本身就是决策的一部分。
+- **把权重全设 0 不等于停服**,等于「全压到 `defaultMember`」—— 这是把一个 fleet 排空而不删对象的
+  唯一办法,所以它必须和「没有 policy」区分开,不能被当成「还没决定」而改成平均分。
 - **`status.effectiveWeight` 报的是「实际在生效的占比」,不等于决策表里的 weight**。
-  没写 trafficPolicy(或把所有权重都置 0)时,表里全是 0、靠 `defaultMember` 兜底转发,
+  权重被显式全置 0 时,表里全是 0、靠 `defaultMember` 兜底转发,
   但那个成员实际吃掉 100% 流量 —— status 这时报 10000,不报 0。报 0 会让 decision-gen
   拿一个「看起来闲着、实际扛着全部流量」的成员去算下一轮。
 - **权重按 tier 在「真正 ready 的成员」之间重新归一**,用最大余数法,每个 tier 恰好合计 10000。
@@ -403,7 +410,6 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
 - **不 ready 的成员整条不进表**,而不是进表带 weight 0 —— weight 0 仍是合法的溢出落点,
   往一个没有后端的成员溢出,会把「降级」变成「故障」。**唯一例外是 `defaultMember`**:
   插件按 id 在表里解析 `default`,它不在表里就成了网关错误。
-- **把权重全设 0 不等于停服**,等于「全压到 defaultMember」。停服是摘成员或下线路由。
 - **`matchRules` 在 WasmPlugin CRD 里是裸数组、没有 listType** → SSA 下是 atomic,
   apply 会整份替换、把网关 chart 写的规则全抹掉。所以这四个对象走 read-modify-write、
   按「规则绑的是哪条 Ingress」认自己那条,**内容没变就不写**(每次写都是一次全数据面的配置下发)。

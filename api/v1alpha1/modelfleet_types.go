@@ -137,9 +137,18 @@ type TrafficPolicy struct {
 	// Stickiness: reserved, refused at apply time today (see the type's note).
 	// +optional
 	Stickiness *Stickiness `json:"stickiness,omitempty"`
-	// Members: the per-member split. A member with no entry here is served with weight 0 in
-	// tier 0, i.e. reachable only as the default member — writing no policy at all must not
-	// silently spray traffic across hardware nobody has measured.
+	// Members: the per-member split.
+	//
+	// With NO trafficPolicy at all (or none of its members listed), every member shares tier 0
+	// evenly: a fleet is a set of services someone put behind one name because they all serve
+	// that model, so "nothing has decided a split yet" reads as "use them all". Leaving it on
+	// the default member instead would mean adding hardware to a fleet does nothing visible
+	// until decision-gen speaks, with the new member idle and reporting Ready.
+	//
+	// Once a policy IS written it is obeyed as written, including the members it leaves out:
+	// omission is then part of the decision, and an entry at weight 0 takes that member out
+	// of rotation. An all-zero policy therefore still sends everything to the default member,
+	// which is how a fleet is drained without being deleted.
 	// +optional
 	// +listType=map
 	// +listMapKey=name

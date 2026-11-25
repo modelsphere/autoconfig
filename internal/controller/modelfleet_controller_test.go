@@ -960,6 +960,101 @@ func TestFleetStatusCountsItsMembers(t *testing.T) {
 	}
 }
 
+// A fleet with no traffic policy yet must use all of its members, split evenly. Leaving
+// everything on the default member would mean a console that adds hardware to a fleet sees
+// nothing happen until decision-gen writes a split - and the added member sits idle while
+// reporting Ready. Nothing covered this branch before: every fixture here has a policy.
+func TestFleetWithNoPolicySplitsEvenly(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.TrafficPolicy = nil
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	got := map[string]int64{}
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	for _, b := range backends {
+		m := b.(map[string]any)
+		id, _, _ := unstructured.NestedString(m, "id")
+		w, _, _ := unstructured.NestedInt64(m, "weight")
+		tier, _, _ := unstructured.NestedInt64(m, "tier")
+		if tier != 0 {
+			t.Fatalf("member %s landed in tier %d with no policy", id, tier)
+		}
+		got[id] = w
+	}
+	if len(got) != 2 {
+		t.Fatalf("backends = %v, want both members", got)
+	}
+	if got["h100"] != 5000 || got["ascend"] != 5000 {
+		t.Fatalf("weights = %v, want an even split", got)
+	}
+
+	// ...and status says the same thing, so the console is not told something else.
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	for _, m := range fleet.Status.Members {
+		if m.EffectiveWeight != 5000 {
+			t.Fatalf("status member %s effectiveWeight = %d, want 5000", m.Name, m.EffectiveWeight)
+		}
+	}
+}
+
+// The even split is over members that can actually serve. A member that is not up yet must
+// not hold a share that goes nowhere.
+func TestFleetWithNoPolicySplitsOverReadyMembersOnly(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.TrafficPolicy = nil
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 0, false), // not up
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	if len(backends) != 1 {
+		t.Fatalf("backends = %v, want only the ready member", backends)
+	}
+	m := backends[0].(map[string]any)
+	id, _, _ := unstructured.NestedString(m, "id")
+	w, _, _ := unstructured.NestedInt64(m, "weight")
+	if id != "h100" || w != 10000 {
+		t.Fatalf("backend = %s at %d, want h100 at 10000", id, w)
+	}
+}
+
+// An all-zero policy is a decision, not an absence: it means "drain this fleet onto its
+// default member", which is the only way to take every member out of rotation without
+// deleting the object. It must NOT be mistaken for "no policy" and turned into an even split.
+func TestFleetExplicitlyZeroedPolicyIsNotAnEvenSplit(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.TrafficPolicy.Members = []routingv1.PolicyMember{
+		{Name: "h100", Tier: 0, Weight: 0},
+		{Name: "ascend", Tier: 0, Weight: 0},
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	if len(backends) != 1 {
+		t.Fatalf("backends = %v, want only the default member", backends)
+	}
+	if id, _, _ := unstructured.NestedString(backends[0].(map[string]any), "id"); id != "h100" {
+		t.Fatalf("backend = %s, want the default member h100", id)
+	}
+}
+
 func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 	t.Helper()
 	o := &unstructured.Unstructured{}
