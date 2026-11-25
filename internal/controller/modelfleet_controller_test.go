@@ -187,7 +187,7 @@ func TestFleetReconcileMemberUnready(t *testing.T) {
 		fleetFixture(),
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 0, false),
-		wasmPlugin("ai-backend-router"),
+		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
 	)
 	reconcileFleet(t, r)
 
@@ -279,7 +279,7 @@ func TestFleetReconcileOrphanPolicyMemberIsReportedNotFatal(t *testing.T) {
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router"),
+		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
 	)
 	reconcileFleet(t, r)
 
@@ -300,7 +300,7 @@ func TestFleetReconcileMissingModelRoute(t *testing.T) {
 	r, c := newFleetReconciler(t,
 		fleetFixture(),
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
-		wasmPlugin("ai-backend-router"),
+		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
 	)
 	reconcileFleet(t, r)
 
@@ -358,20 +358,62 @@ func TestFleetUpstreamKeyFromSecret(t *testing.T) {
 	}
 }
 
-// An optional plugin that is not deployed must not stop the rest from being programmed.
-func TestFleetMissingOptionalPluginIsNotFatal(t *testing.T) {
-	r, c := newFleetReconciler(t,
-		fleetFixture(),
+// A plugin this cluster does not use, that we had nothing to write to anyway, must not stop
+// the rest from being programmed.
+func TestFleetMissingPluginWithNothingToWriteIsNotFatal(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.AuthConsumers = nil // nothing to put in an allow-list
+	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router"), // no key-auth / ai-statistics in this cluster
+		wasmPlugin("ai-backend-router"), // no key-auth / ai-proxy / ai-statistics here
 	)
 	reconcileFleet(t, r)
 
 	var fleet routingv1.ModelFleet
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
-		t.Fatalf("missing optional plugin failed the sync: %+v", fleet.Status.Conditions)
+		t.Fatalf("missing unused plugin failed the sync: %+v", fleet.Status.Conditions)
+	}
+}
+
+// ...but a fleet that ASKED for an allow-list and found no key-auth must fail the sync.
+// Skipping it silently would publish an unauthenticated route, which is the one outcome
+// nobody would notice until it mattered.
+func TestFleetRequestedAuthWithoutKeyAuthPluginFailsSync(t *testing.T) {
+	r, c := newFleetReconciler(t,
+		fleetFixture(), // AuthConsumers: [ops]
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), // key-auth absent
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("authConsumers requested but key-auth missing, and the sync reported success")
+	}
+	if condTrue(fleet.Status.Conditions, condReady) {
+		t.Fatal("fleet Ready with an allow-list that was never programmed")
+	}
+}
+
+// ai-statistics is the one plugin whose absence is only a loss of metrics, so it stays
+// tolerated even though we had a rule to write.
+func TestFleetMissingStatisticsPluginIsNotFatal(t *testing.T) {
+	r, c := newFleetReconciler(t,
+		fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"), // no ai-statistics
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("missing ai-statistics failed the sync: %+v", fleet.Status.Conditions)
 	}
 }
 

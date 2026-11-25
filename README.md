@@ -332,8 +332,11 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 | `ai-proxy` | 网关给 openresty 的 key(从 Secret 读) | 401 |
 | `ai-statistics` | 把本路由加进列表 | 没有 token 指标 |
 
-除 `ai-backend-router` 外三个都是 optional:插件没部署只跳过,不拖垮整次同步;
-`ai-backend-router` 缺了则 `GatewaySynced=False` —— 没有它就没有分流,不该静默只服务一个成员。
+**插件不存在时的分寸**:有东西要写却写不进去,就是失败 —— `ai-backend-router` 缺了没有分流,
+`key-auth` 缺了而 fleet 配了 `authConsumers` 就是**一条不鉴权的路由**,`ai-proxy` 缺了而配了
+`upstreamAuthSecretRef` 则是必然 401。三者都置 `GatewaySynced=False`。
+**本来就没东西要写**(没配 `authConsumers` / 没配 `upstreamAuthSecretRef`)则跳过,
+那只是这个集群没用这个插件。`ai-statistics` 是唯一的例外,缺了只丢指标,一律跳过。
 
 **几个容易想当然的点**:
 

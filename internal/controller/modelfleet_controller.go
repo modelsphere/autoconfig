@@ -67,7 +67,14 @@ var wasmPluginGVK = schema.GroupVersionKind{
 type fleetPlugin struct {
 	// name of the WasmPlugin object in the gateway namespace.
 	name string
-	// optional: a missing WasmPlugin is reported, not fatal, when the plugin is not deployed.
+	// optional: a missing WasmPlugin is never fatal, even when we had a rule to write. Only
+	// true for plugins whose absence costs nothing but observability.
+	//
+	// For every other plugin a missing object is fatal IF we had something to write: a fleet
+	// that asked for an allow-list and got no key-auth is an unauthenticated route, and a
+	// fleet that asked for an upstream credential and got no ai-proxy is a route that 401s.
+	// Both are worse as a silent skip than as a failed sync. Having nothing to write is
+	// different, and stays tolerated — that is just a plugin this cluster does not use.
 	optional bool
 	// config renders this plugin's per-route config; returning nil means "no rule for this
 	// fleet", which removes any rule we previously wrote.
@@ -294,9 +301,9 @@ func fleetPlugins() []fleetPlugin {
 			return sink.RenderDecisionTable(f.modelName, f.fleet.Spec.DefaultMember, f.members, rev)
 		},
 	}, {
-		// Without a rule here the route is not in any consumer's allow-list: 403.
-		name:     "key-auth",
-		optional: true,
+		// Without a rule here the route is not in any consumer's allow-list: 403. Missing
+		// plugin + a requested allow-list = an unauthenticated route, so that fails the sync.
+		name: "key-auth",
 		config: func(f *fleetRender) (any, error) {
 			if len(f.fleet.Spec.Gateway.AuthConsumers) == 0 {
 				return nil, nil
@@ -305,8 +312,7 @@ func fleetPlugins() []fleetPlugin {
 		},
 	}, {
 		// Without a rule here the gateway presents no credential to openresty: 401.
-		name:     "ai-proxy",
-		optional: true,
+		name: "ai-proxy",
 		config: func(f *fleetRender) (any, error) {
 			if f.upstreamKey == "" {
 				return nil, nil
@@ -340,7 +346,7 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 			}
 		}
 		if err := r.upsertMatchRule(ctx, rend, p, raw); err != nil {
-			if apierrors.IsNotFound(err) && p.optional {
+			if apierrors.IsNotFound(err) && (p.optional || raw == nil) {
 				continue
 			}
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
