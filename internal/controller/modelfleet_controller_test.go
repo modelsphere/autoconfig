@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"strings"
 	"testing"
 
@@ -510,6 +514,150 @@ func TestTwoFleetsSharingAPluginSettle(t *testing.T) {
 	}
 	if after := resourceVersionOf(t, c, "ai-statistics"); after != rv {
 		t.Fatalf("ai-statistics rewritten on resync with nothing changed: %s -> %s", rv, after)
+	}
+}
+
+// ai-proxy carries the upstream credential, resolved from a Secret precisely so it never
+// lands in the CR. Passing it through extraPlugins would put a credential in plaintext in the
+// object AND leave the Secret-derived one unprogrammed, with a healthy-looking sync. There is
+// no CEL rule to fall back on, so this refusal is the only guard - and it was briefly lost
+// when the overridable set was derived from "has no tolerateMissing" instead of being stated.
+func TestFleetExtraPluginCannotOverrideAIProxy(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "gw-upstream:token"
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"ai-proxy": rawJSON(t, map[string]any{
+			"provider": map[string]any{"type": "openai", "apiTokens": []any{"sk-from-the-cr"}},
+		}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "gw-upstream", Namespace: "llm-route"},
+			Data:       map[string][]byte{"token": []byte("sk-from-the-secret")},
+		},
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("extraPlugins was allowed to supply the upstream credential")
+	}
+	// ...and the credential actually programmed is still the Secret's, not the CR's.
+	rule := getPlugin(t, c, "ai-proxy")[0].(map[string]any)
+	tokens, _, _ := unstructured.NestedStringSlice(rule, "config", "provider", "apiTokens")
+	if len(tokens) != 1 || tokens[0] != "sk-from-the-secret" {
+		t.Fatalf("apiTokens = %v, want the Secret's credential", tokens)
+	}
+}
+
+// status.appliedExtraPlugins is written on the failure paths too, so it must say what is
+// believed to be ON the gateway, not what this round managed to write. Forgetting a live rule
+// means a later key removal never withdraws it, and the rule keeps being enforced on a live
+// route with nothing in the CR to say so.
+func TestFleetAppliedExtraPluginsSurvivesAFailedRound(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"cluster-key-rate-limit": rawJSON(t, map[string]any{"rule_name": "x"}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("cluster-key-rate-limit"),
+	)
+	reconcileFleet(t, r)
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), nn, &fleet)
+	if len(fleet.Status.AppliedExtraPlugins) != 1 {
+		t.Fatalf("precondition: %v", fleet.Status.AppliedExtraPlugins)
+	}
+
+	// A round that fails to reach the plugin, with the rule still on the gateway. Deleting
+	// the WasmPlugin stands in for any write error: the Get fails, the key is not written.
+	pl := &unstructured.Unstructured{}
+	pl.SetGroupVersionKind(wasmPluginGVK)
+	pl.SetNamespace("higress-system")
+	pl.SetName("cluster-key-rate-limit")
+	if err := c.Delete(context.Background(), pl); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: nn}) // expected to fail
+	_ = c.Get(context.Background(), nn, &fleet)
+	if len(fleet.Status.AppliedExtraPlugins) != 1 {
+		t.Fatalf("a failed round forgot a live rule: %v", fleet.Status.AppliedExtraPlugins)
+	}
+}
+
+// A cluster with no Higress has no extensions.higress.io CRD at all, and then a Get on a
+// WasmPlugin fails with *meta.NoKindMatchError rather than a NotFound - a different type
+// entirely, which apierrors.IsNotFound does not recognise. The reachable consequence is
+// deletion: the finalizer withdraws this fleet's rules and treats "not there" as done, so
+// classifying that error as a real failure leaves the object stuck Terminating forever, with
+// no way out but patching the finalizer off by hand. Uninstalling Higress from a cluster that
+// still has fleets is enough to get there.
+func TestIsAbsent(t *testing.T) {
+	notFound := apierrors.NewNotFound(schema.GroupResource{
+		Group: "extensions.higress.io", Resource: "wasmplugins"}, "ai-statistics")
+	noKind := &meta.NoKindMatchError{GroupKind: wasmPluginGVK.GroupKind()}
+	noResource := &meta.NoResourceMatchError{PartialResource: wasmPluginGVK.GroupVersion().
+		WithResource("wasmplugins")}
+	for _, err := range []error{notFound, noKind, noResource} {
+		if !isAbsent(err) {
+			t.Errorf("isAbsent(%T) = false, want true (%v)", err, err)
+		}
+	}
+	// A conflict or a permission problem is NOT absence: those must fail the sync loudly.
+	for _, err := range []error{
+		apierrors.NewConflict(schema.GroupResource{Resource: "wasmplugins"}, "x", nil),
+		apierrors.NewForbidden(schema.GroupResource{Resource: "wasmplugins"}, "x", nil),
+	} {
+		if isAbsent(err) {
+			t.Errorf("isAbsent(%T) = true, want false (%v)", err, err)
+		}
+	}
+}
+
+// gateway.service is documented as "ns/name:port". Every malformed part has to fail the sync:
+// an Ingress pointing at the wrong port is published without complaint and then 502s on the
+// first real request. "8o80" used to parse as port 8, because %d stops at the first
+// non-digit and still reports success.
+func TestUpstreamService(t *testing.T) {
+	fleetWith := func(svc string) *routingv1.ModelFleet {
+		f := fleetFixture()
+		f.Spec.Gateway.Service = svc
+		return f
+	}
+	for _, tc := range []struct {
+		svc  string
+		name string
+		port int32
+	}{
+		{"", "openresty", 8080},
+		{"openresty", "openresty", 8080},
+		{"openresty:8080", "openresty", 8080},
+		{"llm-route/openresty:9090", "openresty", 9090},
+	} {
+		n, p, err := upstreamService(fleetWith(tc.svc))
+		if err != nil || n != tc.name || p != tc.port {
+			t.Errorf("upstreamService(%q) = %q, %d, %v; want %q, %d", tc.svc, n, p, err, tc.name, tc.port)
+		}
+	}
+	for _, svc := range []string{
+		"openresty:8o80",                // silently became port 8
+		"openresty:0",                   // not a port
+		"openresty:99999",               // not a port
+		"openresty:",                    // no port at all
+		"higress-system/openresty:8080", // an Ingress cannot reach another namespace
+	} {
+		if n, p, err := upstreamService(fleetWith(svc)); err == nil {
+			t.Errorf("upstreamService(%q) = %q, %d, nil; want an error", svc, n, p)
+		}
 	}
 }
 

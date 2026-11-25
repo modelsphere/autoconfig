@@ -13,12 +13,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -82,6 +84,15 @@ type fleetPlugin struct {
 	// not use. The exceptions are per-plugin and depend on what the fleet actually asked
 	// for, so this is a decision rather than a constant.
 	tolerateMissing func(*fleetRender) bool
+	// overridable: may a fleet replace this plugin's config wholesale through
+	// gateway.extraPlugins?
+	//
+	// Stated per plugin rather than derived from one of the other fields. It used to be
+	// "tolerateMissing == nil", which silently made ai-proxy overridable the moment that got
+	// a tolerance - and ai-proxy carries the upstream credential, so the CR could then supply
+	// it verbatim while the Secret-derived one was never programmed, with a healthy sync.
+	// There is no CEL rule to fall back on (see the field's doc), so this is the only guard.
+	overridable bool
 	// config renders this plugin's per-route config; returning nil means "no rule for this
 	// fleet", which removes any rule we previously wrote.
 	config func(*fleetRender) (any, error)
@@ -330,7 +341,7 @@ func (r *ModelFleetReconciler) checkAuth(ctx context.Context, fleet *routingv1.M
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(wasmPluginGVK)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
-		if apierrors.IsNotFound(err) && len(fleet.Spec.Gateway.AuthConsumers) == 0 {
+		if isAbsent(err) && len(fleet.Spec.Gateway.AuthConsumers) == 0 {
 			return nil // nothing to check; the missing plugin is handled where rules are written
 		}
 		// Name the namespace: gateway.namespace defaults to higress-system and must match the
@@ -381,7 +392,10 @@ func (r *ModelFleetReconciler) checkAuth(ctx context.Context, fleet *routingv1.M
 // plugin's to choose per member, and an Ingress-level rewrite would pin every member to one.
 func (r *ModelFleetReconciler) applyIngress(ctx context.Context, rend *fleetRender) error {
 	fleet := rend.fleet
-	svcName, svcPort := upstreamService(fleet)
+	svcName, svcPort, err := upstreamService(fleet)
+	if err != nil {
+		return err
+	}
 	pathType := networkingv1.PathTypePrefix
 
 	ing := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
@@ -391,7 +405,7 @@ func (r *ModelFleetReconciler) applyIngress(ctx context.Context, rend *fleetRend
 	// changed, which matters because every write here is a config push to the gateway. The
 	// object is ours alone (named after the fleet, owned by it), so there is no second writer
 	// whose fields an apply would have to protect.
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, ing, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, ing, func() error {
 		if ing.Annotations == nil {
 			ing.Annotations = map[string]string{}
 		}
@@ -474,7 +488,10 @@ func fleetPlugins() []fleetPlugin {
 		// metrics and nothing else, so it is always tolerated.
 		name:            "ai-statistics",
 		tolerateMissing: func(*fleetRender) bool { return true },
-		config:          func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
+		// Nothing here depends on state the fleet's author cannot see, so a fleet that wants
+		// different accounting attributes may simply say so.
+		overridable: true,
+		config:      func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
 	}}
 }
 
@@ -484,7 +501,7 @@ func fleetPlugins() []fleetPlugin {
 func renderedPlugins() map[string]bool {
 	out := map[string]bool{}
 	for _, p := range fleetPlugins() {
-		if p.tolerateMissing == nil { // the three whose config we compute; ai-statistics may be overridden
+		if !p.overridable {
 			out[p.name] = true
 		}
 	}
@@ -523,7 +540,7 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 			}
 		}
 		if err := r.upsertMatchRule(ctx, rend, p, raw); err != nil {
-			if apierrors.IsNotFound(err) && (raw == nil ||
+			if isAbsent(err) && (raw == nil ||
 				(p.tolerateMissing != nil && p.tolerateMissing(rend))) {
 				continue
 			}
@@ -564,10 +581,21 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 		}
 		written = append(written, name)
 	}
-	// Only the keys whose rules are actually on the gateway: status.appliedExtraPlugins is
-	// what the next round withdraws from, so recording a key we refused or failed to write
-	// would make a later reconcile withdraw a rule it never wrote.
-	rend.appliedExtras = written
+	// status.appliedExtraPlugins is what the NEXT round withdraws from, so it has to be the
+	// set of rules we believe are on the gateway right now - not the set we wrote this round.
+	// Those differ whenever a write fails: this status is written on the failure paths too,
+	// so recording only this round's successes would forget a rule that is still live, and a
+	// later key removal would then never take it off the route.
+	//
+	// Start from what was believed live, add what was written, and remove only what was
+	// actually withdrawn below. A key we refused or failed to write is simply left as it was.
+	believed := map[string]bool{}
+	for _, n := range rend.fleet.Status.AppliedExtraPlugins {
+		believed[n] = true
+	}
+	for _, n := range written {
+		believed[n] = true
+	}
 
 	// Keys that were in the spec last time and are not now: we wrote those rules, so we take
 	// them back. Nothing else will - the reconciler only ever sees the current spec, so a
@@ -585,18 +613,31 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 		builtin[p.name] = true
 	}
 	for _, old := range rend.fleet.Status.AppliedExtraPlugins {
+		if desired[old] {
+			continue // still asked for; written above, or left as it was if that failed
+		}
 		// Never withdraw a plugin this controller writes itself. An overridable one
 		// (ai-statistics) that the fleet stops overriding has just been written again by the
 		// loop above, with our default - withdrawing it here would take it off the route
 		// moments after programming it, so the route would lose token accounting until some
-		// later reconcile happened to put it back.
-		if desired[old] || rendered[old] || builtin[old] {
+		// later reconcile happened to put it back. The rule stays, but it is the built-in
+		// renderer's again, so stop claiming it as a passthrough.
+		if rendered[old] || builtin[old] {
+			delete(believed, old)
 			continue
 		}
-		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: old}, nil); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: old}, nil); err != nil && !isAbsent(err) {
+			// Still live: keep claiming it, or the next round would not try again.
 			errs = append(errs, fmt.Sprintf("%s: withdraw: %v", old, err))
+			continue
 		}
+		delete(believed, old)
 	}
+	rend.appliedExtras = make([]string, 0, len(believed))
+	for n := range believed {
+		rend.appliedExtras = append(rend.appliedExtras, n)
+	}
+	sort.Strings(rend.appliedExtras) // listType=set on the status field, and a stable order means no needless writes
 
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
@@ -612,6 +653,15 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 // replace the whole list and drop every rule written by the gateway chart. Our rule is
 // identified by the Ingress it binds to, so re-running is idempotent and two fleets never
 // collide.
+// isAbsent: the object is not there to write to, either because it does not exist or because
+// its KIND does not - a cluster with no Higress has no extensions.higress.io CRD at all, and
+// then the Get fails with *meta.NoKindMatchError, which apierrors.IsNotFound does not
+// recognise. Without this, a fleet created before the gateway is installed fails its sync
+// forever on a plugin whose absence is explicitly tolerated.
+func isAbsent(err error) bool {
+	return apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
+}
+
 func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetRender, p fleetPlugin, cfg map[string]any) error {
 	ns := gatewayNamespace(rend.fleet)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -691,7 +741,7 @@ func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *ro
 		}
 	}
 	for _, p := range plugins {
-		if err := r.upsertMatchRule(ctx, rend, p, nil); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.upsertMatchRule(ctx, rend, p, nil); err != nil && !isAbsent(err) {
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
 		}
 	}
@@ -913,26 +963,40 @@ func gatewayNamespace(f *routingv1.ModelFleet) string {
 
 // upstreamService parses gateway.service ("ns/name:port"); only the name and port are used,
 // since the Ingress can only point at a Service in its own namespace.
-func upstreamService(f *routingv1.ModelFleet) (string, int32) {
-	s := f.Spec.Gateway.Service
+// upstreamService parses gateway.service ("ns/name:port") into what an Ingress backend takes.
+//
+// Every malformed part is an error rather than a fallback. An Ingress pointing at the wrong
+// port is published without complaint and then 502s on the first real request, which is a far
+// worse way to learn about a typo than a failed sync: "openresty:8o80" used to be parsed by
+// Sscanf as port 8, because %d stops at the first non-digit and still reports success.
+func upstreamService(f *routingv1.ModelFleet) (string, int32, error) {
+	s := strings.TrimSpace(f.Spec.Gateway.Service)
 	if s == "" {
-		return defaultUpstreamService, defaultUpstreamPort
+		return defaultUpstreamService, defaultUpstreamPort, nil
 	}
 	if i := strings.Index(s, "/"); i >= 0 {
+		// An Ingress backend can only name a Service in the Ingress's own namespace, so a
+		// prefix naming another one cannot be honoured. Accepting and ignoring it would send
+		// this model's traffic to whatever happens to answer to that name next to the fleet.
+		if ns := s[:i]; ns != f.Namespace {
+			return "", 0, fmt.Errorf("gateway.service %q names namespace %q, but an Ingress can only "+
+				"reach a Service in its own namespace (%q)", s, ns, f.Namespace)
+		}
 		s = s[i+1:]
 	}
 	port := int32(defaultUpstreamPort)
 	if i := strings.LastIndex(s, ":"); i >= 0 {
-		var p int
-		if _, err := fmt.Sscanf(s[i+1:], "%d", &p); err == nil && p > 0 {
-			port = int32(p)
+		p, err := strconv.Atoi(s[i+1:])
+		if err != nil || p <= 0 || p > 65535 {
+			return "", 0, fmt.Errorf("gateway.service %q: %q is not a port", f.Spec.Gateway.Service, s[i+1:])
 		}
+		port = int32(p)
 		s = s[:i]
 	}
 	if s == "" {
 		s = defaultUpstreamService
 	}
-	return s, port
+	return s, port, nil
 }
 
 func splitRef(ref, defNS string) (string, string) {
