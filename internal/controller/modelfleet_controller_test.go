@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -661,6 +663,142 @@ func TestUpstreamService(t *testing.T) {
 	}
 }
 
+// gateway.upstreamAuthSecretRef must not reach outside the fleet's own namespace. The
+// controller holds a cluster-wide `secrets: get`, the value it reads is written in plain text
+// into the ai-proxy WasmPlugin, and anyone who can write a ModelFleet could otherwise name
+// kube-system/any-secret:any-key and read it back - "write a ModelFleet" would mean "read
+// every Secret in the cluster".
+func TestFleetUpstreamSecretRefCannotCrossNamespaces(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "kube-system/stolen:token"
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "stolen", Namespace: "kube-system"},
+			Data:       map[string][]byte{"token": []byte("sk-not-yours")},
+		},
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("a Secret in another namespace was resolved")
+	}
+	// Nothing may be written at all, least of all the value.
+	for _, item := range getPlugin(t, c, "ai-proxy") {
+		if strings.Contains(fmt.Sprint(item), "sk-not-yours") {
+			t.Fatalf("the foreign Secret's value reached the gateway: %v", item)
+		}
+	}
+	// A ref in the fleet's own namespace still works, with or without the prefix.
+	for _, ref := range []string{"llm-route/mine:token", "mine:token"} {
+		if _, err := r.readSecretKey(context.Background(), ref, "llm-route"); err == nil ||
+			!strings.Contains(err.Error(), "not found") {
+			// The Secret does not exist here, so "not found" is the expected failure - what
+			// matters is that it was not refused for being in another namespace.
+			if err != nil && strings.Contains(err.Error(), "own namespace") {
+				t.Errorf("%q was refused as cross-namespace", ref)
+			}
+		}
+	}
+}
+
+// Two fleets claiming one model name publish two Ingresses matching the same header, and
+// which one a request lands on is undefined; they also fight over one key in the decision
+// table. The older one keeps serving and the newcomer reports the conflict - the other way
+// round, a typo in a new fleet would take a route that already carries traffic off the air.
+func TestTwoFleetsCannotClaimOneModelName(t *testing.T) {
+	old := fleetFixture()
+	old.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	newer := fleetFixture()
+	newer.Name = "glm-53-copy"
+	newer.Spec.ModelName = "glm-5.3" // the same model as the incumbent
+	newer.CreationTimestamp = metav1.NewTime(time.Now())
+
+	r, c := newFleetReconciler(t, old, newer,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcile := func(name string) {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: name},
+		}); err != nil {
+			t.Fatalf("reconcile %s: %v", name, err)
+		}
+	}
+	reconcile("glm-5.3")
+	reconcile("glm-53-copy")
+
+	var incumbent, copy routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &incumbent)
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-53-copy"}, &copy)
+	if !condTrue(incumbent.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the incumbent stopped serving over a newcomer's name clash: %+v", incumbent.Status.Conditions)
+	}
+	if condTrue(copy.Status.Conditions, condGatewaySynced) {
+		t.Fatal("two fleets were allowed to claim one model name")
+	}
+	// ...and the second fleet published no Ingress of its own.
+	var ing networkingv1.Ingress
+	err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-53-copy"}, &ing)
+	if err == nil {
+		t.Fatal("the clashing fleet published an Ingress matching the same model header")
+	}
+}
+
+// Teardown is the mirror of creation: the route goes first, the rules after. Withdrawing
+// key-auth's rule while the Ingress is still live leaves the route reachable and
+// unauthenticated (the gateway chart's globalAuth is false, so a route with no rule is open),
+// and because cleanup carries on past errors, one failed withdrawal would hold that state
+// through every retry.
+func TestFleetDeleteTakesTheRouteDownBeforeItsGuards(t *testing.T) {
+	f := fleetFixture()
+	now := metav1.Now()
+	f.DeletionTimestamp = &now
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		wasmPlugin("ai-backend-router"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}, map[string]any{
+			"ingress":       []any{"llm-route/llm-fleet-glm-5.3"},
+			"configDisable": false,
+			"config":        map[string]any{"allow": []any{"ops"}},
+		}),
+		&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
+			Name: "llm-fleet-glm-5.3", Namespace: "llm-route"}},
+	)
+	// First pass: the Ingress is deleted and the pass returns without touching any rule,
+	// because the route must be gone before the rule that keeps it closed is.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
+		t.Fatal("the Ingress is still live after the first teardown pass")
+	}
+	if n := len(getPlugin(t, c, "key-auth")); n != 1 {
+		t.Fatalf("key-auth rules = %d: the guard was withdrawn while the route was still live", n)
+	}
+	// Second pass: the route is gone, so now the rules go.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if n := len(getPlugin(t, c, "key-auth")); n != 0 {
+		t.Fatalf("key-auth rules = %d after the route was gone, want 0", n)
+	}
+}
+
 func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 	t.Helper()
 	o := &unstructured.Unstructured{}
@@ -735,8 +873,8 @@ func TestFleetMissingDefaultMemberRouteFreezesTableAndReports(t *testing.T) {
 
 // keyAuthPlugin builds a key-auth WasmPlugin whose defaultConfig defines consumers, the way
 // the gateway chart renders it.
-func keyAuthPlugin(consumers map[string]string) *unstructured.Unstructured {
-	o := wasmPlugin("key-auth")
+func keyAuthPlugin(consumers map[string]string, rules ...any) *unstructured.Unstructured {
+	o := wasmPlugin("key-auth", rules...)
 	var list []any
 	for name, cred := range consumers {
 		list = append(list, map[string]any{

@@ -152,9 +152,24 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	if !fleet.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&fleet, fleetFinalizer) {
-			// The Ingress is garbage-collected through its owner reference; the plugin match
-			// rules live in another namespace and in objects we do not own, so they have to be
-			// withdrawn by hand before we let the object go.
+			// Teardown is the mirror of creation: the route goes first, the rules after.
+			//
+			// Leaving the Ingress to be garbage-collected means it outlives this cleanup -
+			// GC only runs once the finalizer is gone - so withdrawing key-auth's rule while
+			// it is still live leaves the route reachable with no authentication, and the
+			// gateway chart's globalAuth is false, which means a route with no rule is open.
+			// Cleanup also collects errors and carries on, so one failed withdrawal would
+			// leave that state in place through every retry rather than for an instant.
+			// Deleting the Ingress ourselves and waiting for it to be gone closes the window.
+			gone, err := r.deleteIngress(ctx, &fleet)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !gone {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			// The plugin rules live in another namespace, in objects we do not own, so they
+			// have to be withdrawn by hand before we let the object go.
 			if err := r.cleanupPluginRules(ctx, &fleet); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -175,7 +190,13 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	rend, err := r.resolve(ctx, &fleet)
 	if err != nil {
-		r.setFleetStatus(ctx, req.NamespacedName, nil, condGatewaySynced, metav1.ConditionFalse, "ResolveError", err.Error())
+		// Nothing has been written at this point, which for a fleet that is already live
+		// means its route keeps serving on its last good configuration. Say so in the
+		// message: "ResolveError" on its own reads as "the route is down", and an operator
+		// who believes that will go looking in the wrong place.
+		r.setFleetStatus(ctx, req.NamespacedName, nil, condGatewaySynced, metav1.ConditionFalse,
+			"ResolveError", err.Error()+" (nothing was written; any rules already on the "+
+				"gateway are unchanged and a live route keeps serving its last configuration)")
 		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 	}
 
@@ -201,6 +222,57 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 }
 
+// checkModelNameIsUnique refuses a model name another fleet on the same gateway already
+// serves. Two fleets with the same effective modelName publish two Ingresses carrying the
+// same exact-match header, and which one a request lands on is then not defined - the two
+// also write decision tables for the same key into the same plugin, each overwriting the
+// other's intent on every resync. The API server cannot see this (it is a property of a set
+// of objects), so it is checked here.
+//
+// The older fleet wins, so a mistake in a new one cannot take a route that already serves
+// traffic off the air. Ties, which can only happen within one clock tick, go by name.
+func (r *ModelFleetReconciler) checkModelNameIsUnique(ctx context.Context, fleet *routingv1.ModelFleet, modelName string) error {
+	var list routingv1.ModelFleetList
+	if err := r.List(ctx, &list); err != nil {
+		return fmt.Errorf("check modelName uniqueness: %w", err)
+	}
+	gwNS := gatewayNamespace(fleet)
+	for i := range list.Items {
+		other := &list.Items[i]
+		// Identity by name, not by UID: a UID is empty on an object that has not been through
+		// the API server, and "self" would then match every fleet in the list.
+		if (other.Namespace == fleet.Namespace && other.Name == fleet.Name) ||
+			!other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		name := other.Spec.ModelName
+		if name == "" {
+			name = other.Name
+		}
+		if name != modelName || gatewayNamespace(other) != gwNS {
+			continue
+		}
+		if olderThan(other, fleet) {
+			return fmt.Errorf("modelName %q is already served on gateway %q by ModelFleet %s/%s, "+
+				"which was created first; two fleets with one model name publish two Ingresses "+
+				"matching the same header and the route becomes undefined",
+				modelName, gwNS, other.Namespace, other.Name)
+		}
+	}
+	return nil
+}
+
+// olderThan: a is the incumbent. Equal timestamps are only possible inside one clock tick, so
+// the name breaks the tie - what matters is that both fleets reach the SAME answer, or they
+// would each stand down for the other and neither would publish.
+func olderThan(a, b *routingv1.ModelFleet) bool {
+	at, bt := a.CreationTimestamp.Time, b.CreationTimestamp.Time
+	if at.Equal(bt) {
+		return a.Namespace+"/"+a.Name < b.Namespace+"/"+b.Name
+	}
+	return at.Before(bt)
+}
+
 // resolve joins the CR's intent with the live state of each member's ModelRoute.
 func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.ModelFleet) (*fleetRender, error) {
 	rend := &fleetRender{
@@ -210,6 +282,9 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	}
 	if rend.modelName == "" {
 		rend.modelName = fleet.Name
+	}
+	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
+		return nil, err
 	}
 
 	policy := map[string]routingv1.PolicyMember{}
@@ -720,6 +795,26 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 }
 
 // cleanupPluginRules withdraws every rule this fleet put into the gateway plugins.
+// deleteIngress removes this fleet's Ingress and reports whether it is actually gone, so the
+// caller can wait instead of assuming. Returning "gone" from the Delete call alone would be a
+// guess: the object can linger behind its own finalizers or a slow apiserver.
+func (r *ModelFleetReconciler) deleteIngress(ctx context.Context, fleet *routingv1.ModelFleet) (bool, error) {
+	nn := types.NamespacedName{Namespace: fleet.Namespace, Name: ingressName(fleet)}
+	var ing networkingv1.Ingress
+	if err := r.Get(ctx, nn, &ing); err != nil {
+		if isAbsent(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if ing.DeletionTimestamp.IsZero() {
+		if err := r.Delete(ctx, &ing); err != nil && !isAbsent(err) {
+			return false, err
+		}
+	}
+	return false, nil // still there (or terminating): come back and check
+}
+
 func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *routingv1.ModelFleet) error {
 	rend := &fleetRender{fleet: fleet, ingressRef: fleet.Namespace + "/" + ingressName(fleet)}
 	var errs []string
@@ -740,6 +835,12 @@ func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *ro
 			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
 		}
 	}
+	// key-auth last. The Ingress is already gone by the time this runs, so nothing is
+	// reachable either way, but if that ever stops being true this ordering means the rule
+	// that keeps the route closed is the last thing to go rather than the second.
+	sort.SliceStable(plugins, func(i, j int) bool {
+		return plugins[j].name == "key-auth" && plugins[i].name != "key-auth"
+	})
 	for _, p := range plugins {
 		if err := r.upsertMatchRule(ctx, rend, p, nil); err != nil && !isAbsent(err) {
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
@@ -924,11 +1025,25 @@ func setCond(st *routingv1.ModelFleetStatus, t string, s metav1.ConditionStatus,
 	})
 }
 
+// readSecretKey resolves "[ns/]name:key", and the namespace may only ever be the fleet's own.
+//
+// Without that restriction this field is a confused deputy: the controller holds a
+// cluster-wide `secrets: get`, so anyone who can write a ModelFleet - the console, or whoever
+// it delegates to - could name kube-system/any-secret:any-key and read the value back out of
+// the ai-proxy WasmPlugin, which carries it in plain text, or have it presented as a bearer
+// token upstream. "Can write a ModelFleet in namespace X" must not become "can read every
+// Secret in the cluster"; it now means at most "can read Secrets in namespace X", which is
+// the same boundary everything else here respects. The defaulted ref carries no prefix and so
+// resolves in the fleet's namespace, where that Secret already lives.
 func (r *ModelFleetReconciler) readSecretKey(ctx context.Context, ref, defNS string) (string, error) {
 	nameKey := ref
 	ns := defNS
 	if i := strings.Index(ref, "/"); i >= 0 {
 		ns, nameKey = ref[:i], ref[i+1:]
+		if ns != defNS {
+			return "", fmt.Errorf("upstreamAuthSecretRef %q: may only name a Secret in this "+
+				"fleet's own namespace (%q)", ref, defNS)
+		}
 	}
 	i := strings.LastIndex(nameKey, ":")
 	if i < 0 {
@@ -961,8 +1076,6 @@ func gatewayNamespace(f *routingv1.ModelFleet) string {
 	return defaultGatewayNamespace
 }
 
-// upstreamService parses gateway.service ("ns/name:port"); only the name and port are used,
-// since the Ingress can only point at a Service in its own namespace.
 // upstreamService parses gateway.service ("ns/name:port") into what an Ingress backend takes.
 //
 // Every malformed part is an error rather than a fallback. An Ingress pointing at the wrong
