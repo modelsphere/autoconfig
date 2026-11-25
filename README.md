@@ -332,6 +332,15 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 | `ai-proxy` | 网关给 openresty 的 key(从 Secret 读) | 401 |
 | `ai-statistics` | 把本路由加进列表 | 没有 token 指标 |
 
+**先写插件规则,最后建 Ingress**。Ingress 是「路由可达」的那一步,守它的东西必须先就位 ——
+反过来写,插件中途失败就会留下一条**已经可达、但 key-auth 规则没写进去**的路由:不带 key 也返 200,
+而现场只有 CR 上一个 `GatewaySynced=False`。规则里引用一条还不存在的 Ingress 是惰性的,所以这个顺序自己不开窗口。
+
+**`authConsumers` 的名字在发布前对着 key-auth 的 `defaultConfig.consumers` 校验**。
+名字写错插件不会报错,只会对所有调用方回 403,而 CR 显示同步正常 —— 以前这是网关 chart 在渲染时拦下的,
+现在 allow 名单归我们写,校验也跟着搬过来。同理,`upstreamAuthSecretRef` 的值不能同时是某个 consumer 的
+credential:那是网关递给 openresty 的凭证,一旦它也能当调用方凭证用,泄露一次等于开两道门。
+
 **插件不存在时的分寸**:有东西要写却写不进去,就是失败 —— `ai-backend-router` 缺了没有分流,
 `key-auth` 缺了而 fleet 配了 `authConsumers` 就是**一条不鉴权的路由**,`ai-proxy` 缺了而配了
 `upstreamAuthSecretRef` 则是必然 401。三者都置 `GatewaySynced=False`。

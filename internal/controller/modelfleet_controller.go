@@ -145,12 +145,20 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 	}
 
-	if err := r.applyIngress(ctx, rend); err != nil {
-		r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse, "IngressError", err.Error())
-		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
-	}
+	// Plugin rules first, Ingress last. The Ingress is what makes the route reachable, so
+	// everything that guards it has to be in place before it exists: writing the Ingress
+	// first means that a failure half way through the plugins publishes a live route whose
+	// key-auth rule was never written — unauthenticated, answering 200, with nothing but a
+	// GatewaySynced=False on the CR to say so.
+	//
+	// A match rule naming an Ingress that does not exist yet is inert, so this order has no
+	// window of its own.
 	if err := r.applyPluginRules(ctx, rend); err != nil {
 		r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse, "PluginError", err.Error())
+		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+	}
+	if err := r.applyIngress(ctx, rend); err != nil {
+		r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse, "IngressError", err.Error())
 		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 	}
 
@@ -230,7 +238,69 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		}
 		rend.upstreamKey = key
 	}
+	if err := r.checkAuth(ctx, fleet, rend); err != nil {
+		return nil, err
+	}
 	return rend, nil
+}
+
+// checkAuth validates this fleet's auth settings against the gateway's own key-auth config,
+// because the plugin itself will not: an allow-list naming a consumer that does not exist is
+// accepted by the API server and by the plugin, and simply denies everyone with 403 while the
+// CR reports a healthy sync. The gateway chart used to catch this at render time; now that the
+// allow-list is written here, the check belongs here too.
+func (r *ModelFleetReconciler) checkAuth(ctx context.Context, fleet *routingv1.ModelFleet, rend *fleetRender) error {
+	if len(fleet.Spec.Gateway.AuthConsumers) == 0 && rend.upstreamKey == "" {
+		return nil
+	}
+	gwNS := gatewayNamespace(fleet)
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(wasmPluginGVK)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+		if apierrors.IsNotFound(err) && len(fleet.Spec.Gateway.AuthConsumers) == 0 {
+			return nil // nothing to check; the missing plugin is handled where rules are written
+		}
+		// Name the namespace: gateway.namespace defaults to higress-system and must match the
+		// namespace the gateway chart installs into, and a bare NotFound makes that look like
+		// a broken plugin rather than a namespace that does not line up.
+		return fmt.Errorf("key-auth in namespace %q (spec.gateway.namespace): %w", gwNS, err)
+	}
+	consumers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
+	known := map[string]bool{}
+	creds := map[string]string{}
+	for _, c := range consumers {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(m, "name")
+		known[name] = true
+		cs, _, _ := unstructured.NestedStringSlice(m, "credentials")
+		for _, cred := range cs {
+			creds[strings.TrimPrefix(cred, "Bearer ")] = name
+		}
+	}
+	var unknown []string
+	for _, want := range fleet.Spec.Gateway.AuthConsumers {
+		if !known[want] {
+			unknown = append(unknown, want)
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("gateway.authConsumers name consumers that key-auth in %q does not define: %s "+
+			"(the route would be published and then deny every caller with 403)",
+			gwNS, strings.Join(unknown, ", "))
+	}
+	// The upstream credential is what the gateway presents to openresty. If it is also a
+	// consumer's credential at the gateway, then anyone who learns it can call the gateway as
+	// that consumer — one leak, two doors.
+	if rend.upstreamKey != "" {
+		if who, ok := creds[rend.upstreamKey]; ok {
+			return fmt.Errorf("gateway.upstreamAuthSecretRef holds the same credential as key-auth consumer %q; "+
+				"the upstream key must not double as a caller credential", who)
+		}
+	}
+	return nil
 }
 
 // applyIngress writes the per-model Ingress: match the header model-router filled in, send

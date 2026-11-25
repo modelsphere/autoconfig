@@ -147,7 +147,11 @@ type GatewaySpec struct {
 	// +kubebuilder:validation:Enum=higress
 	// +kubebuilder:default=higress
 	Class string `json:"class,omitempty"`
-	// Namespace holding the gateway's WasmPlugin objects. Defaults to higress-system.
+	// Namespace holding the gateway's WasmPlugin objects. Defaults to higress-system, and
+	// must be the namespace the gateway chart installs into (its `namespaces.higress`). The
+	// two are configured separately, so a mismatch shows up as the plugins being "missing"
+	// rather than as anything pointing at the namespace — the controller names this namespace
+	// in that error for exactly that reason.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	Namespace string `json:"namespace,omitempty"`
@@ -175,6 +179,10 @@ type GatewaySpec struct {
 	// AuthConsumers: the key-auth consumers allowed on this fleet's route. The consumer
 	// definitions (and their keys) stay in the gateway chart's defaultConfig — only the
 	// allow-list for this route is ours to write, so no key ever lands in this CR.
+	//
+	// Names are checked against what key-auth actually defines before the route is published:
+	// a name with a typo is accepted by both the API server and the plugin, and then denies
+	// every caller with 403 while this CR reports a healthy sync.
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
 	AuthConsumers []string `json:"authConsumers,omitempty"`

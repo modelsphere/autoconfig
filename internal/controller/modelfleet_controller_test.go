@@ -125,7 +125,7 @@ func TestFleetReconcileHappyPath(t *testing.T) {
 		fleetFixture(),
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 		wasmPlugin("ai-statistics"),
 	)
 	reconcileFleet(t, r)
@@ -188,7 +188,7 @@ func TestFleetReconcileMemberUnready(t *testing.T) {
 		fleetFixture(),
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 0, false),
-		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
 
@@ -235,6 +235,7 @@ func TestFleetReconcilePreservesForeignMatchRules(t *testing.T) {
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
 		wasmPlugin("ai-backend-router", foreign),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
 
@@ -280,7 +281,7 @@ func TestFleetReconcileOrphanPolicyMemberIsReportedNotFatal(t *testing.T) {
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
 
@@ -301,7 +302,7 @@ func TestFleetReconcileMissingModelRoute(t *testing.T) {
 	r, c := newFleetReconciler(t,
 		fleetFixture(),
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
-		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
 
@@ -345,6 +346,7 @@ func TestFleetUpstreamKeyFromSecret(t *testing.T) {
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
 		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "openresty-keys", Namespace: "llm-route"},
 			Data:       map[string][]byte{"gateway": []byte("sk-test-key\n")},
@@ -407,7 +409,7 @@ func TestFleetMissingStatisticsPluginIsNotFatal(t *testing.T) {
 		fleetFixture(),
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"), // no ai-statistics
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}), // no ai-statistics
 	)
 	reconcileFleet(t, r)
 
@@ -466,7 +468,7 @@ func TestFleetUnchangedEmptyPluginIsNotRewritten(t *testing.T) {
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
 	first := resourceVersionOf(t, c, "key-auth")
@@ -490,7 +492,7 @@ func TestFleetMissingDefaultMemberRouteFreezesTableAndReports(t *testing.T) {
 	r, c := newFleetReconciler(t, f,
 		// h100's ModelRoute is absent; ascend's is healthy.
 		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
-		wasmPlugin("ai-backend-router", existing), wasmPlugin("key-auth"),
+		wasmPlugin("ai-backend-router", existing), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
 
@@ -516,5 +518,117 @@ func TestFleetMissingDefaultMemberRouteFreezesTableAndReports(t *testing.T) {
 	}
 	if !strings.Contains(msg, "frozen") || !strings.Contains(msg, "h100") {
 		t.Fatalf("GatewaySynced message does not say what froze or why: %q", msg)
+	}
+}
+
+// keyAuthPlugin builds a key-auth WasmPlugin whose defaultConfig defines consumers, the way
+// the gateway chart renders it.
+func keyAuthPlugin(consumers map[string]string) *unstructured.Unstructured {
+	o := wasmPlugin("key-auth")
+	var list []any
+	for name, cred := range consumers {
+		list = append(list, map[string]any{
+			"name":        name,
+			"credentials": []any{"Bearer " + cred},
+		})
+	}
+	_ = unstructured.SetNestedSlice(o.Object, list, "spec", "defaultConfig", "consumers")
+	return o
+}
+
+// The route must not be published before the rules that guard it. Writing the Ingress first
+// means a failure part way through the plugins leaves a live, unauthenticated route behind.
+func TestFleetIngressIsNotPublishedWhenPluginRulesFail(t *testing.T) {
+	r, c := newFleetReconciler(t,
+		fleetFixture(), // asks for authConsumers: [ops]
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), // key-auth absent -> writing its rule must fail
+	)
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing)
+	if err == nil {
+		t.Fatal("the route was published although its key-auth rule could not be written")
+	}
+}
+
+// An allow-list naming a consumer key-auth does not define would publish a route that denies
+// everyone with 403 while the CR claims a healthy sync. Catch it before publishing anything.
+func TestFleetUnknownAuthConsumerIsRefusedBeforePublishing(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.AuthConsumers = []string{"opss"} // typo
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("an allow-list naming an undefined consumer reported a healthy sync")
+	}
+	var msg string
+	for _, cd := range fleet.Status.Conditions {
+		if cd.Type == condGatewaySynced {
+			msg = cd.Message
+		}
+	}
+	if !strings.Contains(msg, "opss") {
+		t.Fatalf("the error does not name the offending consumer: %q", msg)
+	}
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
+		t.Fatal("the route was published despite an unusable allow-list")
+	}
+}
+
+// A known consumer passes, and the route is published.
+func TestFleetKnownAuthConsumerPasses(t *testing.T) {
+	r, c := newFleetReconciler(t,
+		fleetFixture(), // authConsumers: [ops]
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops", "tenant-a": "sk-a"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a valid allow-list failed the sync: %+v", fleet.Status.Conditions)
+	}
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err != nil {
+		t.Fatalf("route not published: %v", err)
+	}
+}
+
+// The credential the gateway presents to openresty must not also be a caller credential at
+// the gateway: one leak would then open both doors.
+func TestFleetUpstreamKeyMustNotBeAConsumerCredential(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "keys:gateway"
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-shared"}),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "keys", Namespace: "llm-route"},
+			Data:       map[string][]byte{"gateway": []byte("sk-shared")},
+		},
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("an upstream key that doubles as a consumer credential was accepted")
 	}
 }
