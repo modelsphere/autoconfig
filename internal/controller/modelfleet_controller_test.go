@@ -78,6 +78,9 @@ func fleetFixture() *routingv1.ModelFleet {
 			Gateway: routingv1.GatewaySpec{
 				ExternalURL:   "http://172.28.44.17:31080",
 				AuthConsumers: []string{"ops"},
+				// Opt out by default so each test states its own intent about the upstream
+				// credential; the tests that care about it set this themselves.
+				UpstreamAuthSecretRef: "none",
 			},
 			Members: []routingv1.FleetMember{
 				{Name: "h100", Hardware: routingv1.Hardware{Vendor: "nvidia", Model: "H100", Replicas: 2},
@@ -630,5 +633,86 @@ func TestFleetUpstreamKeyMustNotBeAConsumerCredential(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
 		t.Fatal("an upstream key that doubles as a consumer credential was accepted")
+	}
+}
+
+// The upstream credential defaults to where that key already lives on these clusters, so a
+// fleet does not have to restate one cluster-wide fact.
+func TestFleetUpstreamKeyDefaultsToOpenrestySecret(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "" // not stated
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "openresty-api-keys", Namespace: "llm-route"},
+			Data:       map[string][]byte{"keys": []byte("sk-default\n")},
+		},
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-proxy")[0].(map[string]any)
+	tokens, _, _ := unstructured.NestedStringSlice(rule, "config", "provider", "apiTokens")
+	if len(tokens) != 1 || tokens[0] != "sk-default" {
+		t.Fatalf("apiTokens = %v, want the default secret's key", tokens)
+	}
+}
+
+// With no Secret to default to, the route must not be published: openresty would answer 401
+// on the first real request, long after this reconcile looked healthy.
+func TestFleetMissingDefaultUpstreamSecretFailsSync(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = ""
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		// no openresty-api-keys Secret
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("no upstream credential available, yet the sync reported success")
+	}
+	var msg string
+	for _, cd := range fleet.Status.Conditions {
+		if cd.Type == condGatewaySynced {
+			msg = cd.Message
+		}
+	}
+	// The message has to say how to get out of it, or the only way forward is reading source.
+	if !strings.Contains(msg, "none") {
+		t.Fatalf("the error does not mention the opt-out: %q", msg)
+	}
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
+		t.Fatal("route published without the credential it needs")
+	}
+}
+
+// "none" is the explicit opt-out for an openresty that asks for no key.
+func TestFleetUpstreamAuthNoneSkipsAIProxy(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "none"
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("ai-proxy"),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("explicit opt-out failed the sync: %+v", fleet.Status.Conditions)
+	}
+	if rules := getPlugin(t, c, "ai-proxy"); len(rules) != 0 {
+		t.Fatalf("ai-proxy rule written despite the opt-out: %v", rules)
 	}
 }

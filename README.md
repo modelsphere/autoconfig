@@ -294,7 +294,8 @@ spec:
     service: openresty:8080     # Ingress 的后端;成员靠【路径】区分
     externalURL: http://<gw>:31080        # 发布成 status.endpoint + /v1
     authConsumers: [ops]                  # key-auth 本路由的 allow 名单
-    upstreamAuthSecretRef: openresty-keys:gateway   # 网关给 openresty 的 key(读 Secret)
+    # upstreamAuthSecretRef 省略 = openresty-api-keys:keys(那把 key 本来就在那儿);
+    # 只在要指向别的 Secret 时写,openresty 不要 key 时写 "none"
   members:                      # 成员【引用】ModelRoute,不重抄地址
   - name: h100                  # = 决策表 backend id = 网关指标标签,改名等于删了重建
     hardware: {vendor: nvidia, model: H100, replicas: 2}

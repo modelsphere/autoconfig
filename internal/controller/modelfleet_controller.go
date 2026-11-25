@@ -50,6 +50,13 @@ const (
 	defaultGatewayNamespace = "higress-system"
 	defaultUpstreamService  = "openresty"
 	defaultUpstreamPort     = 8080
+	// defaultUpstreamSecret: where the openresty API key already lives on these clusters, as
+	// a Secret mounted into the openresty pods. Defaulting to it keeps the credential out of
+	// every ModelFleet: the gateway needs the same key as every other caller of openresty, so
+	// naming it per fleet was asking each fleet to repeat one cluster-wide fact.
+	defaultUpstreamSecret = "openresty-api-keys:keys"
+	// upstreamAuthNone: the explicit opt-out, for an openresty with auth turned off.
+	upstreamAuthNone = "none"
 
 	// modelHeader: model-router copies body.model into this header before routing, because
 	// Envoy cannot match on a body field. Every per-model Ingress matches on it.
@@ -231,9 +238,23 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	// when everything falls through to the default member (see sink.TrafficShares).
 	rend.effective = sink.TrafficShares(rend.members, fleet.Spec.DefaultMember)
 
-	if ref := fleet.Spec.Gateway.UpstreamAuthSecretRef; ref != "" {
+	switch ref := fleet.Spec.Gateway.UpstreamAuthSecretRef; ref {
+	case upstreamAuthNone:
+		// openresty is not asking for a key on this cluster.
+	default:
+		defaulted := ref == ""
+		if defaulted {
+			ref = defaultUpstreamSecret
+		}
 		key, err := r.readSecretKey(ctx, ref, fleet.Namespace)
 		if err != nil {
+			if defaulted {
+				// Do not fall through to "no credential": openresty would answer 401 on the
+				// first real request, long after this reconcile looked fine.
+				return nil, fmt.Errorf("%w (default upstream credential; set "+
+					"gateway.upstreamAuthSecretRef to another Secret, or to %q if this "+
+					"openresty needs no key)", err, upstreamAuthNone)
+			}
 			return nil, err
 		}
 		rend.upstreamKey = key

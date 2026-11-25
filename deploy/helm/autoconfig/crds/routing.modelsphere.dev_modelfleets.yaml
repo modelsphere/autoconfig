@@ -131,8 +131,13 @@ spec:
                       UpstreamAuthSecretRef: the Secret holding the API key the gateway presents to openresty,
                       as "ns/name:key" ("name:key" uses the fleet's namespace). The key is read by the
                       controller and rendered into the ai-proxy plugin config; it never appears in this CR.
-                      Omitted = the fleet's route is not given an upstream credential, which is correct only
-                      when openresty has auth turned off for it.
+
+                      Omitted = "openresty-api-keys:keys", where that key already lives on these clusters.
+                      The gateway needs the same credential as every other caller of openresty, so this is
+                      one cluster-wide fact rather than something each fleet should restate. Set it only to
+                      point at a different Secret, or to "none" for an openresty that needs no key — a
+                      missing default Secret fails the sync rather than quietly publishing a route that will
+                      401 on its first real request.
                     type: string
                 type: object
               members:

@@ -25,7 +25,8 @@ spec:
     service: openresty:8080     # the Ingress backend; members are told apart by path
     externalURL: http://172.28.44.17:31080   # published as status.endpoint + /v1
     authConsumers: [ops]        # key-auth allow-list for this route (keys stay in the chart)
-    upstreamAuthSecretRef: openresty-keys:gateway   # key the gateway presents to openresty
+    # upstreamAuthSecretRef: omitted = openresty-api-keys:keys, where that key already
+    # lives. Set it only to point elsewhere, or to "none" if openresty needs no key.
 
   # Where traffic lands when no member is selectable (all drained, all weights 0, or the
   # plugin errors). That round does not overflow afterwards.
