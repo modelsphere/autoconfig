@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1755,5 +1756,356 @@ func TestFleetExplicitCredentialRequiresAIProxy(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
 		t.Fatal("an explicitly named credential was silently skipped when ai-proxy was absent")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The invariants the design rests on, and the object shapes the gateway reads.
+// ---------------------------------------------------------------------------
+
+// Plugin rules first, Ingress last. The Ingress is what makes the route reachable, so a run
+// that fails half way through the plugins must NOT publish one: an Ingress whose key-auth rule
+// was never written is a live, unauthenticated route answering 200, with nothing but a
+// condition on the CR to say so. The existing tests check the condition; this checks the
+// thing the condition is about.
+func TestFleetPluginFailureLeavesNoIngress(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		// no ai-backend-router: there is nowhere to put the decision table
+	)
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing)
+	if err == nil {
+		t.Fatal("an Ingress was published although a plugin rule could not be written")
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error getting the Ingress: %v", err)
+	}
+}
+
+// The Ingress is the one object the gateway reads to decide that a request belongs to this
+// fleet. Every part of it is load-bearing, and none of it is checked anywhere else in Go.
+func TestFleetIngressShape(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err != nil {
+		t.Fatal(err)
+	}
+	if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != "higress" {
+		t.Fatalf("ingressClassName = %v", ing.Spec.IngressClassName)
+	}
+	a := ing.Annotations
+	if got := a["higress.io/exact-match-header-x-higress-llm-model"]; got != "glm-5.3" {
+		t.Fatalf("model header match = %q", got)
+	}
+	// No rewrite-path: the path is the router plugin's to choose per member, and an
+	// Ingress-level rewrite would pin every member to one path.
+	for k := range a {
+		if strings.Contains(k, "rewrite-path") {
+			t.Fatalf("annotation %q pins every member to one path", k)
+		}
+	}
+	// Long-lived streaming responses: the defaults cut a generation short.
+	for _, k := range []string{"higress.io/proxy-read-timeout", "higress.io/proxy-send-timeout"} {
+		if a[k] != "3600" {
+			t.Fatalf("%s = %q, want 3600", k, a[k])
+		}
+	}
+	if n := len(ing.Spec.Rules); n != 1 {
+		t.Fatalf("rules = %d, want 1", n)
+	}
+	paths := ing.Spec.Rules[0].HTTP.Paths
+	if len(paths) != 1 {
+		t.Fatalf("paths = %d, want 1", len(paths))
+	}
+	p := paths[0]
+	if p.PathType == nil || *p.PathType != networkingv1.PathTypePrefix {
+		t.Fatalf("pathType = %v, want Prefix", p.PathType)
+	}
+	if p.Path != "/" {
+		t.Fatalf("path = %q, want / (the router rewrites per member)", p.Path)
+	}
+	svc := p.Backend.Service
+	if svc == nil || svc.Name != "openresty" || svc.Port.Number != 8080 {
+		t.Fatalf("backend = %+v, want openresty:8080", svc)
+	}
+	// Owned by the fleet, so deleting the fleet takes the route with it.
+	if n := len(ing.OwnerReferences); n != 1 || ing.OwnerReferences[0].Kind != "ModelFleet" {
+		t.Fatalf("ownerReferences = %+v", ing.OwnerReferences)
+	}
+}
+
+// Every write to the Ingress is a config push to the gateway, so an unchanged fleet must not
+// produce one. CreateOrUpdate only writes on a real diff - this pins that, because a mutate
+// function that sets a field to a fresh value every time (a timestamp, a re-sorted list)
+// would turn each resync into a push and nothing else would notice.
+func TestFleetIngressIsNotRewrittenWhenUnchanged(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}
+	var first networkingv1.Ingress
+	if err := c.Get(context.Background(), nn, &first); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		reconcileFleet(t, r)
+	}
+	var again networkingv1.Ingress
+	if err := c.Get(context.Background(), nn, &again); err != nil {
+		t.Fatal(err)
+	}
+	if again.ResourceVersion != first.ResourceVersion {
+		t.Fatalf("the Ingress was rewritten on an unchanged reconcile: %s -> %s",
+			first.ResourceVersion, again.ResourceVersion)
+	}
+}
+
+// ...and it does follow a real change, or the gateway would keep sending this model's traffic
+// to the Service the fleet used to name.
+func TestFleetIngressFollowsTheGatewayService(t *testing.T) {
+	f := fleetFixture()
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	fleet.Spec.Gateway.Service = "openresty-canary:9090"
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err != nil {
+		t.Fatal(err)
+	}
+	svc := ing.Spec.Rules[0].HTTP.Paths[0].Backend.Service
+	if svc.Name != "openresty-canary" || svc.Port.Number != 9090 {
+		t.Fatalf("backend = %+v, want openresty-canary:9090", svc)
+	}
+}
+
+// Deleting a fleet must finish on a cluster that no longer serves WasmPlugin at all - after
+// Higress is uninstalled, say. A Get on a kind with no RESTMapping fails with
+// *meta.NoKindMatchError rather than NotFound, and treating that as a real failure would
+// leave the object stuck Terminating with no way out but patching the finalizer off by hand.
+func TestFleetDeleteCompletesWhenThePluginKindIsGone(t *testing.T) {
+	f := fleetFixture()
+	now := metav1.Now()
+	f.DeletionTimestamp = &now
+	s := fleetScheme(t)
+	c := ctrlfake.NewClientBuilder().WithScheme(s).
+		WithObjects(f, modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true)).
+		WithStatusSubresource(&routingv1.ModelFleet{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == wasmPluginGVK {
+					return &meta.NoKindMatchError{GroupKind: wasmPluginGVK.GroupKind()}
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	r := &ModelFleetReconciler{Client: c, Scheme: s}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"},
+	}); err != nil {
+		t.Fatalf("teardown failed on a cluster with no WasmPlugin kind: %v", err)
+	}
+	var fleet routingv1.ModelFleet
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if err == nil && len(fleet.Finalizers) > 0 {
+		t.Fatalf("the finalizer is still on the object: %v", fleet.Finalizers)
+	}
+}
+
+// The uniqueness check is per gateway, not global: two clusters' worth of gateways in one
+// cluster (a canary namespace next to the real one) legitimately serve the same model name,
+// and the Ingresses live in different namespaces with different plugins.
+func TestTwoFleetsMayShareAModelNameOnDifferentGateways(t *testing.T) {
+	a := fleetFixture()
+	a.Spec.Gateway.Namespace = "higress-system"
+	b := fleetFixture()
+	b.Name = "glm-53-canary"
+	b.Spec.ModelName = "glm-5.3"
+	b.Spec.Gateway.Namespace = "higress-canary"
+
+	r, c := newFleetReconciler(t, a, b,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPluginIn("higress-canary", "ai-backend-router"),
+		keyAuthPluginIn("higress-canary", map[string]string{"ops": "sk-ops"}),
+	)
+	for _, name := range []string{"glm-5.3", "glm-53-canary"} {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: name},
+		}); err != nil {
+			t.Fatalf("reconcile %s: %v", name, err)
+		}
+	}
+	for _, name := range []string{"glm-5.3", "glm-53-canary"} {
+		var fleet routingv1.ModelFleet
+		_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: name}, &fleet)
+		if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+			t.Fatalf("%s was refused although the other fleet is on a different gateway: %+v",
+				name, fleet.Status.Conditions)
+		}
+	}
+}
+
+// totalCapacity is what the console shows as the fleet's capacity, so it must count only what
+// can actually serve. Summing a member that is down would overstate the fleet exactly when
+// someone is looking at it because it is degraded.
+func TestFleetTotalCapacityCountsReadyMembersOnly(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 0, false), // down
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	tc := fleet.Status.TotalCapacity
+	if tc == nil {
+		t.Fatal("no totalCapacity")
+	}
+	// The fixture declares 16 for h100 and 8 for ascend, with 2 and 1 replicas.
+	if tc.MaxConcurrency != 16 || tc.ReadyReplicas != 2 {
+		t.Fatalf("totalCapacity = %+v, want only the ready member's 16/2", tc)
+	}
+}
+
+// modelName is what the client sends as body.model. Defaulting it to the object's name is how
+// a single-hardware fleet stays a one-liner, and it has to reach the Ingress match and the
+// decision table, not just status.
+func TestFleetModelNameDefaultsToTheObjectName(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.ModelName = ""
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err != nil {
+		t.Fatal(err)
+	}
+	if got := ing.Annotations["higress.io/exact-match-header-x-higress-llm-model"]; got != "glm-5.3" {
+		t.Fatalf("Ingress matches %q, want the object's name", got)
+	}
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	if _, found, _ := unstructured.NestedMap(rule, "config", "decisions", "static", "models", "glm-5.3"); !found {
+		t.Fatalf("the table has no entry under the object's name: %v", rule["config"])
+	}
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if fleet.Status.ModelName != "glm-5.3" {
+		t.Fatalf("status.modelName = %q", fleet.Status.ModelName)
+	}
+}
+
+// Tiers are an ordered fallback chain, so weights renormalise WITHIN a tier and never across
+// one: moving weight over a tier boundary would change which hardware is the mains, which is
+// the one thing the tier exists to pin down.
+func TestFleetWeightsRenormaliseWithinEachTier(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members = append(f.Spec.Members, routingv1.FleetMember{
+		Name:     "rtx6000d",
+		Hardware: routingv1.Hardware{Vendor: "nvidia", Model: "RTX6000D", Replicas: 1},
+		Backend:  routingv1.MemberBackend{ModelRouteRef: "glm-53-6000d"},
+	})
+	f.Spec.TrafficPolicy.Members = []routingv1.PolicyMember{
+		{Name: "h100", Tier: 0, Weight: 3},
+		{Name: "ascend", Tier: 0, Weight: 1},
+		{Name: "rtx6000d", Tier: 1, Weight: 7}, // alone in its tier, whatever the number
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		modelRoute("glm-53-6000d", "llm-route", "glm-53-6000d", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	perTier := map[int64]int64{}
+	got := map[string]int64{}
+	for _, b := range backends {
+		m := b.(map[string]any)
+		id, _, _ := unstructured.NestedString(m, "id")
+		w, _, _ := unstructured.NestedInt64(m, "weight")
+		tier, _, _ := unstructured.NestedInt64(m, "tier")
+		got[id] = w
+		perTier[tier] += w
+	}
+	if got["h100"] != 7500 || got["ascend"] != 2500 {
+		t.Fatalf("tier 0 split = %v, want 7500/2500 from 3:1", got)
+	}
+	if got["rtx6000d"] != 10000 {
+		t.Fatalf("the sole member of tier 1 got %d, want the whole tier", got["rtx6000d"])
+	}
+	for tier, sum := range perTier {
+		if sum != 10000 {
+			t.Fatalf("tier %d sums to %d, want exactly 10000", tier, sum)
+		}
+	}
+}
+
+// A one-member fleet is how every single-hardware model is published once "everything goes
+// through ModelFleet" is the rule, so it has to be the boring case: one backend, everything.
+func TestFleetWithOneMemberGetsEverything(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members = f.Spec.Members[:1]
+	f.Spec.TrafficPolicy = nil
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	if len(backends) != 1 {
+		t.Fatalf("backends = %v, want exactly one", backends)
+	}
+	m := backends[0].(map[string]any)
+	id, _, _ := unstructured.NestedString(m, "id")
+	w, _, _ := unstructured.NestedInt64(m, "weight")
+	if id != "h100" || w != 10000 {
+		t.Fatalf("backend = %s at %d, want h100 at 10000", id, w)
+	}
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if fleet.Status.MemberCount != 1 {
+		t.Fatalf("status.memberCount = %d", fleet.Status.MemberCount)
 	}
 }
