@@ -193,3 +193,45 @@ func TestRenderKeyAuthSorts(t *testing.T) {
 		t.Fatalf("allow = %v", got.Allow)
 	}
 }
+
+// With no policy at all the default member serves every request through the plugin's
+// fallback, so status must say 10000 even though its table entry reads 0. Reporting 0 would
+// hand decision-gen a member that looks idle while it carries the whole fleet.
+func TestTrafficSharesNoPolicyCreditsDefaultMember(t *testing.T) {
+	ms := []FleetMemberView{mem("h100", 0, 0, true), mem("ascend", 0, 0, true)}
+	got := TrafficShares(ms, "h100")
+	if got["h100"] != weightTotal || got["ascend"] != 0 {
+		t.Fatalf("shares = %v, want h100 credited with the whole fleet", got)
+	}
+	// ...while the table itself still carries the raw 0, which is what the plugin needs for
+	// `default` to resolve.
+	tbl, err := RenderDecisionTable("m", "h100", ms, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := tbl.Decisions.Static.Models["m"].Backends[0].Weight; w != 0 {
+		t.Fatalf("table weight = %d, want 0", w)
+	}
+}
+
+// Once any member has real weight, shares are just the renormalised weights again - the
+// default member gets no special credit.
+func TestTrafficSharesWithPolicyIsPlainRenormalisation(t *testing.T) {
+	got := TrafficShares([]FleetMemberView{
+		mem("h100", 0, 8000, true), mem("ascend", 0, 2000, true),
+	}, "h100")
+	if got["h100"] != 8000 || got["ascend"] != 2000 {
+		t.Fatalf("shares = %v", got)
+	}
+}
+
+// Every weight zeroed is "send it all to the default member", not "stop serving", and the
+// status has to say so or an operator reads the fleet as drained when it is not.
+func TestTrafficSharesAllZeroedIsNotADrain(t *testing.T) {
+	got := TrafficShares([]FleetMemberView{
+		mem("h100", 0, 0, true), mem("ascend", 0, 0, true),
+	}, "ascend")
+	if got["ascend"] != weightTotal {
+		t.Fatalf("shares = %v, want the default member credited", got)
+	}
+}

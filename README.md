@@ -340,6 +340,10 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 
 **几个容易想当然的点**:
 
+- **`status.effectiveWeight` 报的是「实际在生效的占比」,不等于决策表里的 weight**。
+  没写 trafficPolicy(或把所有权重都置 0)时,表里全是 0、靠 `defaultMember` 兜底转发,
+  但那个成员实际吃掉 100% 流量 —— status 这时报 10000,不报 0。报 0 会让 decision-gen
+  拿一个「看起来闲着、实际扛着全部流量」的成员去算下一轮。
 - **权重按 tier 在「真正 ready 的成员」之间重新归一**,用最大余数法,每个 tier 恰好合计 10000。
   成员挂了它那份要**重新分配**,不能扣进黑洞;decision-gen 必须读 `status.members[].effectiveWeight`
   而不是自己上次写的值,否则是拿没发生过的流量算下一轮。

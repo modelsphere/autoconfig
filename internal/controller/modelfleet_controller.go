@@ -219,7 +219,9 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		}
 		sort.Strings(rend.orphans)
 	}
-	rend.effective = sink.EffectiveWeights(rend.members)
+	// Status reports the share actually in force, which differs from the table's weights
+	// when everything falls through to the default member (see sink.TrafficShares).
+	rend.effective = sink.TrafficShares(rend.members, fleet.Spec.DefaultMember)
 
 	if ref := fleet.Spec.Gateway.UpstreamAuthSecretRef; ref != "" {
 		key, err := r.readSecretKey(ctx, ref, fleet.Namespace)

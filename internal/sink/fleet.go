@@ -39,7 +39,7 @@ type FleetMemberView struct {
 	Weight int32
 	// Ready: the member has at least one ready fleetBackend. An unready member is left out of the
 	// table entirely rather than shipped with weight 0 — a zero-weight entry is still a
-	// legal overflow fleetTarget for the plugin, and overflowing into a member with no backends
+	// legal overflow target for the plugin, and overflowing into a member with no backends
 	// turns a degraded fleet into a failing one.
 	Ready bool
 	// ReadyReplicas / MaxConcurrency feed status.totalCapacity.
@@ -104,7 +104,28 @@ func EffectiveWeights(members []FleetMemberView) map[string]int32 {
 	return out
 }
 
-// DecisionTable is the ai-fleetBackend-router matchRule config. Rendered as a typed struct rather
+// TrafficShares is what each member actually receives, which is NOT always what the decision
+// table says. When no member has a positive weight — no policy written yet, or every weight
+// explicitly zeroed — the plugin falls back to the default member, so that member takes all
+// of the traffic while its table entry still reads 0.
+//
+// Status reports this, the table keeps the raw weights. Reporting the table's 0 for a member
+// that is serving every request would make decision-gen compute its next round from traffic
+// that never happened, which is the exact failure effectiveWeight exists to prevent.
+func TrafficShares(members []FleetMemberView, defaultMember string) map[string]int32 {
+	out := EffectiveWeights(members)
+	for _, w := range out {
+		if w > 0 {
+			return out
+		}
+	}
+	if _, ok := out[defaultMember]; ok {
+		out[defaultMember] = weightTotal
+	}
+	return out
+}
+
+// DecisionTable is the ai-backend-router matchRule config. Rendered as a typed struct rather
 // than a free map so the field names are checked at compile time: the plugin refuses a table
 // with an unknown field outright, and it refuses it at the gateway — `kubectl apply` succeeds
 // and the breakage surfaces later, as a config push that stops updating every plugin.
@@ -145,7 +166,7 @@ type fleetLimits struct {
 
 type fleetRetry struct {
 	Codes []int `json:"codes"`
-	// Exclude: "tier" means a fleetRetry after one of Codes goes to a DIFFERENT tier, i.e. the
+	// Exclude: "tier" means a retry after one of Codes goes to a DIFFERENT tier, i.e. the
 	// overflow behaviour. Retrying inside the same tier would just hit the next equally full
 	// member of the same hardware.
 	Exclude string `json:"exclude"`
