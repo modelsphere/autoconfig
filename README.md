@@ -366,10 +366,18 @@ gateway:
 而一个插件出问题会连带卡住所有插件的配置下发。用它就等同于直接写网关配置。
 
 **插件不存在时的分寸**:有东西要写却写不进去,就是失败 —— `ai-backend-router` 缺了没有分流,
-`key-auth` 缺了而 fleet 配了 `authConsumers` 就是**一条不鉴权的路由**,`ai-proxy` 缺了而配了
-`upstreamAuthSecretRef` 则是必然 401。三者都置 `GatewaySynced=False`。
-**本来就没东西要写**(没配 `authConsumers` / 没配 `upstreamAuthSecretRef`)则跳过,
-那只是这个集群没用这个插件。`ai-statistics` 是唯一的例外,缺了只丢指标,一律跳过。
+`key-auth` 缺了而 fleet 配了 `authConsumers` 就是**一条不鉴权的路由**,都置 `GatewaySynced=False`。
+**本来就没东西要写**则跳过,那只是这个集群没用这个插件。两个例外:`ai-statistics` 缺了只丢指标,
+一律跳过;`ai-proxy` 缺了**且凭证是默认来的**(没显式写 `upstreamAuthSecretRef`)也跳过 ——
+一个从没部署过 ai-proxy、也从没指定过 Secret 的集群,就是 openresty 不收 key 的集群,
+不该因为加了默认值就变成「fleet 拒绝发布」。**显式写了 `upstreamAuthSecretRef` 则是指令,照样失败。**
+
+**`status.observedGeneration` 只在同步成功时推进**。它是 console 和 decision-gen 轮询的收敛信号,
+失败时也推进就等于告诉它们「新的分流已经生效」,而实际上什么都没写、表还冻在上一次好值。
+
+**`status.appliedExtraPlugins` 记下真正写过的透传插件**。从 spec 里删掉一个 key 时,reconciler
+只看得见「现在有什么」,不记就撤不回来 —— 那条限流规则会继续在活路由上生效,而 CR 里已经没有它了。
+这跟 ModelRoute 用 `appliedRouteKey` 处理改名是同一个理由。
 
 **几个容易想当然的点**:
 

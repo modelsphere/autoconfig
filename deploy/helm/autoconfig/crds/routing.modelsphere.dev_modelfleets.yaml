@@ -358,6 +358,17 @@ spec:
             description: ModelFleetStatus is written only by this controller, through
               the status subresource.
             properties:
+              appliedExtraPlugins:
+                description: |-
+                  AppliedExtraPlugins: the gateway.extraPlugins keys this controller has actually written
+                  a rule for. Removing a key from the spec is otherwise undetectable - the reconciler
+                  only ever sees what is there now - and the rule it wrote would keep enforcing itself on
+                  the live route with nothing in the CR to say so. Same reason ModelRoute keeps
+                  appliedRouteKey across a rename.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
               conditions:
                 description: |-
                   Conditions: Ready (serving), GatewaySynced (objects written), PolicyApplied (the policy

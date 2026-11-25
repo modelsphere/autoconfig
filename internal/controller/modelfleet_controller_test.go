@@ -835,3 +835,187 @@ func TestFleetDeleteWithdrawsExtraPluginRules(t *testing.T) {
 		t.Fatalf("passthrough rule left behind after delete: %v", rules)
 	}
 }
+
+// observedGeneration is the convergence signal console and decision-gen poll. Advancing it
+// on a failed reconcile tells them the new split is live while nothing was written.
+func TestFleetObservedGenerationOnlyAdvancesOnSuccess(t *testing.T) {
+	r, c := newFleetReconciler(t,
+		fleetFixture(), // wants an allow-list
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), // key-auth missing -> sync fails
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if fleet.Status.ObservedGeneration == fleet.Generation {
+		t.Fatalf("observedGeneration = generation = %d after a failed sync", fleet.Generation)
+	}
+}
+
+// An address that was removed must disappear from status, not linger: status.endpoint is the
+// one address the console shows.
+func TestFleetEndpointClearedWhenExternalURLRemoved(t *testing.T) {
+	r, c := newFleetReconciler(t,
+		fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if fleet.Status.Endpoint == "" {
+		t.Fatal("precondition: endpoint should have been set")
+	}
+	fleet.Spec.Gateway.ExternalURL = ""
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	_ = c.Get(context.Background(), nn, &fleet)
+	if fleet.Status.Endpoint != "" {
+		t.Fatalf("stale endpoint kept: %q", fleet.Status.Endpoint)
+	}
+}
+
+// An overridable plugin passed through must be written once, by the fleet - not written by
+// the controller's default first and then overwritten, twice per resync forever.
+func TestFleetOverriddenStatisticsIsWrittenOnce(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"ai-statistics": rawJSON(t, map[string]any{"attributes": []any{
+			map[string]any{"key": "mine", "value": "model", "value_source": "request_body", "apply_to_log": true},
+		}}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-statistics")[0].(map[string]any)
+	attrs, _, _ := unstructured.NestedSlice(rule, "config", "attributes")
+	key, _, _ := unstructured.NestedString(attrs[0].(map[string]any), "key")
+	if key != "mine" {
+		t.Fatalf("the fleet's config did not win: %v", rule["config"])
+	}
+	// ...and a second reconcile writes nothing at all.
+	before := resourceVersionOf(t, c, "ai-statistics")
+	reconcileFleet(t, r)
+	if after := resourceVersionOf(t, c, "ai-statistics"); after != before {
+		t.Fatalf("overridden plugin rewritten on an unchanged reconcile: %s -> %s", before, after)
+	}
+}
+
+// Taking a key out of extraPlugins has to withdraw the rule it wrote. Nothing else will: the
+// reconciler only ever sees the spec as it is now.
+func TestFleetRemovedExtraPluginRuleIsWithdrawn(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"cluster-key-rate-limit": rawJSON(t, map[string]any{"rule_name": "x"}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("cluster-key-rate-limit"),
+	)
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "cluster-key-rate-limit")); n != 1 {
+		t.Fatalf("precondition: rules = %d, want 1", n)
+	}
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if len(fleet.Status.AppliedExtraPlugins) != 1 {
+		t.Fatalf("status did not record what was written: %v", fleet.Status.AppliedExtraPlugins)
+	}
+	fleet.Spec.Gateway.ExtraPlugins = nil
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	if rules := getPlugin(t, c, "cluster-key-rate-limit"); len(rules) != 0 {
+		t.Fatalf("rule still enforced on the live route after its key was removed: %v", rules)
+	}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if len(fleet.Status.AppliedExtraPlugins) != 0 {
+		t.Fatalf("status still claims %v", fleet.Status.AppliedExtraPlugins)
+	}
+}
+
+// `plugin: null` must be refused, not treated as "withdraw": an emptied entry would quietly
+// take a plugin off a live route while reporting a healthy sync.
+func TestFleetNullExtraPluginConfigIsRefused(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"cluster-key-rate-limit": {Raw: []byte("null")},
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("cluster-key-rate-limit"),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("a null plugin config reported a healthy sync")
+	}
+}
+
+// A cluster that never deployed ai-proxy and never named a Secret takes no key from the
+// gateway; defaulting the credential must not turn that into a fleet that refuses to publish.
+func TestFleetDefaultedCredentialToleratesMissingAIProxy(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "" // defaulted
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "openresty-api-keys", Namespace: "llm-route"},
+			Data:       map[string][]byte{"keys": []byte("sk-default")},
+		},
+		// no ai-proxy WasmPlugin
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a defaulted credential with no ai-proxy failed the sync: %+v", fleet.Status.Conditions)
+	}
+}
+
+// ...but naming a Secret is an instruction, so a missing ai-proxy then IS a failure.
+func TestFleetExplicitCredentialRequiresAIProxy(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.UpstreamAuthSecretRef = "mine:gateway"
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "mine", Namespace: "llm-route"},
+			Data:       map[string][]byte{"gateway": []byte("sk-explicit")},
+		},
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("an explicitly named credential was silently skipped when ai-proxy was absent")
+	}
+}

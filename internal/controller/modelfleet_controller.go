@@ -74,15 +74,14 @@ var wasmPluginGVK = schema.GroupVersionKind{
 type fleetPlugin struct {
 	// name of the WasmPlugin object in the gateway namespace.
 	name string
-	// optional: a missing WasmPlugin is never fatal, even when we had a rule to write. Only
-	// true for plugins whose absence costs nothing but observability.
+	// tolerateMissing: may this plugin be absent even though we had a rule to write?
 	//
-	// For every other plugin a missing object is fatal IF we had something to write: a fleet
-	// that asked for an allow-list and got no key-auth is an unauthenticated route, and a
-	// fleet that asked for an upstream credential and got no ai-proxy is a route that 401s.
-	// Both are worse as a silent skip than as a failed sync. Having nothing to write is
-	// different, and stays tolerated — that is just a plugin this cluster does not use.
-	optional bool
+	// Normally no: a fleet that asked for an allow-list and got no key-auth is an
+	// unauthenticated route, and that is worse as a silent skip than as a failed sync.
+	// Having nothing to write is always tolerated - that is just a plugin this cluster does
+	// not use. The exceptions are per-plugin and depend on what the fleet actually asked
+	// for, so this is a decision rather than a constant.
+	tolerateMissing func(*fleetRender) bool
 	// config renders this plugin's per-route config; returning nil means "no rule for this
 	// fleet", which removes any rule we previously wrote.
 	config func(*fleetRender) (any, error)
@@ -91,7 +90,20 @@ type fleetPlugin struct {
 // ModelFleetReconciler reconciles ModelFleet.
 type ModelFleetReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader reads straight from the API server, bypassing the manager's cache. Secrets go
+	// through it: a cached Get on a Secret starts an informer over EVERY Secret in the
+	// cluster, which is a memory footprint and a blast radius out of all proportion to
+	// needing one key. Nil falls back to the cached client, which keeps the tests simple.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+}
+
+// reader returns the uncached reader when one is wired up.
+func (r *ModelFleetReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=routing.modelsphere.dev,resources=modelfleets,verbs=get;list;watch;create;update;patch;delete
@@ -99,7 +111,7 @@ type ModelFleetReconciler struct {
 // +kubebuilder:rbac:groups=routing.modelsphere.dev,resources=modelfleets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=extensions.higress.io,resources=wasmplugins,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 // fleetRender is everything the renderers need, resolved once per reconcile.
 type fleetRender struct {
@@ -109,6 +121,10 @@ type fleetRender struct {
 	members     []sink.FleetMemberView
 	effective   map[string]int32
 	upstreamKey string
+	// upstreamKeyDefaulted: the credential came from the default Secret, not from a named one.
+	upstreamKeyDefaulted bool
+	// appliedExtras: the extraPlugins keys written this round, for status.
+	appliedExtras []string
 	// orphans: trafficPolicy entries naming members that no longer exist. Reported, never
 	// rejected: refusing the policy would deadlock console's member delete against
 	// decision-gen's stale policy, with neither side able to write first.
@@ -243,6 +259,7 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		// openresty is not asking for a key on this cluster.
 	default:
 		defaulted := ref == ""
+		rend.upstreamKeyDefaulted = defaulted
 		if defaulted {
 			ref = defaultUpstreamSecret
 		}
@@ -405,7 +422,12 @@ func fleetPlugins() []fleetPlugin {
 		},
 	}, {
 		// Without a rule here the gateway presents no credential to openresty: 401.
-		name: "ai-proxy",
+		// Tolerated only when the credential was DEFAULTED rather than asked for: a cluster
+		// that never deployed ai-proxy and never named a Secret is one where openresty takes
+		// no key, and defaulting must not turn that into a fleet that refuses to publish.
+		// An explicit upstreamAuthSecretRef is an instruction, and is enforced.
+		name:            "ai-proxy",
+		tolerateMissing: func(f *fleetRender) bool { return f.upstreamKeyDefaulted },
 		config: func(f *fleetRender) (any, error) {
 			if f.upstreamKey == "" {
 				return nil, nil
@@ -413,10 +435,11 @@ func fleetPlugins() []fleetPlugin {
 			return sink.RenderAIProxy(f.upstreamKey)
 		},
 	}, {
-		// Without a rule here the model simply has no token accounting.
-		name:     "ai-statistics",
-		optional: true,
-		config:   func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
+		// Without a rule here the model simply has no token accounting: its absence costs
+		// metrics and nothing else, so it is always tolerated.
+		name:            "ai-statistics",
+		tolerateMissing: func(*fleetRender) bool { return true },
+		config:          func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
 	}}
 }
 
@@ -426,7 +449,7 @@ func fleetPlugins() []fleetPlugin {
 func renderedPlugins() map[string]bool {
 	out := map[string]bool{}
 	for _, p := range fleetPlugins() {
-		if p.name != "ai-statistics" { // ai-statistics carries no state of ours; it may be overridden
+		if p.tolerateMissing == nil { // the three whose config we compute; ai-statistics may be overridden
 			out[p.name] = true
 		}
 	}
@@ -435,7 +458,20 @@ func renderedPlugins() map[string]bool {
 
 func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleetRender) error {
 	var errs []string
+	extra := rend.fleet.Spec.Gateway.ExtraPlugins
+	rendered := renderedPlugins()
 	for _, p := range fleetPlugins() {
+		// An OVERRIDABLE plugin that the fleet passes through is the fleet's, not ours.
+		// Rendering it here too would write the object twice per reconcile - our default,
+		// then theirs - which is two config pushes to the gateway every resync plus a
+		// window where our default is live instead of what they asked for.
+		//
+		// Only overridable ones: the three we compute must still be written even when a
+		// stale CRD let them into extraPlugins, or passing one through would stop the real
+		// table, allow-list or credential from being programmed at all.
+		if _, overridden := extra[p.name]; overridden && !rendered[p.name] {
+			continue
+		}
 		cfg, err := p.config(rend)
 		if err != nil {
 			// A render error must not be written: the plugin validates its config at the
@@ -452,7 +488,8 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 			}
 		}
 		if err := r.upsertMatchRule(ctx, rend, p, raw); err != nil {
-			if apierrors.IsNotFound(err) && (p.optional || raw == nil) {
+			if apierrors.IsNotFound(err) && (raw == nil ||
+				(p.tolerateMissing != nil && p.tolerateMissing(rend))) {
 				continue
 			}
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
@@ -460,13 +497,11 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 	}
 	// Passthrough plugins: whatever the fleet declared, written verbatim. Sorted so the work
 	// is deterministic and an unchanged spec produces no writes.
-	extra := rend.fleet.Spec.Gateway.ExtraPlugins
 	names := make([]string, 0, len(extra))
 	for name := range extra {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	rendered := renderedPlugins()
 	for _, name := range names {
 		if rendered[name] {
 			errs = append(errs, fmt.Sprintf("%s: rendered by this controller, cannot be passed through", name))
@@ -477,12 +512,39 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 			errs = append(errs, fmt.Sprintf("%s: config is not an object: %v", name, err))
 			continue
 		}
+		if raw == nil {
+			// `plugin: null` unmarshals cleanly into a nil map, which downstream means
+			// "withdraw our rule" - so an emptied entry would quietly take the plugin off a
+			// live route while reporting a healthy sync. Declaring a plugin means giving it
+			// a config; removing the key is how you take it away.
+			errs = append(errs, fmt.Sprintf("%s: config is null; remove the key to withdraw the rule", name))
+			continue
+		}
 		// Not optional: the fleet asked for this config, so a plugin that is not there means
 		// the route goes live without something it was told to have.
 		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: name}, raw); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 		}
 	}
+	rend.appliedExtras = names
+
+	// Keys that were in the spec last time and are not now: we wrote those rules, so we take
+	// them back. Nothing else will - the reconciler only ever sees the current spec, so a
+	// removed rate-limit entry would keep being enforced on a live route with nothing in the
+	// CR to say so.
+	desired := map[string]bool{}
+	for _, n := range names {
+		desired[n] = true
+	}
+	for _, old := range rend.fleet.Status.AppliedExtraPlugins {
+		if desired[old] || rendered[old] {
+			continue
+		}
+		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: old}, nil); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Sprintf("%s: withdraw: %v", old, err))
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
@@ -540,9 +602,21 @@ func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *ro
 	rend := &fleetRender{fleet: fleet, ingressRef: fleet.Namespace + "/" + ingressName(fleet)}
 	var errs []string
 	plugins := fleetPlugins()
-	// Passthrough plugins were written by us too, so they have to be withdrawn by us.
+	// Passthrough plugins were written by us too, so they have to be withdrawn by us - both
+	// the ones still in the spec and any we recorded having written.
+	seen := map[string]bool{}
+	for _, p := range plugins {
+		seen[p.name] = true
+	}
 	for name := range fleet.Spec.Gateway.ExtraPlugins {
-		plugins = append(plugins, fleetPlugin{name: name})
+		if !seen[name] {
+			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
+		}
+	}
+	for _, name := range fleet.Status.AppliedExtraPlugins {
+		if !seen[name] {
+			plugins, seen[name] = append(plugins, fleetPlugin{name: name}), true
+		}
 	}
 	for _, p := range plugins {
 		if err := r.upsertMatchRule(ctx, rend, p, nil); err != nil && !apierrors.IsNotFound(err) {
@@ -593,7 +667,12 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 			return err
 		}
 		st := &fleet.Status
-		st.ObservedGeneration = fleet.Generation
+		if syncStatus == metav1.ConditionTrue {
+			// Only on success. observedGeneration == generation is THE convergence signal
+			// console and decision-gen poll; advancing it on a failed reconcile tells them
+			// the new split is live while nothing was written and the table is frozen.
+			st.ObservedGeneration = fleet.Generation
+		}
 		now := metav1.Now()
 		st.LastSyncTime = &now
 
@@ -601,8 +680,14 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 			st.ModelName = rend.modelName
 			if u := fleet.Spec.Gateway.ExternalURL; u != "" {
 				st.Endpoint = strings.TrimSuffix(u, "/") + "/v1"
+			} else {
+				// Cleared or removed: blank it. status.endpoint is "the one address the
+				// console shows", so leaving the old one there keeps a wrong address on
+				// screen indefinitely.
+				st.Endpoint = ""
 			}
 			st.Members = memberStatuses(&fleet, rend)
+			st.AppliedExtraPlugins = rend.appliedExtras
 			st.TotalCapacity = totalCapacity(st.Members, &fleet)
 
 			policyOK, policyReason, policyMsg := metav1.ConditionTrue, "Applied", "traffic policy applied"
@@ -728,7 +813,7 @@ func (r *ModelFleetReconciler) readSecretKey(ctx context.Context, ref, defNS str
 		return "", fmt.Errorf("upstreamAuthSecretRef %q: want [ns/]name:key", ref)
 	}
 	var sec corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: nameKey[:i]}, &sec); err != nil {
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: ns, Name: nameKey[:i]}, &sec); err != nil {
 		return "", fmt.Errorf("upstreamAuthSecretRef %q: %w", ref, err)
 	}
 	v, ok := sec.Data[nameKey[i+1:]]

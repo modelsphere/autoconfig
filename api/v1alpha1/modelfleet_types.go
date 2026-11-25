@@ -329,6 +329,14 @@ type ModelFleetStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	Members []MemberStatus `json:"members,omitempty"`
+	// AppliedExtraPlugins: the gateway.extraPlugins keys this controller has actually written
+	// a rule for. Removing a key from the spec is otherwise undetectable - the reconciler
+	// only ever sees what is there now - and the rule it wrote would keep enforcing itself on
+	// the live route with nothing in the CR to say so. Same reason ModelRoute keeps
+	// appliedRouteKey across a rename.
+	// +optional
+	// +listType=set
+	AppliedExtraPlugins []string `json:"appliedExtraPlugins,omitempty"`
 	// LastSyncTime: when the gateway objects were last written.
 	// +optional
 	LastSyncTime *metav1.Time `json:"lastSyncTime,omitempty"`

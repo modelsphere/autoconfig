@@ -256,6 +256,11 @@ func (in *ModelFleetStatus) DeepCopyInto(out *ModelFleetStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.AppliedExtraPlugins != nil {
+		in, out := &in.AppliedExtraPlugins, &out.AppliedExtraPlugins
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.LastSyncTime != nil {
 		in, out := &in.LastSyncTime, &out.LastSyncTime
 		*out = (*in).DeepCopy()
