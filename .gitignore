@@ -1,9 +1,2 @@
-# 交叉编译产物(本机 build,不入库)
-/autoconfig
-autoconfig.exe
-/hagate
-/reload
-/autoconfig
-
-# 排查时的抓包/落盘,禁止入库(含真实请求体与内网地址)
-/debug/
+# Build output: `make build` drops cross-compiled binaries here.
+bin/

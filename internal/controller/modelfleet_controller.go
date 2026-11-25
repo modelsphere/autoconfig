@@ -435,7 +435,14 @@ func ruleBindsTo(item any, ingressRef string) bool {
 	return false
 }
 
+// sameRules compares two rule lists. A nil list and an empty one are the same list: the
+// WasmPlugin may have no matchRules field at all, and json.Marshal renders those as "null"
+// and "[]", which would make an unchanged plugin look changed and earn a pointless config
+// push to the gateway on every resync.
 func sameRules(a, b []any) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
 	ab, err1 := json.Marshal(a)
 	bb, err2 := json.Marshal(b)
 	return err1 == nil && err2 == nil && string(ab) == string(bb)

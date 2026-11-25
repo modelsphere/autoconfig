@@ -190,8 +190,18 @@ func RenderDecisionTable(modelName, defaultMember string, members []FleetMemberV
 	if !ok {
 		return nil, fmt.Errorf("render decision table: defaultMember %q is not a member", defaultMember)
 	}
+	// No path means the member's ModelRoute could not be resolved, and the plugin resolves
+	// `default` by id against this table, so there is nothing safe to ship: rendering without
+	// it would leave the fleet with no landing spot, and picking a different default silently
+	// would move every fallback request to hardware nobody chose.
+	//
+	// The whole table is therefore left untouched, which freezes the other members' weights
+	// at their last good values rather than taking the fleet down — the same fail-safe the
+	// ModelRoute controller uses when discovery comes back empty. It is reported on
+	// GatewaySynced, so a frozen table is visible rather than silent.
 	if def.Path == "" {
-		return nil, fmt.Errorf("render decision table: defaultMember %q has no path", defaultMember)
+		return nil, fmt.Errorf("render decision table: defaultMember %q has no backing ModelRoute, "+
+			"so the table is left unchanged and every member's weights stay frozen", defaultMember)
 	}
 
 	backends := make([]fleetBackend, 0, len(members))

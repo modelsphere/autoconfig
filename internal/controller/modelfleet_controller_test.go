@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -454,4 +455,66 @@ func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 		t.Fatal(err)
 	}
 	return o.GetResourceVersion()
+}
+
+// A plugin that exists with no match rules at all, and a fleet with nothing to write to it,
+// must not be written. nil and [] are the same empty list; marshalling them differently made
+// every 30s resync push an identical config to the gateway.
+func TestFleetUnchangedEmptyPluginIsNotRewritten(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.AuthConsumers = nil // nothing to write into key-auth
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), wasmPlugin("key-auth"),
+	)
+	reconcileFleet(t, r)
+	first := resourceVersionOf(t, c, "key-auth")
+	reconcileFleet(t, r)
+	if second := resourceVersionOf(t, c, "key-auth"); second != first {
+		t.Fatalf("empty plugin rewritten with nothing to write: %s -> %s", first, second)
+	}
+}
+
+// If the default member's ModelRoute is gone there is no safe table to ship, so the existing
+// one is left alone and the failure is reported. Overwriting it would leave the fleet with no
+// landing spot for a fallback; picking another default silently would move those requests to
+// hardware nobody chose.
+func TestFleetMissingDefaultMemberRouteFreezesTableAndReports(t *testing.T) {
+	f := fleetFixture() // defaultMember: h100
+	existing := map[string]any{
+		"ingress":       []any{"llm-route/llm-fleet-glm-5.3"},
+		"configDisable": false,
+		"config":        map[string]any{"marker": "last-good"},
+	}
+	r, c := newFleetReconciler(t, f,
+		// h100's ModelRoute is absent; ascend's is healthy.
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router", existing), wasmPlugin("key-auth"),
+	)
+	reconcileFleet(t, r)
+
+	rules := getPlugin(t, c, "ai-backend-router")
+	if len(rules) != 1 {
+		t.Fatalf("rules = %d, want the previous one kept", len(rules))
+	}
+	marker, _, _ := unstructured.NestedString(rules[0].(map[string]any), "config", "marker")
+	if marker != "last-good" {
+		t.Fatalf("the last good table was overwritten: %v", rules[0])
+	}
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("a frozen table was reported as synced")
+	}
+	var msg string
+	for _, cd := range fleet.Status.Conditions {
+		if cd.Type == condGatewaySynced {
+			msg = cd.Message
+		}
+	}
+	if !strings.Contains(msg, "frozen") || !strings.Contains(msg, "h100") {
+		t.Fatalf("GatewaySynced message does not say what froze or why: %q", msg)
+	}
 }
