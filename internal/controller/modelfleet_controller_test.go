@@ -787,8 +787,9 @@ func TestFleetMissingExtraPluginFailsSync(t *testing.T) {
 }
 
 // Passing through a plugin the controller renders itself would put two writers on one rule.
-// The CRD refuses it at apply time; this is the controller's own guard for an older cluster
-// whose CRD has not been updated.
+// This is the only guard against it: a CEL rule on extraPlugins cannot exist, because the
+// API server leaves a map with x-kubernetes-preserve-unknown-fields values out of the CEL
+// type system and would reject the whole CRD.
 func TestFleetExtraPluginCannotOverrideARenderedOne(t *testing.T) {
 	f := fleetFixture()
 	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
@@ -949,6 +950,50 @@ func TestFleetRemovedExtraPluginRuleIsWithdrawn(t *testing.T) {
 	_ = c.Get(context.Background(), nn, &fleet)
 	if len(fleet.Status.AppliedExtraPlugins) != 0 {
 		t.Fatalf("status still claims %v", fleet.Status.AppliedExtraPlugins)
+	}
+}
+
+// Stopping an override of a plugin the controller also renders itself must NOT withdraw it:
+// the built-in renderer has just put our default back on the route, and withdrawing it in the
+// same pass would take token accounting off a live route moments after programming it.
+func TestFleetStoppingAnOverrideRestoresTheDefaultRule(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"ai-statistics": rawJSON(t, map[string]any{"attributes": []any{
+			map[string]any{"key": "mine", "value": "model", "value_source": "request_body", "apply_to_log": true},
+		}}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	if len(fleet.Status.AppliedExtraPlugins) != 1 {
+		t.Fatalf("precondition: status = %v", fleet.Status.AppliedExtraPlugins)
+	}
+	fleet.Spec.Gateway.ExtraPlugins = nil
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	rules := getPlugin(t, c, "ai-statistics")
+	if len(rules) != 1 {
+		t.Fatalf("ai-statistics rules = %d, want our default back (withdrawn by the override bookkeeping?)", len(rules))
+	}
+	rule := rules[0].(map[string]any)
+	attrs, _, _ := unstructured.NestedSlice(rule, "config", "attributes")
+	if len(attrs) != 1 {
+		t.Fatalf("config = %v", rule["config"])
+	}
+	if key, _, _ := unstructured.NestedString(attrs[0].(map[string]any), "key"); key != "requested_model" {
+		t.Fatalf("the override is still live after its key was removed: %v", rule["config"])
 	}
 }
 

@@ -545,8 +545,17 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 	for _, n := range names {
 		desired[n] = true
 	}
+	builtin := map[string]bool{}
+	for _, p := range fleetPlugins() {
+		builtin[p.name] = true
+	}
 	for _, old := range rend.fleet.Status.AppliedExtraPlugins {
-		if desired[old] || rendered[old] {
+		// Never withdraw a plugin this controller writes itself. An overridable one
+		// (ai-statistics) that the fleet stops overriding has just been written again by the
+		// loop above, with our default - withdrawing it here would take it off the route
+		// moments after programming it, so the route would lose token accounting until some
+		// later reconcile happened to put it back.
+		if desired[old] || rendered[old] || builtin[old] {
 			continue
 		}
 		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: old}, nil); err != nil && !apierrors.IsNotFound(err) {
