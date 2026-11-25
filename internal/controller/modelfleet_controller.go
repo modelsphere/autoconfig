@@ -624,18 +624,37 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 		if err != nil {
 			return fmt.Errorf("read matchRules: %w", err)
 		}
-		kept := make([]any, 0, len(rules)+1)
-		for _, item := range rules {
-			if !ruleBindsTo(item, rend.ingressRef) {
-				kept = append(kept, item)
-			}
-		}
+		var mine map[string]any
 		if cfg != nil {
-			kept = append(kept, map[string]any{
+			mine = map[string]any{
 				"ingress":       []any{rend.ingressRef},
 				"configDisable": false,
 				"config":        cfg,
-			})
+			}
+		}
+		// Our rule keeps the POSITION it already had, rather than being dropped and appended.
+		// sameRules compares the list in order, so appending moves our rule to the end, which
+		// every other fleet writing this same plugin then sees as a change and answers by
+		// moving its own rule to the end - and so on, every resync, for as long as two fleets
+		// share a gateway. Measured on a test cluster with two fleets: the two rules swapped
+		// places roughly every 35s, and each swap is an ECDS push of this plugin to the whole
+		// data plane. Position is not semantic here (rules bind to disjoint Ingresses), but it
+		// has to be STABLE, and foreign rules must keep theirs too.
+		kept := make([]any, 0, len(rules)+1)
+		placed := false
+		for _, item := range rules {
+			if !ruleBindsTo(item, rend.ingressRef) {
+				kept = append(kept, item)
+				continue
+			}
+			if mine != nil && !placed {
+				kept = append(kept, mine)
+				placed = true
+			}
+			// Any further rule of ours is a duplicate and is dropped.
+		}
+		if mine != nil && !placed {
+			kept = append(kept, mine)
 		}
 		if sameRules(rules, kept) {
 			// Nothing changed: do not write. Every write here is a config push to the

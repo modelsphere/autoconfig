@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -452,6 +453,64 @@ func condTrue(conds []metav1.Condition, t string) bool {
 		}
 	}
 	return false
+}
+
+// Two fleets sharing one gateway must settle. Each fleet rewrites one rule inside the same
+// WasmPlugin, and the unchanged-check compares matchRules in order, so a fleet that drops its
+// own rule and appends it moves itself to the end of the list - which the other fleet then
+// sees as a change and answers by moving itself to the end, every resync, forever. Each swap
+// is an ECDS push of that plugin to the whole data plane. Measured on a test cluster before
+// the fix: the two rules traded places about every 35s with nothing changing.
+func TestTwoFleetsSharingAPluginSettle(t *testing.T) {
+	a := fleetFixture()
+	b := fleetFixture()
+	b.Name = "qwen-7b"
+	b.Spec.ModelName = "qwen-7b"
+
+	r, c := newFleetReconciler(t, a, b,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+	)
+	reconcile := func(name string) {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: name},
+		}); err != nil {
+			t.Fatalf("reconcile %s: %v", name, err)
+		}
+	}
+	order := func() []string {
+		t.Helper()
+		var out []string
+		for _, item := range getPlugin(t, c, "ai-statistics") {
+			ings, _, _ := unstructured.NestedStringSlice(item.(map[string]any), "ingress")
+			out = append(out, ings...)
+		}
+		return out
+	}
+
+	reconcile("glm-5.3")
+	reconcile("qwen-7b")
+	first := order()
+	if len(first) != 2 {
+		t.Fatalf("rules = %v, want one per fleet", first)
+	}
+
+	// Now resync both, repeatedly, with nothing changed. Neither the order nor the object may
+	// move again.
+	rv := resourceVersionOf(t, c, "ai-statistics")
+	for i := 0; i < 3; i++ {
+		reconcile("glm-5.3")
+		reconcile("qwen-7b")
+	}
+	if got := order(); !reflect.DeepEqual(got, first) {
+		t.Fatalf("rule order churns: %v -> %v", first, got)
+	}
+	if after := resourceVersionOf(t, c, "ai-statistics"); after != rv {
+		t.Fatalf("ai-statistics rewritten on resync with nothing changed: %s -> %s", rv, after)
+	}
 }
 
 func resourceVersionOf(t *testing.T, c client.Client, name string) string {
