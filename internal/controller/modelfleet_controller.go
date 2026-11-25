@@ -1020,6 +1020,7 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 				st.Endpoint = ""
 			}
 			st.Members = memberStatuses(&fleet, rend)
+			st.MemberCount = int32(len(st.Members))
 			st.AppliedExtraPlugins = rend.appliedExtras
 			if syncStatus == metav1.ConditionTrue {
 				// Only on success: claiming a namespace whose rules were not written would

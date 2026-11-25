@@ -919,6 +919,32 @@ func TestFleetMovingGatewayNamespaceWithdrawsTheOldRules(t *testing.T) {
 	}
 }
 
+// The Members print column is fed by a field, because a print column's JSONPath is evaluated
+// by the API server and cannot count a list - pointing it at .status.members.length() renders
+// an empty column, which is worse than the wrong-but-populated one it replaced.
+func TestFleetStatusCountsItsMembers(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if got, want := fleet.Status.MemberCount, int32(len(fleet.Status.Members)); got != want {
+		t.Fatalf("status.memberCount = %d, want %d", got, want)
+	}
+	if fleet.Status.MemberCount != 2 {
+		t.Fatalf("status.memberCount = %d, want 2", fleet.Status.MemberCount)
+	}
+	// ...and it is not the replica count, which is the number it used to show.
+	if fleet.Status.TotalCapacity != nil && fleet.Status.MemberCount == fleet.Status.TotalCapacity.ReadyReplicas {
+		t.Fatalf("memberCount %d equals readyReplicas: the fixture no longer distinguishes them",
+			fleet.Status.MemberCount)
+	}
+}
+
 func resourceVersionOf(t *testing.T, c client.Client, name string) string {
 	t.Helper()
 	o := &unstructured.Unstructured{}

@@ -353,6 +353,10 @@ type ModelFleetStatus struct {
 	// +optional
 	// +listType=set
 	AppliedExtraPlugins []string `json:"appliedExtraPlugins,omitempty"`
+	// MemberCount: how many members this fleet has, for the Members print column (a print
+	// column cannot count a list itself).
+	// +optional
+	MemberCount int32 `json:"memberCount,omitempty"`
 	// AppliedGatewayNamespace: the gateway namespace this fleet's rules were last written to,
 	// for the same reason appliedExtraPlugins exists. Rules are written into WasmPlugins in
 	// spec.gateway.namespace, and the reconciler only ever sees the namespace that is there
@@ -378,9 +382,12 @@ type ModelFleetStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=mf
 // +kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.status.modelName`
-// Members is the number of members, so it counts status.members - readyReplicas is a count
-// of engine replicas across the fleet, which is a different (and usually larger) number.
-// +kubebuilder:printcolumn:name="Members",type=integer,JSONPath=`.status.members.length()`
+// Members counts members and Replicas counts engine replicas across them: different numbers,
+// and the column used to show the second under the first one's name. A print column's
+// JSONPath is evaluated by the API server and has no length() - pointing it at
+// .status.members.length() renders an empty column, which is worse than a wrong one - so the
+// count is a field.
+// +kubebuilder:printcolumn:name="Members",type=integer,JSONPath=`.status.memberCount`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.totalCapacity.readyReplicas`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

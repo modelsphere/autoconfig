@@ -20,7 +20,7 @@ spec:
     - jsonPath: .status.modelName
       name: Model
       type: string
-    - jsonPath: .status.members.length()
+    - jsonPath: .status.memberCount
       name: Members
       type: integer
     - jsonPath: .status.totalCapacity.readyReplicas
@@ -471,6 +471,12 @@ spec:
                   GatewaySynced answer the latter.
                 format: date-time
                 type: string
+              memberCount:
+                description: |-
+                  MemberCount: how many members this fleet has, for the Members print column (a print
+                  column cannot count a list itself).
+                format: int32
+                type: integer
               members:
                 description: 'Members: per-member observed state.'
                 items:
