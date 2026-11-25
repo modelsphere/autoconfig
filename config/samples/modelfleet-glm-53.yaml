@@ -27,6 +27,16 @@ spec:
     authConsumers: [ops]        # key-auth allow-list for this route (keys stay in the chart)
     # upstreamAuthSecretRef: omitted = openresty-api-keys:keys, where that key already
     # lives. Set it only to point elsewhere, or to "none" if openresty needs no key.
+    # extraPlugins: config for plugins this controller has no opinion about, passed through
+    # verbatim as this route's match rule. Adding a plugin to the gateway is a chart change
+    # plus a few lines here - no new CRD field, no new release of the controller.
+    # NOT validated: plugin config is checked at the gateway, so a wrong field applies
+    # cleanly and then fails when the gateway loads the plugin.
+    # extraPlugins:
+    #   cluster-key-rate-limit:
+    #     rule_name: glm-53
+    #     limit_by_header: x-mse-consumer
+    #     limit_keys: [{key: tenant-a, query_per_minute: 600}]
 
   # Where traffic lands when no member is selectable (all drained, all weights 0, or the
   # plugin errors). That round does not overflow afterwards.

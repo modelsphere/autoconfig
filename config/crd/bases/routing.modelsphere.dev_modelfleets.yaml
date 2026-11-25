@@ -66,6 +66,8 @@ spec:
               unusable, so a dangling name is a hole in the one path that is supposed to have no holes.
               Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
               setting that will never take effect.
+              A plugin this controller renders itself cannot also be passed through: one rule, two
+              writers, and the passed-through one would be overwritten on the next reconcile.
             properties:
               defaultMember:
                 description: |-
@@ -111,6 +113,31 @@ spec:
                       requiring it to be stated.
                     pattern: ^https?://[^/]+$
                     type: string
+                  extraPlugins:
+                    additionalProperties:
+                      x-kubernetes-preserve-unknown-fields: true
+                    description: |-
+                      ExtraPlugins: config for gateway plugins this controller has no opinion about, keyed by
+                      the WasmPlugin object's name and passed through to it verbatim as this route's match
+                      rule. It exists so that adding a plugin to the gateway — rate limiting, context
+                      admission, whatever comes next — is a chart change and a few lines of YAML here, not a
+                      new field, a new renderer and a new release of this controller.
+
+                      A plugin whose config this controller DOES have an opinion about is not accepted here,
+                      because the two writers would fight over one rule: the backend router's table is
+                      computed from live ModelRoute state, key-auth's allow-list is cross-checked against the
+                      gateway's consumers, and ai-proxy's credential is resolved from a Secret so it never
+                      lands in this object.
+
+                      ⚠ The content is NOT validated: plugin config is checked at the gateway, not by the API
+                      server, so a wrong field here applies cleanly and then fails when the gateway loads the
+                      plugin — and one plugin that fails to load stalls the config push for every plugin on
+                      that gateway. Treat this as writing gateway config directly, because that is what it is.
+
+                      Being a map, each key is its own field under Server-Side Apply: a quota service can own
+                      the rate-limit entry while the console owns the rest, with no extra object.
+                    maxProperties: 16
+                    type: object
                   namespace:
                     description: |-
                       Namespace holding the gateway's WasmPlugin objects. Defaults to higress-system, and
@@ -322,6 +349,11 @@ spec:
             - message: trafficPolicy.stickiness is not supported by ai-backend-router
                 yet; it would be silently ignored, so it is refused here
               rule: '!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)'
+            - message: 'gateway.extraPlugins cannot carry ai-backend-router, key-auth
+                or ai-proxy: this controller renders those itself from members, authConsumers
+                and upstreamAuthSecretRef'
+              rule: '!has(self.gateway) || !has(self.gateway.extraPlugins) || self.gateway.extraPlugins.all(k,
+                !(k in [''ai-backend-router'',''key-auth'',''ai-proxy'']))'
           status:
             description: ModelFleetStatus is written only by this controller, through
               the status subresource.

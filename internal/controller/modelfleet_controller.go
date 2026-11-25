@@ -420,6 +420,19 @@ func fleetPlugins() []fleetPlugin {
 	}}
 }
 
+// renderedPlugins: the plugins this controller renders itself. The passthrough path must
+// never write to one of these - the CRD refuses it at apply time, and this is the belt to
+// that pair of braces, since a stale CRD on an older cluster would otherwise let it through.
+func renderedPlugins() map[string]bool {
+	out := map[string]bool{}
+	for _, p := range fleetPlugins() {
+		if p.name != "ai-statistics" { // ai-statistics carries no state of ours; it may be overridden
+			out[p.name] = true
+		}
+	}
+	return out
+}
+
 func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleetRender) error {
 	var errs []string
 	for _, p := range fleetPlugins() {
@@ -443,6 +456,31 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 				continue
 			}
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
+		}
+	}
+	// Passthrough plugins: whatever the fleet declared, written verbatim. Sorted so the work
+	// is deterministic and an unchanged spec produces no writes.
+	extra := rend.fleet.Spec.Gateway.ExtraPlugins
+	names := make([]string, 0, len(extra))
+	for name := range extra {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rendered := renderedPlugins()
+	for _, name := range names {
+		if rendered[name] {
+			errs = append(errs, fmt.Sprintf("%s: rendered by this controller, cannot be passed through", name))
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(extra[name].Raw, &raw); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: config is not an object: %v", name, err))
+			continue
+		}
+		// Not optional: the fleet asked for this config, so a plugin that is not there means
+		// the route goes live without something it was told to have.
+		if err := r.upsertMatchRule(ctx, rend, fleetPlugin{name: name}, raw); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 		}
 	}
 	if len(errs) > 0 {
@@ -501,7 +539,12 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 func (r *ModelFleetReconciler) cleanupPluginRules(ctx context.Context, fleet *routingv1.ModelFleet) error {
 	rend := &fleetRender{fleet: fleet, ingressRef: fleet.Namespace + "/" + ingressName(fleet)}
 	var errs []string
-	for _, p := range fleetPlugins() {
+	plugins := fleetPlugins()
+	// Passthrough plugins were written by us too, so they have to be withdrawn by us.
+	for name := range fleet.Spec.Gateway.ExtraPlugins {
+		plugins = append(plugins, fleetPlugin{name: name})
+	}
+	for _, p := range plugins {
 		if err := r.upsertMatchRule(ctx, rend, p, nil); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
 		}

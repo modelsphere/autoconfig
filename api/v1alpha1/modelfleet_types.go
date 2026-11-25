@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -160,6 +161,28 @@ type GatewaySpec struct {
 	// per member. Defaults to "<fleet ns>/openresty:8080".
 	// +optional
 	Service string `json:"service,omitempty"`
+	// ExtraPlugins: config for gateway plugins this controller has no opinion about, keyed by
+	// the WasmPlugin object's name and passed through to it verbatim as this route's match
+	// rule. It exists so that adding a plugin to the gateway — rate limiting, context
+	// admission, whatever comes next — is a chart change and a few lines of YAML here, not a
+	// new field, a new renderer and a new release of this controller.
+	//
+	// A plugin whose config this controller DOES have an opinion about is not accepted here,
+	// because the two writers would fight over one rule: the backend router's table is
+	// computed from live ModelRoute state, key-auth's allow-list is cross-checked against the
+	// gateway's consumers, and ai-proxy's credential is resolved from a Secret so it never
+	// lands in this object.
+	//
+	// ⚠ The content is NOT validated: plugin config is checked at the gateway, not by the API
+	// server, so a wrong field here applies cleanly and then fails when the gateway loads the
+	// plugin — and one plugin that fails to load stalls the config push for every plugin on
+	// that gateway. Treat this as writing gateway config directly, because that is what it is.
+	//
+	// Being a map, each key is its own field under Server-Side Apply: a quota service can own
+	// the rate-limit entry while the console owns the rest, with no extra object.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=16
+	ExtraPlugins map[string]apiextensionsv1.JSON `json:"extraPlugins,omitempty"`
 	// ExternalURL: how clients reach this gateway from outside, e.g.
 	// "http://172.28.44.17:31080". The controller publishes it as status.endpoint with "/v1"
 	// appended — the one address the console shows. It is configuration rather than something
@@ -206,6 +229,9 @@ type GatewaySpec struct {
 // Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
 // setting that will never take effect.
 // +kubebuilder:validation:XValidation:rule="!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)",message="trafficPolicy.stickiness is not supported by ai-backend-router yet; it would be silently ignored, so it is refused here"
+// A plugin this controller renders itself cannot also be passed through: one rule, two
+// writers, and the passed-through one would be overwritten on the next reconcile.
+// +kubebuilder:validation:XValidation:rule="!has(self.gateway) || !has(self.gateway.extraPlugins) || self.gateway.extraPlugins.all(k, !(k in ['ai-backend-router','key-auth','ai-proxy']))",message="gateway.extraPlugins cannot carry ai-backend-router, key-auth or ai-proxy: this controller renders those itself from members, authConsumers and upstreamAuthSecretRef"
 type ModelFleetSpec struct {
 	// ModelName is what the client sends as body.model, and what model-router copies into the
 	// x-higress-llm-model header the Ingress matches on. Defaults to metadata.name.

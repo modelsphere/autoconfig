@@ -342,6 +342,29 @@ client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种�
 现在 allow 名单归我们写,校验也跟着搬过来。同理,`upstreamAuthSecretRef` 的值不能同时是某个 consumer 的
 credential:那是网关递给 openresty 的凭证,一旦它也能当调用方凭证用,泄露一次等于开两道门。
 
+**接新插件不用改 autoconfig**:`spec.gateway.extraPlugins` 是个 map,key 是 WasmPlugin 对象名,
+value 原样下发成本路由的 matchRule。限流、上下文准入这类 autoconfig 没有任何需要理解的东西的插件,
+走这条路 —— chart 部署一次插件(镜像/phase/priority/failStrategy 本来就是 chart 的事),
+CRD 和 controller 零改动。
+
+```yaml
+gateway:
+  extraPlugins:
+    cluster-key-rate-limit:
+      rule_name: glm-53
+      limit_by_header: x-mse-consumer
+      limit_keys: [{key: tenant-a, query_per_minute: 600}]
+```
+
+**哪些插件必须类型化、不能透传**:配置依赖「写入方看不见的东西」时 ——
+`ai-backend-router` 的表是算出来的(路径来自 ModelRoute、权重按就绪成员归一,都是集群实时状态);
+`ai-proxy` 的内容是密钥(透传等于把明文写进 CR);`key-auth` 的 allow 要对着网关的 consumers 交叉校验,
+而且「谁能用这个模型」是 console 要当一等字段读写的策略。这三个写进 `extraPlugins` 会被拒
+(CEL 在 apply 时拦,controller 里还有一道,防老集群 CRD 没更新)。`ai-statistics` 不在此列,可以覆盖。
+
+⚠️ **透传的内容不校验**。插件的校验在网关侧,写错了 apply 照样成功,要到网关加载插件时才炸,
+而一个插件出问题会连带卡住所有插件的配置下发。用它就等同于直接写网关配置。
+
 **插件不存在时的分寸**:有东西要写却写不进去,就是失败 —— `ai-backend-router` 缺了没有分流,
 `key-auth` 缺了而 fleet 配了 `authConsumers` 就是**一条不鉴权的路由**,`ai-proxy` 缺了而配了
 `upstreamAuthSecretRef` 则是必然 401。三者都置 `GatewaySynced=False`。

@@ -2,11 +2,13 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -714,5 +716,122 @@ func TestFleetUpstreamAuthNoneSkipsAIProxy(t *testing.T) {
 	}
 	if rules := getPlugin(t, c, "ai-proxy"); len(rules) != 0 {
 		t.Fatalf("ai-proxy rule written despite the opt-out: %v", rules)
+	}
+}
+
+func rawJSON(t *testing.T, v any) apiextensionsv1.JSON {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return apiextensionsv1.JSON{Raw: b}
+}
+
+// A plugin this controller knows nothing about is bound to the fleet's route with its config
+// passed through unchanged - that is the whole point: adding a plugin should not need a new
+// field, a new renderer and a new release.
+func TestFleetExtraPluginIsPassedThroughVerbatim(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"cluster-key-rate-limit": rawJSON(t, map[string]any{
+			"rule_name":       "glm-53",
+			"limit_by_header": "x-mse-consumer",
+			"limit_keys":      []any{map[string]any{"key": "tenant-a", "query_per_minute": 600}},
+		}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("cluster-key-rate-limit"),
+	)
+	reconcileFleet(t, r)
+
+	rules := getPlugin(t, c, "cluster-key-rate-limit")
+	if len(rules) != 1 {
+		t.Fatalf("rules = %d, want 1", len(rules))
+	}
+	rule := rules[0].(map[string]any)
+	ings, _, _ := unstructured.NestedStringSlice(rule, "ingress")
+	if len(ings) != 1 || ings[0] != "llm-route/llm-fleet-glm-5.3" {
+		t.Fatalf("rule bound to %v", ings)
+	}
+	name, _, _ := unstructured.NestedString(rule, "config", "rule_name")
+	hdr, _, _ := unstructured.NestedString(rule, "config", "limit_by_header")
+	if name != "glm-53" || hdr != "x-mse-consumer" {
+		t.Fatalf("config was not passed through verbatim: %v", rule["config"])
+	}
+}
+
+// The fleet asked for this config, so a plugin that is not deployed means the route would go
+// live without something it was told to have.
+func TestFleetMissingExtraPluginFailsSync(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"cluster-key-rate-limit": rawJSON(t, map[string]any{"rule_name": "x"}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		// no cluster-key-rate-limit
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("a declared extra plugin was missing, yet the sync reported success")
+	}
+}
+
+// Passing through a plugin the controller renders itself would put two writers on one rule.
+// The CRD refuses it at apply time; this is the controller's own guard for an older cluster
+// whose CRD has not been updated.
+func TestFleetExtraPluginCannotOverrideARenderedOne(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"ai-backend-router": rawJSON(t, map[string]any{"decisions": map[string]any{}}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("extraPlugins was allowed to override a rendered plugin")
+	}
+	// ...and the real table was still written, not replaced by the passthrough blob.
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	if _, found, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends"); !found {
+		t.Fatalf("the computed decision table was clobbered: %v", rule["config"])
+	}
+}
+
+// Deleting the fleet has to withdraw the passthrough rules too: we wrote them, nothing else
+// will take them back.
+func TestFleetDeleteWithdrawsExtraPluginRules(t *testing.T) {
+	f := fleetFixture()
+	now := metav1.Now()
+	f.DeletionTimestamp = &now
+	f.Spec.Gateway.ExtraPlugins = map[string]apiextensionsv1.JSON{
+		"cluster-key-rate-limit": rawJSON(t, map[string]any{"rule_name": "x"}),
+	}
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		wasmPlugin("cluster-key-rate-limit", map[string]any{
+			"ingress":       []any{"llm-route/llm-fleet-glm-5.3"},
+			"configDisable": false,
+			"config":        map[string]any{"rule_name": "x"},
+		}),
+	)
+	reconcileFleet(t, r)
+	if rules := getPlugin(t, c, "cluster-key-rate-limit"); len(rules) != 0 {
+		t.Fatalf("passthrough rule left behind after delete: %v", rules)
 	}
 }
