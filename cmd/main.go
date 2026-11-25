@@ -81,6 +81,15 @@ func runController(leaderElect bool) error {
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}
+	// ModelFleet: aggregates several single-hardware ModelRoutes into one model behind one
+	// gateway address. It only reads ModelRoute status, so the two reconcilers share nothing
+	// but the API group.
+	if err := (&controller.ModelFleetReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return err
+	}
 	// controller-runtime 自带的 ping 检查:进程存活即通过。
 	// 注意它【不能】发现 reconcile 卡死 —— 要那个得看 metrics 的 workqueue_depth。
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -90,7 +99,7 @@ func runController(leaderElect bool) error {
 		return err
 	}
 
-	log.Print("controller start: ModelRoute (routing.modelsphere.dev/v1alpha1)")
+	log.Print("controller start: ModelRoute + ModelFleet (routing.modelsphere.dev/v1alpha1)")
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 

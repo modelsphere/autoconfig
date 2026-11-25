@@ -35,6 +35,7 @@ rules:
   - ""
   resources:
   - pods
+  - secrets
   verbs:
   - get
   - list
@@ -60,6 +61,16 @@ rules:
   - list
   - watch
 - apiGroups:
+  - extensions.higress.io
+  resources:
+  - wasmplugins
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - inference.modelsphere.dev
   resources:
   - llmslorequirements
@@ -68,8 +79,21 @@ rules:
   - list
   - watch
 - apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - routing.modelsphere.dev
   resources:
+  - modelfleets
   - modelroutes
   verbs:
   - create
@@ -82,12 +106,14 @@ rules:
 - apiGroups:
   - routing.modelsphere.dev
   resources:
+  - modelfleets/finalizers
   - modelroutes/finalizers
   verbs:
   - update
 - apiGroups:
   - routing.modelsphere.dev
   resources:
+  - modelfleets/status
   - modelroutes/status
   verbs:
   - get
