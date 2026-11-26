@@ -200,10 +200,7 @@ func (r *ModelRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if s.Use == "backend-svc" && len(peersByTarget["backend-svc"]) == 0 {
 			continue // 兜底 VIP 没解析到(selector 模式 / 解析失败),跳过
 		}
-		mc := s.MaxConcurrency
-		if s.Use == "cart" && s.MaxConcurrencyFromBackend {
-			mc = backendPerInstance * len(backends) // CART 总容量 = 后端单实例并发 × 后端数(随扩缩自动变)
-		}
+		mc := peerMaxConcurrency(s, backendPerInstance, len(backends))
 		// 健康探测路径:cart 层默认 /health(其 /v1/models 是缓存端点、worker 全挂也返 200,不能当健康信号);
 		// 其余层默认空=用 route 的 /v1/models。显式 probePath 覆盖(含把 cart 设回 /v1/models)。
 		probePath := s.ProbePath
@@ -925,6 +922,29 @@ func splitNSName(ref, defaultNS string) (ns, name string) {
 
 // discoveryTarget 构造发现 Target。service 支持 "ns/name"(跨 ns 发现,让 ModelRoute 可放别的 ns),
 // 裸名默认用 ModelRoute 的 ns。selector 路径不支持 ns/name(用默认 ns)。
+// peerMaxConcurrency is the per-peer concurrency cap written for one peer tier.
+//
+//   - cart with maxConcurrencyFromBackend: backend per-instance cap x number of backends,
+//     so it follows scaling (CART fans out to every backend).
+//   - backend-svc without its own maxConcurrency: the same backend x count. The tier is a
+//     single Service VIP that spreads over the same backends, so it can carry what they
+//     can. Left at 0 it would fall back to openresty's default_max (20), and a failover to
+//     this tier would cap the whole route at 20 while the backends could take far more.
+//   - anything else: the tier's own maxConcurrency (0 = openresty's default_max).
+//
+// A backend per-instance cap of 0 (no backend tier, or one without maxConcurrency) leaves
+// the result 0 and openresty's default_max applies, as before.
+func peerMaxConcurrency(p routingv1.RoutePeer, backendPerInstance, backends int) int {
+	switch {
+	case p.Use == "cart" && p.MaxConcurrencyFromBackend:
+		return backendPerInstance * backends
+	case p.Use == "backend-svc" && p.MaxConcurrency == 0:
+		return backendPerInstance * backends
+	default:
+		return p.MaxConcurrency
+	}
+}
+
 // usesBackendSvc 判断 peers 里有没有引用 backend-svc(后端 Service VIP 兜底)来源。
 func usesBackendSvc(peers []routingv1.RoutePeer) bool {
 	for _, p := range peers {
