@@ -2073,3 +2073,50 @@ func TestConsumerPreservedIncumbentBeatsANewcomerInEitherListOrder(t *testing.T)
 		})
 	}
 }
+
+// A newcomer sharing its key with a PRESERVED incumbent must cost only itself.
+//
+// Reached by ordinary sequencing, not by anything adversarial: create tenant-a-v2 with the
+// same key so no caller has to change, then delete the old Secret before the old APIConsumer.
+// The old object is now preserved with that key live, the new one renders the same key, and
+// the duplicate-credential guard in the write path refused the whole ROUND - nothing addable,
+// rotatable or revocable on that gateway until somebody deleted the old object.
+//
+// Neither existing check could see it: the clash map was built only from entries that are
+// neither managed nor claimed, and a preserved name is always one of those, while the object
+// holding the key is not in `views` at all.
+func TestConsumerSharingAKeyWithAPreservedIncumbentCostsOnlyItself(t *testing.T) {
+	old := consumerFixture("tenant-a", "gone-secret")
+	old.Status.ConsumerName = "tenant-a"
+	old.Status.AppliedGatewayNamespace = "higress-system"
+	v2 := consumerFixture("tenant-a-v2", "v2-keys")
+	// Another tenant, to prove the round still goes through for everybody else.
+	bystander := consumerFixture("tenant-b", "b-keys")
+	bystander.Status.ConsumerName = "tenant-b"
+	bystander.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, old, v2, bystander,
+		credSecret("v2-keys", map[string]string{"key": "sk-shared"}),
+		credSecret("b-keys", map[string]string{"key": "sk-b-rotated"}),
+		keyAuthManagedBy("tenant-a,tenant-b",
+			liveConsumer("tenant-a", "Bearer sk-shared"),
+			liveConsumer("tenant-b", "Bearer sk-b")),
+	)
+	round, err := r.programGateway(context.Background(), "higress-system", nil)
+	if err != nil {
+		t.Fatalf("a shared key with a preserved incumbent froze the gateway: %v", err)
+	}
+	why := round.skipped["llm-route/tenant-a-v2"]
+	if !strings.Contains(why, "tenant-a") {
+		t.Fatalf("tenant-a-v2 was not told which consumer holds the key: %q", why)
+	}
+	if strings.Contains(why, "sk-shared") {
+		t.Fatalf("the reason leaks the credential: %q", why)
+	}
+	// The preserved entry keeps its key, and the bystander's rotation went through.
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-shared" {
+		t.Fatalf("tenant-a credentials = %v, want its live key untouched", got)
+	}
+	if got := creds0Of(t, c, "higress-system", "tenant-b"); strings.Join(got, ",") != "Bearer sk-b-rotated" {
+		t.Fatalf("tenant-b credentials = %v, want its rotated key: the freeze used to block this", got)
+	}
+}

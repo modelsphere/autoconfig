@@ -563,7 +563,7 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// rather than failing the round: wanting an identity it is not entitled to must not stop
 	// every other consumer on this gateway from being added, rotated or revoked.
 	views = dropUnprovenAdoptions(views, liveEntries, liveManaged, claimed, round, gwNS)
-	views = dropDuplicatesAgainstCarriedOver(views, liveEntries, liveManaged, claimed, round)
+	views = dropDuplicatesAgainstCarriedOver(views, liveEntries, liveManaged, claimed, preserve, round)
 
 	if len(round.skipped) > 0 {
 		logf.FromContext(ctx).Info("left consumers out of this round",
@@ -1572,7 +1572,7 @@ func ourGateway(o *unstructured.Unstructured, named map[string]bool) bool {
 // The write-path guard stays as a backstop; a guard that never fires is fine, a freeze on a
 // normal path is not.
 func dropDuplicatesAgainstCarriedOver(views []sink.ConsumerView,
-	liveEntries map[string][]string, liveManaged, claimed map[string]bool,
+	liveEntries map[string][]string, liveManaged, claimed, preserve map[string]bool,
 	round gatewayRound) []sink.ConsumerView {
 	rendered := map[string]bool{}
 	for _, v := range views {
@@ -1581,7 +1581,15 @@ func dropDuplicatesAgainstCarriedOver(views []sink.ConsumerView,
 	// Which live entries will be carried over as somebody else's, and under what name.
 	ownerOf := map[string]string{}
 	for name, creds := range liveEntries {
-		if rendered[name] || liveManaged[name] || claimed[name] {
+		// A PRESERVED name is carried over too, and it is always managed or claimed - so
+		// excluding those names left its live credentials out of this map, while the object
+		// holding them is not in `views` either, so neither check could see them. A newcomer
+		// carrying the same key then reached the write-path guard, which refuses the ROUND:
+		// nothing addable, rotatable or revocable on that gateway until the old object is
+		// deleted or its Secret fixed. Reached by ordinary sequencing - create tenant-a-v2
+		// with the same key, delete the old Secret before the old APIConsumer - which is why
+		// it is not excluded here.
+		if rendered[name] || (!preserve[name] && (liveManaged[name] || claimed[name])) {
 			continue
 		}
 		for _, c := range creds {
@@ -1604,13 +1612,18 @@ func dropDuplicatesAgainstCarriedOver(views []sink.ConsumerView,
 			kept = append(kept, v)
 			continue
 		}
+		held := "which this controller does not manage (the gateway chart renders it until " +
+			"the migration is finished)"
+		if preserve[clash] {
+			held = "whose credentials this controller cannot read at the moment, so its " +
+				"existing entry is being kept as it is"
+		}
 		round.skipped[v.Source] = fmt.Sprintf("one of its credentials is already in use by "+
-			"consumer %q, which this controller does not manage (the gateway chart renders it "+
-			"until the migration is finished). key-auth refuses a duplicate credential by "+
+			"consumer %q, %s. key-auth refuses a duplicate credential by "+
 			"failing to parse its whole config, and it denies every caller when it cannot "+
 			"parse - so this consumer was left out instead, and nothing else on this gateway "+
 			"is blocked. Either adopt %q with this APIConsumer (set consumerName to it, if it "+
-			"is a valid DNS label) or remove it from the chart", clash, clash)
+			"is a valid DNS label) or stop sharing the key with it", clash, held, clash)
 	}
 	return kept
 }
