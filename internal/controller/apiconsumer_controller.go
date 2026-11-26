@@ -823,7 +823,20 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		//
 		// This is the gateway chart's side of the contract: it stopped rendering the field,
 		// so this controller is the only thing that can put it there.
-		if found && sameRules(live, next) && sameNames(managed, mine) {
+		// mine ∪ preserve, because that is what the annotation records. Comparing against
+		// `mine` alone defeated this short-circuit permanently once anything was preserved:
+		// the annotation is then a strict superset, sameNames is false every round, and the
+		// write happens on every pass - content-identical, so no config push, but an API
+		// write and an Info log claiming a change, every minute, in exactly the degraded
+		// state the guard matters in.
+		recorded := make(map[string]bool, len(mine)+len(preserve))
+		for n := range mine {
+			recorded[n] = true
+		}
+		for n := range preserve {
+			recorded[n] = true
+		}
+		if found && sameRules(live, next) && sameNames(managed, recorded) {
 			return nil
 		}
 		if err := unstructured.SetNestedSlice(obj.Object, next, "spec", "defaultConfig", "consumers"); err != nil {

@@ -197,13 +197,21 @@ spec:
                       by copying an older one, silently, with nothing to say so. A default belongs to the
                       controller; extraPlugins is for what ONE fleet wants differently.
 
-                      The parameters stay in the gateway chart's defaultConfig: this writes an empty rule and
-                      the plugin reads it as "the global config applies here" (its parseRuleConfig starts from
-                      the global one). So a fleet turning it off is a rule withdrawn, not a config rewritten.
+                      The parameters stay in the gateway chart's defaultConfig, and this controller COPIES
+                      them into each route's rule. Not an empty rule inheriting them: with
+                      defaultConfigDisable true the Higress controller never sends defaultConfig to the
+                      gateway at all, so an empty rule reaches a plugin whose global config is empty and is
+                      refused. Measured on a cluster, after the empty-rule version had been written on the
+                      strength of the plugin's own parseRuleConfig - which is right about the plugin and
+                      silent about what reaches it.
+
+                      So a fleet turning the guard off is a rule withdrawn, and a chart that changes the
+                      thresholds is picked up by every route within one resync.
 
                       ⚠ The chart's defaultConfig MUST carry a non-empty `detectors`. The plugin refuses a
-                      config with none - including one inherited as empty - and a plugin that fails to load
-                      stalls the config push for EVERY plugin on that gateway, not just this one.
+                      config with none, and a plugin that fails to load stalls the config push for EVERY
+                      plugin on that gateway, not just this one. With none configured no rule is written at
+                      all, and the fleet's GatewaySynced says so.
                     properties:
                       disabled:
                         description: |-

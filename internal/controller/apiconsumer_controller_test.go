@@ -1870,3 +1870,52 @@ func TestConsumerPreservedNameStaysInTheRecord(t *testing.T) {
 			"later would leave its key working", got)
 	}
 }
+
+// With a consumer preserved - ours, Secret unreadable - the "nothing changed, do not write"
+// short-circuit still has to hold. It did not: the annotation records mine ∪ preserve while
+// the comparison used mine alone, so the recorded set was a strict superset forever, the
+// check was false on every round, and the gateway object was written on every pass. The
+// writes were content-identical, so nothing reached the data plane - which is exactly why
+// this needs a test that counts writes rather than looking at the result.
+func TestConsumerPreservedNameDoesNotCauseAWritePerRound(t *testing.T) {
+	broken := consumerFixture("tenant-a", "gone-secret")
+	healthy := consumerFixture("tenant-b", "tenant-b-keys")
+	healthy.Status.ConsumerName = "tenant-b"
+	healthy.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, broken, healthy,
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
+		keyAuthManagedBy("tenant-a,tenant-b",
+			liveConsumer("tenant-a", "Bearer sk-a"), liveConsumer("tenant-b", "Bearer sk-b")),
+	)
+	rv := func() string {
+		var ka unstructured.Unstructured
+		ka.SetGroupVersionKind(wasmPluginGVK)
+		if err := c.Get(context.Background(), types.NamespacedName{
+			Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+			t.Fatal(err)
+		}
+		return ka.GetResourceVersion()
+	}
+	// First round settles the annotation (it gains the preserved name).
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatal(err)
+	}
+	settled := rv()
+	for i := 0; i < 3; i++ {
+		if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := rv(); got != settled {
+		t.Fatalf("key-auth was written again with nothing changed (resourceVersion %s -> %s): "+
+			"a preserved consumer makes every round rewrite the gateway", settled, got)
+	}
+	// ...and the preserved name is still recorded, which is what made the comparison tricky.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	_ = c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka)
+	if got := ka.GetAnnotations()[managedConsumersAnnotation]; !strings.Contains(got, "tenant-a") {
+		t.Fatalf("managed-consumers = %q, want the preserved name kept", got)
+	}
+}

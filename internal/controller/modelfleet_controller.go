@@ -1159,12 +1159,19 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 				return fmt.Errorf("read %s defaultConfig: %w", p.name, err)
 			}
 			if !found || len(def) == 0 {
-				return &pluginUnusableError{plugin: p.name,
-					why: "its defaultConfig is empty, and this controller copies it into the " +
-						"rule because the gateway never receives defaultConfig while " +
-						"defaultConfigDisable is true"}
+				// Withdraw, like the p.unusable path above, rather than returning here: a
+				// bare return leaves the rule already on the gateway in place while the
+				// fleet reports "not written" - the same asymmetry that path was changed to
+				// avoid. Unreachable for ai-stream-guard today, because its unusable hook
+				// rejects a missing defaultConfig first, but a trap for the next plugin
+				// given copyDefaultConfig without one.
+				unusableWhy = "its defaultConfig is empty, and this controller copies it " +
+					"into the rule because the gateway never receives defaultConfig while " +
+					"defaultConfigDisable is true"
+				cfg = nil
+			} else {
+				cfg = def
 			}
-			cfg = def
 		}
 		rules, _, err := unstructured.NestedSlice(obj.Object, "spec", "matchRules")
 		if err != nil {

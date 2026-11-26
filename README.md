@@ -496,8 +496,11 @@ key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。*
 是显式退出。它**不走 `extraPlugins`**,理由是层级:`extraPlugins` 由建 fleet 的人逐个填,
 而「默认都该有的防护」一旦要人记得写,照抄老 YAML 建的新模型就静默没有保护。默认值归 controller,
 `extraPlugins` 归「这一个 fleet 要的不一样」。
-autoconfig 写的是一条**空规则** —— 插件的 `parseRuleConfig` 以全局配置为底,空规则即「按 chart 配的参数跑」,
-所以阈值只存在于 chart 一处。关掉是**撤掉规则**,不是写另一份配置。
+autoconfig 把插件 `defaultConfig` 的内容**复制**进每条路由的规则,所以阈值只存在于 chart 一处、
+改了最慢一个 resync(30s)传到所有路由。**不是写空规则让插件继承** —— `defaultConfigDisable: true` 时
+Higress controller 根本不下发 `defaultConfig`,空规则到达插件时全局是空的、会被拒(集群实测,
+而我最初按插件自己的 `parseRuleConfig` 推断写了空规则:那个推断对插件成立、对「什么东西到达了插件」沉默)。
+关掉是**撤掉规则**,不是写另一份配置;chart 没配 detectors 时**也撤掉规则**并在 `GatewaySynced` 上说明。
 ⚠️ **chart 的 `defaultConfig` 必须有非空 `detectors`**:插件拒绝 detectors 为空的配置(包括从全局继承到的空),
 而**一个插件加载失败会卡住该网关上所有插件的配置推送**。
 插件对象不存在时**容忍**(只是少了防护,不像 key-auth 那样是 401),同步照常成功。
