@@ -275,6 +275,35 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// The names already in this gateway's list. Needed before rendering, to tell "this
 	// consumer's Secret is unreadable and it has a key in there" (fail closed) from "...and
 	// it has nothing in there" (skip it rather than freeze everyone else).
+	// Is this gateway ours to write at all? Asked HERE, in the one function that writes a
+	// consumer list, rather than at each entry point - the first version checked it in the
+	// periodic sweep only, and the key-auth watch (which fires for every key-auth in the
+	// cluster) walked straight past it. The probe on the test cluster caught that: autoconfig
+	// wrote to a gateway labelled for another manager and to an unlabelled one in a namespace
+	// nothing names.
+	//
+	// The APIConsumer path cannot fail this check by construction - the object names the
+	// gateway, so it is in the set - but it runs there too, because a check that only some
+	// callers make is a check somebody will forget to make.
+	keyAuth := &unstructured.Unstructured{}
+	keyAuth.SetGroupVersionKind(wasmPluginGVK)
+	if err := r.gatewayReader().Get(ctx, types.NamespacedName{
+		Namespace: gwNS, Name: "key-auth"}, keyAuth); err != nil {
+		if isAbsent(err) {
+			return gatewayRound{}, fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
+		}
+		return gatewayRound{}, err
+	}
+	named, err := r.gatewayNamespacesInUse(ctx)
+	if err != nil {
+		return gatewayRound{}, err
+	}
+	if !ourGateway(keyAuth, named) {
+		logf.FromContext(ctx).V(1).Info("not this controller's gateway: no label, and nothing "+
+			"names it", "gateway", gwNS)
+		return gatewayRound{}, nil
+	}
+
 	liveEntries, liveManaged, err := r.liveConsumerState(ctx, gwNS)
 	if err != nil && !errors.Is(err, errGatewayAbsent) {
 		return gatewayRound{}, err
@@ -1318,38 +1347,13 @@ func (r *APIConsumerReconciler) ensureGateways(ctx context.Context) {
 		log.V(1).Info("could not list WasmPlugins for the gateway sweep", "err", err.Error())
 		return
 	}
-	wanted, err := r.gatewayNamespacesInUse(ctx)
-	if err != nil {
-		log.V(1).Info("could not work out which gateways are ours", "err", err.Error())
-		return
-	}
 	for i := range list.Items {
 		o := &list.Items[i]
 		if o.GetName() != "key-auth" {
 			continue
 		}
-		// Only gateways that are ours to write. Writing to every key-auth anywhere would
-		// mean adding `consumers: []` to a Higress another team runs in their own
-		// namespace, and taking SSA ownership of that field on it - acting on an object
-		// nobody pointed this controller at.
-		//
-		// Three ways to be ours, in order of how explicit they are:
-		//
-		//   1. the label the gateway chart puts on the key-auth it installs. This is the one
-		//      that works for a chart installed in any namespace before any fleet or
-		//      consumer exists, which is the fresh-install case and the whole reason the
-		//      sweep exists (agreed with the chart in modelsphere/helm-charts#122);
-		//   2. an APIConsumer or a ModelFleet naming that namespace as its gateway;
-		//   3. the default gateway namespace.
-		//
-		// 3 is kept although 1 subsumes it for any chart that carries the label, because a
-		// chart release without the label would otherwise leave a fresh install's gateway
-		// FAIL_CLOSE - and that is the failure worth one release of a narrower intrusion:
-		// writing to an unlabelled key-auth in higress-system that nothing names. It should
-		// go once the labelled chart has shipped.
-		if !ourGateway(o, wanted) {
-			continue
-		}
+		// No scope check here: programGateway makes it, for every caller. One was here
+		// once, and the key-auth watch - the other entry point - did not have it.
 		if _, err := r.programGateway(ctx, o.GetNamespace(), nil); err != nil &&
 			!errors.Is(err, errGatewayAbsent) {
 			log.V(1).Info("gateway sweep did not program this gateway",
@@ -1391,7 +1395,14 @@ func (r *APIConsumerReconciler) gatewayNamespacesInUse(ctx context.Context) (map
 		return nil, fmt.Errorf("list APIConsumers: %w", err)
 	}
 	for i := range consumers.Items {
-		out[consumerGatewayNamespace(&consumers.Items[i])] = true
+		c := &consumers.Items[i]
+		out[consumerGatewayNamespace(c)] = true
+		// ...and any gateway this controller HAS programmed, which the spec may no longer
+		// name: moving spec.gateway.namespace has to withdraw the credential from the old
+		// one, and that gateway is ours precisely because we put a key there. Without this,
+		// the scope check refused to touch it and the key stayed live forever - which the
+		// move test caught.
+		out[c.Status.AppliedGatewayNamespace] = true
 	}
 	var fleets routingv1.ModelFleetList
 	if err := r.List(ctx, &fleets); err != nil {
@@ -1420,6 +1431,12 @@ const consumersLabel = "routing.modelsphere.dev/consumers"
 // for why there are three answers and not one.
 func ourGateway(o *unstructured.Unstructured, named map[string]bool) bool {
 	if o.GetLabels()[consumersLabel] == "autoconfig" {
+		return true
+	}
+	// Our own record on the object: this controller wrote this list before, so it is ours to
+	// keep correct even if nothing names the namespace any more. It is also what lets a
+	// revocation finish on a gateway whose last APIConsumer has just been deleted.
+	if o.GetAnnotations()[managedConsumersAnnotation] != "" {
 		return true
 	}
 	if named[o.GetNamespace()] {

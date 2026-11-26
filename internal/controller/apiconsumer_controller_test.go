@@ -1696,3 +1696,35 @@ func TestGatewaySweepWritesToALabelledGatewayAnywhere(t *testing.T) {
 		t.Fatal("wrote to a gateway whose label names a different manager")
 	}
 }
+
+// The scope check has to hold on EVERY path into a write, not just the sweep. It was in the
+// sweep only, and the key-auth watch - which fires for every key-auth in the cluster - walked
+// straight past it: a probe on the test cluster found autoconfig writing to a gateway labelled
+// for another manager and to an unlabelled one in a namespace nothing names. No unit test
+// covered the watch path with a foreign gateway, so nothing here said a word.
+func TestKeyAuthWatchRespectsTheGatewayScope(t *testing.T) {
+	foreign := keyAuthWithoutConsumers()
+	foreign.SetNamespace("someone-elses-higress")
+	theirs := keyAuthWithoutConsumers()
+	theirs.SetNamespace("labelled-for-someone-else")
+	theirs.SetLabels(map[string]string{consumersLabel: "somebody-else"})
+	r, c := newConsumerReconciler(t, foreign, theirs)
+	kr := &KeyAuthReconciler{APIConsumerReconciler: r}
+
+	for _, ns := range []string{"someone-elses-higress", "labelled-for-someone-else"} {
+		if _, err := kr.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: "key-auth"},
+		}); err != nil {
+			t.Fatalf("%s: %v", ns, err)
+		}
+		var ka unstructured.Unstructured
+		ka.SetGroupVersionKind(wasmPluginGVK)
+		if err := c.Get(context.Background(), types.NamespacedName{
+			Namespace: ns, Name: "key-auth"}, &ka); err != nil {
+			t.Fatal(err)
+		}
+		if _, found, _ := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers"); found {
+			t.Fatalf("%s: the watch wrote to a gateway this controller has no claim on", ns)
+		}
+	}
+}
