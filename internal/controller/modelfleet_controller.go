@@ -134,6 +134,8 @@ type fleetRender struct {
 	upstreamKey string
 	// upstreamKeyDefaulted: the credential came from the default Secret, not from a named one.
 	upstreamKeyDefaulted bool
+	// defaultMember: the member the plugin falls back to, with the default expanded.
+	defaultMember string
 	// gatewayNS: which gateway namespace to write to. Empty means the one the spec names;
 	// it is set explicitly only when withdrawing rules from a namespace the spec no longer
 	// points at.
@@ -387,6 +389,13 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	if rend.modelName == "" {
 		rend.modelName = fleet.Name
 	}
+	// Omitted defaultMember means the first member. The plugin requires `default` to name one
+	// of the backends and rejects the entire decision table otherwise, so there is always one
+	// - but a single-hardware fleet should not have to say which.
+	rend.defaultMember = fleet.Spec.DefaultMember
+	if rend.defaultMember == "" && len(fleet.Spec.Members) > 0 {
+		rend.defaultMember = fleet.Spec.Members[0].Name
+	}
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
 		return nil, err
 	}
@@ -477,7 +486,7 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	}
 	// Status reports the share actually in force, which differs from the table's weights
 	// when everything falls through to the default member (see sink.TrafficShares).
-	rend.effective = sink.TrafficShares(rend.members, fleet.Spec.DefaultMember)
+	rend.effective = sink.TrafficShares(rend.members, rend.defaultMember)
 
 	switch ref := fleet.Spec.Gateway.UpstreamAuthSecretRef; ref {
 	case upstreamAuthNone:
@@ -676,7 +685,7 @@ func fleetPlugins() []fleetPlugin {
 			if p := f.fleet.Spec.TrafficPolicy; p != nil {
 				rev = p.Revision
 			}
-			return sink.RenderDecisionTable(f.modelName, f.fleet.Spec.DefaultMember, f.members, rev)
+			return sink.RenderDecisionTable(f.modelName, f.defaultMember, f.members, rev)
 		},
 	}, {
 		// Without a rule here the route is not in any consumer's allow-list: 403. Missing
@@ -1057,6 +1066,7 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 
 		if rend != nil {
 			st.ModelName = rend.modelName
+			st.DefaultMember = rend.defaultMember
 			if u := fleet.Spec.Gateway.ExternalURL; u != "" {
 				st.Endpoint = strings.TrimSuffix(u, "/") + "/v1"
 			} else {

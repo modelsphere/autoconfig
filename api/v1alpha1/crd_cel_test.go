@@ -132,6 +132,23 @@ func TestCELDefaultMemberMustNameAMember(t *testing.T) {
 
 // Stickiness has no landing place in ai-backend-router: the plugin has WeightedRandom and no
 // hash picker. Accepting the field would mean configuring a switch that never takes effect.
+// defaultMember is optional now, so the rule has to skip an absent one WITHOUT also letting
+// a wrong one through - the two are one `||` apart, and getting it backwards turns the
+// strictest check in this CRD into a no-op.
+func TestCELDefaultMemberMayBeOmitted(t *testing.T) {
+	val, ss := fleetValidator(t)
+	o := fleetObj()
+	delete(o["spec"].(map[string]any), "defaultMember")
+	if msg := validate(t, val, ss, o); msg != "" {
+		t.Fatalf("an omitted defaultMember was rejected: %s", msg)
+	}
+	// ...and a stated-but-wrong one is still refused.
+	o["spec"].(map[string]any)["defaultMember"] = "not-a-member"
+	if msg := validate(t, val, ss, o); msg == "" {
+		t.Fatal("making the field optional also stopped it checking the stated value")
+	}
+}
+
 func TestCELStickinessIsRefused(t *testing.T) {
 	val, ss := fleetValidator(t)
 	o := fleetObj()

@@ -41,7 +41,7 @@ spec:
   # Where traffic lands when no member is selectable (all drained, all weights 0, or the
   # plugin errors). That round does not overflow afterwards.
   # NOTE: zeroing every weight therefore means "send everything here", not "stop serving".
-  defaultMember: h100
+  defaultMember: h100           # 可选:省略 = members[0]
 
   members:
   - name: h100                  # = backend id in the decision table and the metric label

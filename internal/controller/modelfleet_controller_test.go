@@ -2183,3 +2183,61 @@ func TestFleetCapacityIsZeroWhenTheRouteDeclaresNone(t *testing.T) {
 		t.Fatalf("a route with no declared ceiling failed the sync: %+v", fleet.Status.Conditions)
 	}
 }
+
+// defaultMember is optional: omitted means members[0]. The field cannot go away — the plugin
+// requires `default` to name one of the model's backends and rejects the WHOLE decision table
+// otherwise (not just that model), which then stalls the config push for every plugin on the
+// gateway — but a single-hardware fleet should not have to state the obvious.
+func TestFleetDefaultMemberDefaultsToTheFirstMember(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.DefaultMember = ""
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	def, found, _ := unstructured.NestedString(rule, "config", "decisions", "static", "models", "glm-5.3", "default")
+	if !found || def != "h100" {
+		t.Fatalf("table default = %q (found=%v), want the first member", def, found)
+	}
+	// ...and the console is told which one it is, rather than having to re-derive it.
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if fleet.Status.DefaultMember != "h100" {
+		t.Fatalf("status.defaultMember = %q", fleet.Status.DefaultMember)
+	}
+}
+
+// The defaulted member is subject to the same rule as a stated one: it stays in the table
+// even when it is unready, because a table whose `default` names a backend that is not there
+// is rejected whole — one member's outage would otherwise freeze the gateway's config.
+func TestFleetDefaultedMemberStaysInTheTableWhenUnready(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.DefaultMember = ""
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 0, false), // the default, down
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	var sawDefault bool
+	for _, b := range backends {
+		m := b.(map[string]any)
+		if id, _, _ := unstructured.NestedString(m, "id"); id == "h100" {
+			sawDefault = true
+			if w, _, _ := unstructured.NestedInt64(m, "weight"); w != 0 {
+				t.Fatalf("the unready default carries weight %d, want 0", w)
+			}
+		}
+	}
+	if !sawDefault {
+		t.Fatal("the defaulted member was dropped from the table while unready - the plugin " +
+			"would reject the whole table and freeze this gateway's config")
+	}
+}

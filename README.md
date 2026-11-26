@@ -288,7 +288,7 @@ kind: ModelFleet
 metadata: {name: glm-5.3, namespace: llm-route}
 spec:
   modelName: glm-5.3            # 客户端 body.model
-  defaultMember: h100           # 没有成员可选时的落点(插件必填)
+  defaultMember: h100           # 可选,缺省 = members[0];没有成员可选时的落点
   gateway:
     namespace: higress-system   # WasmPlugin 所在 ns
     service: openresty:8080     # Ingress 的后端;成员靠【路径】区分
@@ -408,7 +408,11 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
   而不是自己上次写的值,否则是拿没发生过的流量算下一轮。
 - **不 ready 的成员整条不进表**,而不是进表带 weight 0 —— weight 0 仍是合法的溢出落点,
   往一个没有后端的成员溢出,会把「降级」变成「故障」。**唯一例外是 `defaultMember`**:
-  插件按 id 在表里解析 `default`,它不在表里就成了网关错误。
+  插件按 id 在表里解析 `default`,查不到**不是降级,是整份决策表解析失败** ——
+  而且不止这一个模型,`models.ForEach` 一出错就中断上抛,**所有模型的配置都不生效**;
+  再叠加「一个插件加载失败会卡住这个网关上所有插件的配置下发」,一次成员故障就升级成全网关配置冻结。
+  (证据:`modelsphere/higress` 的 `feat/ai-backend-router` 分支,
+  `decisions/decisions.go:150-157` —— `default: %q is not one of the model's backends`。)
 - **`matchRules` 在 WasmPlugin CRD 里是裸数组、没有 listType** → SSA 下是 atomic,
   apply 会整份替换、把网关 chart 写的规则全抹掉。所以这四个对象走 read-modify-write、
   按「规则绑的是哪条 Ingress」认自己那条,**内容没变就不写**(每次写都是一次全数据面的配置下发)。

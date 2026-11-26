@@ -230,9 +230,10 @@ type GatewaySpec struct {
 // Server-Side Apply with a per-writer fieldManager — a client-side apply or a constructed-object
 // Update will silently wipe the other writer's fields.
 //
-// defaultMember must name a real member: it is where the plugin lands when every member is
-// unusable, so a dangling name is a hole in the one path that is supposed to have no holes.
-// +kubebuilder:validation:XValidation:rule="self.members.exists(m, m.name == self.defaultMember)",message="defaultMember must name one of spec.members"
+// defaultMember, when stated, must name a real member: it is where the plugin lands when
+// every member is unusable, so a dangling name is a hole in the one path that is supposed to
+// have no holes. Leaving it out is fine — the controller takes members[0].
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultMember) || self.members.exists(m, m.name == self.defaultMember)",message="defaultMember must name one of spec.members"
 // Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
 // setting that will never take effect.
 // +kubebuilder:validation:XValidation:rule="!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)",message="trafficPolicy.stickiness is not supported by ai-backend-router yet; it would be silently ignored, so it is refused here"
@@ -251,8 +252,20 @@ type ModelFleetSpec struct {
 	//
 	// It makes "set every weight to 0" mean "send everything here", NOT "stop serving" —
 	// draining the fleet is removing members or taking the route down, never zeroing weights.
-	// +kubebuilder:validation:MinLength=1
-	DefaultMember string `json:"defaultMember"`
+	//
+	// Optional: omitted means members[0], which is why a single-hardware fleet never has to
+	// state it. The field itself cannot go away, because the plugin requires `default` to be
+	// the id of one of the model's backends and REJECTS THE WHOLE DECISION TABLE otherwise —
+	// not that one model, the whole table, and a plugin that fails to load stalls the config
+	// push for every plugin on that gateway (ai-backend-router decisions.go: "default: %q is
+	// not one of the model's backends"). That is also why the chosen member stays in the
+	// rendered table even when it is unready, at weight 0: dropping it would turn one
+	// member's outage into a gateway-wide config freeze.
+	//
+	// The effective value is reported as status.defaultMember.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	DefaultMember string `json:"defaultMember,omitempty"`
 	// Members: one entry per hardware type, each pointing at the service swiss already created.
 	// +listType=map
 	// +listMapKey=name
@@ -333,6 +346,10 @@ type ModelFleetStatus struct {
 	// ModelName actually programmed into the gateway.
 	// +optional
 	ModelName string `json:"modelName,omitempty"`
+	// DefaultMember actually in force, with the default expanded, so the console can show
+	// which member catches a request when nothing else is selectable.
+	// +optional
+	DefaultMember string `json:"defaultMember,omitempty"`
 	// TotalCapacity: summed over ready members.
 	// +optional
 	TotalCapacity *TotalCapacity `json:"totalCapacity,omitempty"`
