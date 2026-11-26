@@ -136,6 +136,8 @@ type fleetRender struct {
 	upstreamKeyDefaulted bool
 	// defaultMember: the member the plugin falls back to, with the default expanded.
 	defaultMember string
+	// allDisabled: every member is disabled, i.e. the model was deliberately taken offline.
+	allDisabled bool
 	// gatewayNS: which gateway namespace to write to. Empty means the one the spec names;
 	// it is set explicitly only when withdrawing rules from a namespace the spec no longer
 	// points at.
@@ -204,6 +206,32 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		r.setFleetStatus(ctx, req.NamespacedName, nil, condGatewaySynced, metav1.ConditionFalse,
 			"ResolveError", err.Error()+" (nothing was written; any rules already on the "+
 				"gateway are unchanged and a live route keeps serving its last configuration)")
+		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+	}
+
+	if rend.allDisabled {
+		// Route first, rules after - the teardown order, for the same reason: a live Ingress
+		// whose key-auth rule has already gone is an open route.
+		gone, err := r.deleteIngress(ctx, &fleet)
+		if err != nil {
+			r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse,
+				"WithdrawError", fmt.Sprintf("every member is disabled, but this fleet's route "+
+					"could not be taken down: %v", err))
+			return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+		}
+		if !gone {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		if err := r.cleanupPluginRules(ctx, &fleet); err != nil {
+			r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse,
+				"WithdrawError", err.Error())
+			return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+		}
+		// Synced is True: the gateway matches what the object asks for. Ready is False, and
+		// says why - the model is intentionally offline, not broken.
+		r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue,
+			"AllMembersDisabled", "every member is disabled: this model's route is withdrawn, "+
+				"so the gateway answers 404 for it rather than serving from a drained member")
 		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 	}
 
@@ -315,14 +343,27 @@ func isPublicRoute(fleet *routingv1.ModelFleet) bool {
 //
 // 0 when the route declares no ceiling, which is how openresty treats it too (the route's
 // default_max applies) - reported as 0 rather than guessed.
+// routeMaxConcurrency is what openresty will actually admit for this route.
+//
+// Which peer group decides depends on whether CART is in front. With a cart peer carrying a
+// fixed ceiling, that ceiling is the admission limit however many backends there are, so
+// multiplying the backends out would report a capacity openresty refuses to use. With
+// maxConcurrencyFromBackend the cart peer's limit IS the backend sum (that is what the flag
+// means), so the backend groups answer, and so they do when there is no cart peer at all.
 func routeMaxConcurrency(mr *routingv1.ModelRoute) int32 {
-	perInstance := 0
+	perInstance, backendGroups := 0, 0
 	for _, p := range mr.Spec.Nginx.Peers {
+		if p.Use == "cart" && p.MaxConcurrency > 0 && !p.MaxConcurrencyFromBackend {
+			return int32(p.MaxConcurrency)
+		}
 		if p.Use == "backend" && p.MaxConcurrency > 0 {
+			// Several backend groups mean several ceilings and no single answer. Reporting
+			// one of them (the last, as this did) would be a number nobody can trace.
+			backendGroups++
 			perInstance = p.MaxConcurrency
 		}
 	}
-	if perInstance == 0 || mr.Status.Backends <= 0 {
+	if perInstance == 0 || backendGroups > 1 || mr.Status.Backends <= 0 {
 		return 0
 	}
 	return int32(perInstance * mr.Status.Backends)
@@ -400,12 +441,22 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 				break
 			}
 		}
-		// Every member disabled: the plugin still requires `default` to name one of the
-		// backends, so pick the first and let it be the landing spot for a fleet nobody
-		// wants traffic on. Reported below, because "all members disabled" is a state
-		// someone should see rather than discover.
 		if rend.defaultMember == "" && len(fleet.Spec.Members) > 0 {
 			rend.defaultMember = fleet.Spec.Members[0].Name
+		}
+	}
+	// Every member disabled is "take this model offline", and the only way to mean it is to
+	// stop publishing the route. The plugin cannot express "serve nobody": when nothing is
+	// selectable it routes to `default` unconditionally - not even `enabled: false` stops it
+	// ("model %q has no enabled backend with weight > 0; routing to its default backend
+	// %q"). Leaving the route up would therefore send 100% of traffic to a member someone
+	// had just drained, which is the exact opposite of what they asked for, and on a
+	// single-member fleet - the common case - the kill switch would do nothing at all.
+	rend.allDisabled = len(fleet.Spec.Members) > 0
+	for _, m := range fleet.Spec.Members {
+		if !m.Disabled {
+			rend.allDisabled = false
+			break
 		}
 	}
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
@@ -432,6 +483,8 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	undecided := len(policy) == 0
 	declared := map[string]bool{}
 
+	// The ConfigMap the first member writes into: every other member has to match it.
+	var servedBy, servedByMember string
 	for _, m := range fleet.Spec.Members {
 		declared[m.Name] = true
 		view := sink.FleetMemberView{Name: m.Name, Disabled: m.Disabled}
@@ -468,11 +521,32 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		// modelRouteRef, on the assumption that an openresty serves only its own namespace.
 		// It does not, and that check both forbade a legitimate setup and missed the case
 		// that actually breaks: a same-namespace ModelRoute writing to another openresty.
-		if confNS, _ := splitRef(mr.Spec.Nginx.OutputConfigMap, mr.Namespace); confNS != fleet.Namespace {
+		// Compare the whole reference, not just its namespace: two openresty releases in one
+		// namespace give openresty-conf and rel-b-openresty-conf, and a namespace match alone
+		// would wave that through. What is checked is that every member writes into the SAME
+		// ConfigMap, in the fleet's namespace.
+		//
+		// The residual assumption, stated rather than papered over: one openresty per
+		// namespace. A fleet whose members all agree on a ConfigMap that is NOT the one the
+		// Ingress's openresty reads is still accepted. Closing that needs the Service's
+		// Deployment and the volume it mounts - another lookup, more RBAC, and a naming
+		// convention to lean on - so it is deliberately out of scope here.
+		confNS, confName := splitRef(mr.Spec.Nginx.OutputConfigMap, mr.Namespace)
+		conf := confNS + "/" + confName
+		if confNS != fleet.Namespace {
 			return nil, fmt.Errorf("member %q: ModelRoute %s/%s writes its route into %q, but "+
-				"this fleet's Ingress sends traffic to the openresty in %q - the member's path "+
-				"would not be served there, and the route would 404 while the fleet reports it "+
-				"healthy", m.Name, ns, name, mr.Spec.Nginx.OutputConfigMap, fleet.Namespace)
+				"this fleet's Ingress sends traffic to the openresty in namespace %q - the "+
+				"member's path would not be served there, and the route would 404 while the "+
+				"fleet reports it healthy", m.Name, ns, name, conf, fleet.Namespace)
+		}
+		if servedBy == "" {
+			servedBy, servedByMember = conf, m.Name
+		} else if conf != servedBy {
+			return nil, fmt.Errorf("member %q writes its route into %q but member %q writes "+
+				"into %q: the members of one fleet have to be served by one openresty, since "+
+				"the Ingress can only send traffic to one of them - whichever members the "+
+				"Ingress does not reach would 404 while the fleet reports them healthy",
+				m.Name, conf, servedByMember, servedBy)
 		}
 		view.Path = "/" + route
 		// Readiness is taken from the ModelRoute's own status rather than rediscovered here:
@@ -1196,14 +1270,29 @@ func fleetReadiness(st *routingv1.ModelFleetStatus, syncStatus metav1.ConditionS
 	if syncStatus != metav1.ConditionTrue {
 		return metav1.ConditionFalse, "GatewayNotSynced", "gateway objects not written"
 	}
-	ready := 0
+	ready, disabled := 0, 0
 	for _, m := range st.Members {
-		if m.Phase == routingv1.MemberReady {
+		switch m.Phase {
+		case routingv1.MemberReady:
 			ready++
+		case routingv1.MemberDisabled:
+			disabled++
 		}
 	}
+	// "Deliberately taken out" and "broken" need opposite reactions, and this is the
+	// condition people alert on - reporting NoReadyMember for a fleet somebody drained on
+	// purpose sends them hunting for a fault that is not there.
+	if disabled > 0 && disabled == len(st.Members) {
+		return metav1.ConditionFalse, "AllMembersDisabled",
+			"every member is disabled; the route is withdrawn until one is re-enabled"
+	}
 	if ready == 0 {
-		return metav1.ConditionFalse, "NoReadyMember", "no member has a ready backend"
+		msg := "no member has a ready backend"
+		if disabled > 0 {
+			msg = fmt.Sprintf("no member has a ready backend (%d of %d are disabled)",
+				disabled, len(st.Members))
+		}
+		return metav1.ConditionFalse, "NoReadyMember", msg
 	}
 	if ready < len(st.Members) {
 		return metav1.ConditionTrue, "PartiallyReady",

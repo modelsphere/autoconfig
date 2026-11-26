@@ -253,7 +253,7 @@ type GatewaySpec struct {
 // defaultMember, when stated, must name a real member: it is where the plugin lands when
 // every member is unusable, so a dangling name is a hole in the one path that is supposed to
 // have no holes. Leaving it out is fine — the controller takes members[0].
-// +kubebuilder:validation:XValidation:rule="!has(self.defaultMember) || self.members.exists(m, m.name == self.defaultMember)",message="defaultMember must name one of spec.members"
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultMember) || self.defaultMember == \"\" || self.members.exists(m, m.name == self.defaultMember)",message="defaultMember must name one of spec.members"
 // Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
 // setting that will never take effect.
 // +kubebuilder:validation:XValidation:rule="!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)",message="trafficPolicy.stickiness is not supported by ai-backend-router yet; it would be silently ignored, so it is refused here"

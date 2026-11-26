@@ -2386,3 +2386,132 @@ func TestFleetDisabledDefaultMemberStaysInTheTable(t *testing.T) {
 		t.Fatal("the disabled default member was dropped - the plugin would reject the whole table")
 	}
 }
+
+// Disabling every member means "take this model offline", and the only way to mean it is to
+// stop publishing the route. The plugin cannot express "serve nobody": with nothing
+// selectable it routes to `default` unconditionally - not even enabled:false stops it - so a
+// live route would send 100% of traffic to the member that was just drained. On a
+// single-member fleet, which is how every single-hardware model is published, that made the
+// kill switch do nothing at all.
+func TestFleetAllMembersDisabledWithdrawsTheRoute(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members[0].Disabled = true
+	f.Spec.Members[1].Disabled = true
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+	)
+	// First pass deletes the Ingress and requeues; second withdraws the rules.
+	reconcileFleet(t, r)
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
+		t.Fatal("the route is still published although every member is disabled")
+	}
+	for _, p := range []string{"ai-backend-router", "key-auth", "ai-statistics"} {
+		if n := len(getPlugin(t, c, p)); n != 0 {
+			t.Fatalf("%s still carries %d rule(s) for a withdrawn route", p, n)
+		}
+	}
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	// Synced is True - the gateway matches what the object asks for - but Ready says why it
+	// is not serving, and says it was on purpose.
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("GatewaySynced=False for a fleet that is exactly as asked: %+v", fleet.Status.Conditions)
+	}
+	if condTrue(fleet.Status.Conditions, condReady) {
+		t.Fatal("Ready=True for a model whose route was withdrawn")
+	}
+	var readyCond *metav1.Condition
+	for i := range fleet.Status.Conditions {
+		if fleet.Status.Conditions[i].Type == condReady {
+			readyCond = &fleet.Status.Conditions[i]
+		}
+	}
+	// NoReadyMember would send someone hunting for a fault that is not there.
+	if readyCond == nil || readyCond.Reason != "AllMembersDisabled" {
+		t.Fatalf("Ready reason = %v, want AllMembersDisabled", readyCond)
+	}
+
+	// ...and re-enabling one brings the route back.
+	_ = c.Get(context.Background(), nn, &fleet)
+	fleet.Spec.Members[0].Disabled = false
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err != nil {
+		t.Fatalf("re-enabling a member did not bring the route back: %v", err)
+	}
+}
+
+// Two members whose routes land in different ConfigMaps are served by two different
+// openrestys, and the Ingress can only point at one of them. Whichever members it does not
+// reach 404 on a fleet that reports them healthy. A namespace-only comparison waved this
+// through whenever both ConfigMaps happened to live in the fleet's namespace, which is what
+// two openresty releases in one namespace look like.
+func TestFleetMembersServedByTwoOpenrestysAreRefused(t *testing.T) {
+	f := fleetFixture()
+	h100 := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true)
+	h100.Spec.Nginx.OutputConfigMap = "openresty-conf"
+	ascend := modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true)
+	ascend.Spec.Nginx.OutputConfigMap = "rel-b-openresty-conf" // same namespace, other openresty
+	r, c := newFleetReconciler(t, f, h100, ascend,
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"))
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("accepted a fleet whose members are served by two different openrestys")
+	}
+	var msg string
+	for _, c := range fleet.Status.Conditions {
+		if c.Type == condGatewaySynced {
+			msg = c.Message
+		}
+	}
+	if !strings.Contains(msg, "rel-b-openresty-conf") || !strings.Contains(msg, "one openresty") {
+		t.Fatalf("the message does not say what is wrong: %q", msg)
+	}
+	if n := len(getPlugin(t, c, "ai-backend-router")); n != 0 {
+		t.Fatalf("wrote %d rule(s) for a fleet it refused", n)
+	}
+}
+
+// A route fronted by CART with a fixed ceiling admits that many requests however many
+// backends sit behind it, so multiplying the backends out reports capacity openresty will
+// refuse to use. With maxConcurrencyFromBackend the cart peer's limit IS the backend sum, so
+// there the backends answer.
+func TestFleetCapacityUnderCartUsesTheCartCeiling(t *testing.T) {
+	mr := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 4, true)
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "cart", MaxConcurrency: 48},
+		{Use: "backend", MaxConcurrency: 25},
+	}
+	if got := routeMaxConcurrency(mr); got != 48 {
+		t.Fatalf("capacity = %d, want the cart ceiling 48 (not 4 backends x 25)", got)
+	}
+	mr.Spec.Nginx.Peers[0].MaxConcurrencyFromBackend = true
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 4 backends x 25 = 100 when the cart limit follows them", got)
+	}
+	// Two backend groups are two ceilings and no single answer; reporting one of them would
+	// be a number nobody can trace back.
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "backend", MaxConcurrency: 25},
+		{Use: "backend", MaxConcurrency: 40},
+	}
+	if got := routeMaxConcurrency(mr); got != 0 {
+		t.Fatalf("capacity = %d, want 0 (unknown) for a route with two backend ceilings", got)
+	}
+}

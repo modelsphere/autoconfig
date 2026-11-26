@@ -142,6 +142,14 @@ func TestCELDefaultMemberMayBeOmitted(t *testing.T) {
 	if msg := validate(t, val, ss, o); msg != "" {
 		t.Fatalf("an omitted defaultMember was rejected: %s", msg)
 	}
+	// An explicitly empty string means the same thing as omitting it, because that is what
+	// the controller does with it. A writer that always serialises every field sends
+	// defaultMember: "", and has() is true for it: rejecting that would hand someone a
+	// validation error pointing at a problem they do not have.
+	o["spec"].(map[string]any)["defaultMember"] = ""
+	if msg := validate(t, val, ss, o); msg != "" {
+		t.Fatalf("an explicitly empty defaultMember was rejected: %s", msg)
+	}
 	// ...and a stated-but-wrong one is still refused.
 	o["spec"].(map[string]any)["defaultMember"] = "not-a-member"
 	if msg := validate(t, val, ss, o); msg == "" {

@@ -393,8 +393,8 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: defaultMember must name one of spec.members
-              rule: '!has(self.defaultMember) || self.members.exists(m, m.name ==
-                self.defaultMember)'
+              rule: '!has(self.defaultMember) || self.defaultMember == "" || self.members.exists(m,
+                m.name == self.defaultMember)'
             - message: trafficPolicy.stickiness is not supported by ai-backend-router
                 yet; it would be silently ignored, so it is refused here
               rule: '!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)'
