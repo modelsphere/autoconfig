@@ -479,6 +479,32 @@ key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。*
 `return false` 整份配置解析失败,而插件是 `FAIL_CLOSE`,后果是**整个网关所有路由全部拒绝**,
 不是"其中一个不生效"。渲染层会拒掉这种配置(报错只给 consumer 名和下标,不带 key 值)。
 
+**与网关 chart 的契约**(`modelsphere/helm-charts` 的 `charts/higress-llm`,双方都依赖,改一边会坏另一边):
+
+- **chart 不再渲染 `defaultConfig.consumers`,这个字段整个归 autoconfig。** 它继续渲染
+  `keys` 和 `global_auth`,那两个仍归 helm —— `defaultConfig` 是**字段级**跟踪的(实测:
+  managedFields 里 `f:defaultConfig` 下面是 `f:consumers`/`f:keys`/`f:global_auth` 三条独立路径),
+  不是一个原子块,所以两边各写各的层级不会互相覆盖。
+- **key-auth 没有 `consumers` 这个键 = 整个网关拒绝一切请求。** `key_auth` 的
+  `parsePluginConfig` 在 `consumers` 和 `credentials` 都不存在时 `return false`,而那个插件是
+  `FAIL_CLOSE`。所以这个 controller **必须**保证该键存在,哪怕是空列表 —— 这就是
+  `KeyAuthReconciler` watch key-auth 本身的原因:全新安装时集群里**一个 APIConsumer 都没有**,
+  只 watch APIConsumer 的话零对象就是零 reconcile,那个键永远不会被写。
+  ⚠️ 同理:**新 chart 不能部署到还没升级 autoconfig 的集群**(旧版既不被触发、也不补写该键 →
+  网关 FAIL_CLOSE 且不自愈)。helmfile 侧已用 `semverCompare` 门禁 + `needs` 保证顺序。
+- **一个 key 只能属于一个 consumer。** `key_auth` 遇到重复 credential 会 `return false`、
+  整份配置解析失败 —— 加上 FAIL_CLOSE,后果是**整个网关所有路由全部拒绝**,不是「其中一个不生效」。
+  渲染层会拒,但别指望它兜住所有写法。
+- **凭据渲染成带 `Bearer ` 前缀**(Secret 里存裸 key 即可):`key_auth` 比较的是**整个
+  Authorization header 原值**,不剥前缀、不 trim。配裸 key 的话标准客户端全部 401。
+
+**适配已有条目**(迁移时用):建一个 `APIConsumer`,名字与 live 里那个 consumer 相同,Secret 里放
+**它现在用的那把 key**。要求「携带现有全部凭据」不是形式主义 —— 它是这个名字的归属证明:
+`consumerName` 是自由字段、对象可以建在任意 namespace,没有这道证明,任何人写
+`consumerName: tenant-a` + 自己的 key 就继承了 `tenant-a` 被允许的所有路由。适配完成后再换 key,
+那是「轮换」,此时条目已归自己、不需要再证明。
+名字被两个新对象同时争用时,**谁都拿不到** —— 让先到的胜出等于按列表顺序仲裁「谁是 tenant-a」。
+
 **两条写入安全规则**(这个改动最危险的地方,都是「宁可不写」):
 
 - **坏一个,全不写**。某个 `APIConsumer` 的 Secret 读不到时,**不会**把它从名单里摘掉再写剩下的 ——
