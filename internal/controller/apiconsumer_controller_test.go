@@ -1762,3 +1762,111 @@ func TestKeyAuthWatchRespectsTheGatewayScope(t *testing.T) {
 		}
 	}
 }
+
+// A gateway this controller does not manage must not come back as success. Returning no error
+// and no reason made Reconcile indistinguishable from a write that happened: it set
+// Programmed=True and status.credentials for a consumer whose key was never programmed, so
+// the object said "N credential(s) accepted" while every request with that key got 401.
+//
+// The false status.appliedGatewayNamespace was the worse half - it feeds claimed[], which
+// skips the adoption-proof check later.
+func TestConsumerForeignGatewayIsNotReportedAsProgrammed(t *testing.T) {
+	ka := keyAuthWith(liveConsumer("chart-a", "Bearer sk-chart-a"))
+	ka.SetLabels(map[string]string{consumersLabel: "somebody-else"})
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		ka,
+	)
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	var con routingv1.APIConsumer
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}
+	if err := c.Get(context.Background(), nn, &con); err != nil {
+		t.Fatal(err)
+	}
+	if condTrue(con.Status.Conditions, condProgrammed) {
+		t.Fatal("reported Programmed for a gateway labelled for another manager: every " +
+			"request with this key gets 401 while the object says it was accepted")
+	}
+	if con.Status.AppliedGatewayNamespace != "" {
+		t.Fatalf("recorded appliedGatewayNamespace=%q for a gateway it never wrote - that "+
+			"value feeds claimed[] and would skip the adoption proof later",
+			con.Status.AppliedGatewayNamespace)
+	}
+	if msg := consumerCondMessage(con.Status.Conditions, condProgrammed); !strings.Contains(msg, consumersLabel) {
+		t.Fatalf("the message does not explain why: %q", msg)
+	}
+	// And nothing was written there.
+	if n := len(consumerNames(gatewayConsumers(t, c, "higress-system"))); n != 1 {
+		t.Fatalf("the foreign gateway's list has %d entries, want its own 1", n)
+	}
+}
+
+// Two brand-new objects claiming a CHART-rendered consumer name must not freeze the gateway.
+// Each one sees a live entry under that name and no other object's STATUS claiming it, so both
+// used to come out as "incumbents", the collision check hit "more than one incumbent" and
+// refused the round for everyone: no key addable, rotatable or revocable, and a deletion in
+// flight giving up at the deadline with its key still live.
+func TestConsumerTwoNewcomersOnAChartNameDoNotFreezeTheGateway(t *testing.T) {
+	a := consumerFixture("team-a", "a-keys")
+	a.Spec.ConsumerName = "chart-a"
+	b := consumerFixture("team-b", "b-keys")
+	b.Spec.ConsumerName = "chart-a"
+	// Someone already serving, to prove the round still goes through for them.
+	serving := consumerFixture("tenant-x", "x-keys")
+	serving.Status.ConsumerName = "tenant-x"
+	serving.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, a, b, serving,
+		credSecret("a-keys", map[string]string{"key": "sk-a"}),
+		credSecret("b-keys", map[string]string{"key": "sk-b"}),
+		credSecret("x-keys", map[string]string{"key": "sk-rotated"}),
+		// chart-a is the chart's, not ours: the annotation names only tenant-x.
+		keyAuthManagedBy("tenant-x",
+			liveConsumer("chart-a", "Bearer sk-chart-a"),
+			liveConsumer("tenant-x", "Bearer sk-old")),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("two newcomers on a chart-rendered name froze the round: %v", err)
+	}
+	// tenant-x's rotation went through...
+	if got := creds0Of(t, c, "higress-system", "tenant-x"); strings.Join(got, ",") != "Bearer sk-rotated" {
+		t.Fatalf("tenant-x credentials = %v, want the rotated key", got)
+	}
+	// ...the chart's entry is untouched, and neither claimant got the name.
+	if got := creds0Of(t, c, "higress-system", "chart-a"); strings.Join(got, ",") != "Bearer sk-chart-a" {
+		t.Fatalf("chart-a credentials = %v, want the chart's own", got)
+	}
+}
+
+// A preserved name - ours, with a Secret that cannot be read right now - has to stay in the
+// managed-consumers record. Dropping it loses a revocation in the one case the record exists
+// for: gateway write landed, status write did not, the Secret then broke, the object is then
+// deleted. Without the name recorded, its entry is carried over as somebody else's and the
+// revoked tenant's key keeps working.
+func TestConsumerPreservedNameStaysInTheRecord(t *testing.T) {
+	broken := consumerFixture("tenant-a", "gone-secret")
+	healthy := consumerFixture("tenant-b", "tenant-b-keys")
+	healthy.Status.ConsumerName = "tenant-b"
+	healthy.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, broken, healthy,
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b2"}),
+		keyAuthManagedBy("tenant-a,tenant-b",
+			liveConsumer("tenant-a", "Bearer sk-a"), liveConsumer("tenant-b", "Bearer sk-b")),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatal(err)
+	}
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	got := ka.GetAnnotations()[managedConsumersAnnotation]
+	if !strings.Contains(got, "tenant-a") {
+		t.Fatalf("managed-consumers = %q: the preserved name was dropped, so deleting it "+
+			"later would leave its key working", got)
+	}
+}

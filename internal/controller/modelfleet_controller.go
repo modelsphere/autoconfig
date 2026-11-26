@@ -1124,6 +1124,12 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 	if ns == "" {
 		ns = gatewayNamespace(rend.fleet)
 	}
+	// Outside the closure: cfg is mutated inside it (an unusable config becomes a
+	// withdrawal), so on a conflict retry the second attempt would re-enter with cfg already
+	// nil, never consult p.unusable again, and return nil - the rule withdrawn and the fleet
+	// reporting a clean "gateway objects written", which is the silence this reason exists to
+	// break.
+	unusableWhy := ""
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(wasmPluginGVK)
@@ -1139,7 +1145,6 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 		// on cutting streams at a threshold that existed nowhere but in that stale rule.
 		// Caught by the cluster probe, which is also where the asymmetry is obvious - the
 		// condition says one thing and the gateway does another.
-		unusableWhy := ""
 		if cfg != nil && p.unusable != nil {
 			if unusableWhy = p.unusable(obj); unusableWhy != "" {
 				cfg = nil // fall through to the withdrawal path below

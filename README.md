@@ -440,6 +440,15 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
   路由没声明上限时报 0 —— openresty 那边走 route 的 `default_max`,这里编一个数只会在
   console 上显示一个没人执行的值。
 
+⚠️ **升级既有 release 时必须先 apply CRD 再重启 controller,顺序不能省**:`crds/` 不被
+`helm upgrade` 更新,而「APIConsumer 这个 kind 服务不服务」是**启动时判定一次**的。漏了的话
+reconciler 和网关巡检**都被跳过**、没人写 key-auth 的 `defaultConfig.consumers` —— 配上不再渲染
+该字段的网关 chart,就是 `parsePluginConfig` 失败 + FAIL_CLOSE,**整个网关所有路由拒绝一切请求**。
+补装 CRD 本身不会自愈(判定已经做过了),所以 controller 里有个看门狗:CRD 事后出现时它会退出,
+靠重启把判定重做一次。
+同一个机制还有一个更安静的版本:**CRD 没升级时 `spec.gateway.streamGuard` 会被 API server
+静默裁掉** —— `disabled: true` 写进去被接受、然后被忽略,防护照旧开着。这个没法在代码里兜。
+
 **CRD 装在 chart 的 `crds/` 目录,而 `helm upgrade` 不会更新它** —— 以后给 ModelFleet 加字段,
 升级 autoconfig 不生效,必须单独 `kubectl apply --server-side -f` 那份 CRD。
 

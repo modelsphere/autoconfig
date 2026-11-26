@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -166,7 +167,38 @@ func runController(leaderElect bool) error {
 				return err
 			}
 		}
+		// ...and nothing else to add.
 	} else {
+		// Skipped - and this one does NOT self-correct, which is why it gets a watchdog.
+		//
+		// The CRDs ship in the chart's crds/ directory, which `helm upgrade` does not touch,
+		// so upgrading an existing release leaves APIConsumer unserved: this reconciler AND
+		// the gateway sweep are both skipped, and nothing writes key-auth's
+		// defaultConfig.consumers. Paired with the gateway chart that no longer renders that
+		// field, parsePluginConfig fails and FAIL_CLOSE denies every caller on every route of
+		// that gateway. Applying the CRD afterwards fixes nothing by itself, because this
+		// decision was taken once at startup.
+		//
+		// So: watch for the kind appearing and exit when it does. Exiting is how a
+		// leader-elected controller restarts, and a restart is what picks the CRD up.
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-t.C:
+					if served, err := servedKinds(cs); err == nil && served["APIConsumer"] {
+						log.Print("APIConsumer CRD has appeared: exiting so the restart picks " +
+							"it up (nothing writes key-auth's consumers until it does)")
+						return fmt.Errorf("APIConsumer CRD installed after startup: restarting")
+					}
+				}
+			}
+		})); err != nil {
+			return err
+		}
 		log.Print("APIConsumer CRD not installed: skipping that reconciler " +
 			"(apply deploy/helm/autoconfig/crds/ and restart to enable it)")
 	}

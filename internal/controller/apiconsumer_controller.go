@@ -299,9 +299,31 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		return gatewayRound{}, err
 	}
 	if !ourGateway(keyAuth, named) {
-		logf.FromContext(ctx).V(1).Info("not this controller's gateway: no label, and nothing "+
-			"names it", "gateway", gwNS)
-		return gatewayRound{}, nil
+		// Reported on every object that wanted this gateway, not just logged. Returning
+		// (round{}, nil) made Reconcile indistinguishable from a successful write: it set
+		// Programmed=True, status.credentials=N and appliedGatewayNamespace for a consumer
+		// whose key was never written, so an APIConsumer pointing at a key-auth labelled for
+		// somebody else reported "N credential(s) accepted" while every request with that key
+		// got 401. The comment claiming the APIConsumer path could not fail this check was
+		// wrong - the label vetoes regardless of who names the namespace.
+		//
+		// The false appliedGatewayNamespace was the worse half: it feeds claimed[], so if the
+		// foreign label were ever removed, the adoption-proof check would treat the name as
+		// already ours and let this object take over a chart-rendered consumer without
+		// carrying its existing credentials.
+		round := gatewayRound{skipped: map[string]string{}}
+		why := fmt.Sprintf("gateway %s is not managed by autoconfig: its key-auth carries no "+
+			"%s=autoconfig label, or carries one naming another manager. Nothing was written, "+
+			"so this consumer's key does not work there", gwNS, consumersLabel)
+		for i := range list.Items {
+			c := &list.Items[i]
+			if consumerGatewayNamespace(c) == gwNS {
+				round.skipped[c.Namespace+"/"+c.Name] = why
+			}
+		}
+		logf.FromContext(ctx).V(1).Info("not this controller's gateway", "gateway", gwNS,
+			"consumers left unprogrammed", len(round.skipped))
+		return round, nil
 	}
 
 	liveEntries, liveManaged, err := r.liveConsumerState(ctx, gwNS)
@@ -349,21 +371,30 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 				return false // that entry is on record as somebody else's
 			}
 		}
-		// Two objects can reach this point for one name: the one whose gateway write landed
-		// while its status write did not - the case this fallback exists for - and a
-		// newcomer claiming the same consumerName. Both would count as incumbents, and two
-		// incumbents make the collision check refuse the round for the whole gateway, which
-		// is the impostor-driven freeze this is supposed to avoid. The annotation records
-		// which names this controller actually wrote, so it breaks the tie: an entry it
-		// wrote belongs to whoever was there, and a second claimant is a newcomer.
-		if liveManaged[name] {
-			for i := range list.Items {
-				o := &list.Items[i]
-				if o.Namespace != c.Namespace || o.Name != c.Name {
-					if consumerName(o) == name && o.CreationTimestamp.Before(&c.CreationTimestamp) {
-						return false // somebody was here first
-					}
-				}
+		// An entry with no status behind it can only be attributed to ONE object. If a second
+		// object claims the same consumerName, nothing on record says which of them the live
+		// entry belongs to - so neither is an incumbent, and both are handled as newcomers:
+		// the collision check then leaves them both out instead of refusing the round.
+		//
+		// Without this, two brand-new objects claiming a CHART-rendered name both came out as
+		// incumbents (each sees a live entry and no other object's STATUS claiming it), the
+		// collision check hit "more than one incumbent" and froze the whole gateway - no key
+		// addable, rotatable or revocable, and a deletion in flight giving up at the deadline
+		// with its key still live. The earlier tiebreak only covered names this controller
+		// had written, which a chart-rendered one is not.
+		for i := range list.Items {
+			o := &list.Items[i]
+			if o.Namespace == c.Namespace && o.Name == c.Name {
+				continue
+			}
+			if consumerName(o) != name || !o.DeletionTimestamp.IsZero() {
+				continue
+			}
+			if liveManaged[name] && o.CreationTimestamp.Before(&c.CreationTimestamp) {
+				return false // ours, and somebody was here first
+			}
+			if !liveManaged[name] {
+				return false // contested, and nothing on record says it is this object's
 			}
 		}
 		return true
@@ -801,7 +832,12 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		// Written next to the data it describes, because nothing else can tell the two apart
 		// later: once an APIConsumer is deleted, its object is gone and its entry would look
 		// exactly like one of the chart's.
-		setManagedConsumerNames(obj, consumers)
+		// Preserved names too. They are ours - their Secret is just unreadable right now -
+		// and leaving them out of the record loses a revocation in the one case the record
+		// exists for: gateway write landed, status write did not, Secret then broke, object
+		// then deleted. Without the name in the annotation its entry is carried over as
+		// somebody else's and the revoked tenant's key keeps working.
+		setManagedConsumerNames(obj, consumers, preserve)
 		log.Info("programming gateway consumers", "gateway", gwNS,
 			"mine", len(consumers), "carried over", len(foreign), "was", len(live))
 		// FieldOwner spelled out, although the client's default manager happens to be this
@@ -991,10 +1027,17 @@ func managedConsumerNames(obj *unstructured.Unstructured) (map[string]bool, erro
 	return out, nil
 }
 
-func setManagedConsumerNames(obj *unstructured.Unstructured, consumers []sink.KeyAuthConsumer) {
-	names := make([]string, 0, len(consumers))
+func setManagedConsumerNames(obj *unstructured.Unstructured, consumers []sink.KeyAuthConsumer,
+	preserve map[string]bool) {
+	names := make([]string, 0, len(consumers)+len(preserve))
+	seen := map[string]bool{}
 	for _, c := range consumers {
-		names = append(names, c.Name)
+		names, seen[c.Name] = append(names, c.Name), true
+	}
+	for n := range preserve {
+		if !seen[n] {
+			names = append(names, n)
+		}
 	}
 	sort.Strings(names)
 	ann := obj.GetAnnotations()
