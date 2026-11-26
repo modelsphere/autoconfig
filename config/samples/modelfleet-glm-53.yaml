@@ -47,15 +47,12 @@ spec:
   - name: h100                  # = backend id in the decision table and the metric label
     hardware: {vendor: nvidia, model: H100, replicas: 2}
     backend: {modelRouteRef: glm-53-h100}     # path prefix is read from the ModelRoute
-    capabilities: {maxContextTokens: 131072, maxConcurrency: 16}
   - name: ascend
     hardware: {vendor: huawei, model: 910B4, replicas: 1}
     backend: {modelRouteRef: glm-53-ascend}
-    capabilities: {maxContextTokens: 131072, maxConcurrency: 8}
   - name: rtx6000d
     hardware: {vendor: nvidia, model: RTX6000D, replicas: 1}
     backend: {modelRouteRef: glm-53-6000d}
-    capabilities: {maxContextTokens: 65536, maxConcurrency: 8}
 
   # ---- written by decision-gen ----
   # tier: lower is preferred; a higher tier is only reached when every lower one overflows

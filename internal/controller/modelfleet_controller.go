@@ -303,6 +303,29 @@ func isPublicRoute(fleet *routingv1.ModelFleet) bool {
 	return len(c) == 1 && c[0] == "*"
 }
 
+// routeMaxConcurrency: how many in-flight requests this member can take, read from its
+// ModelRoute rather than restated on the fleet.
+//
+// "per-instance ceiling × discovered backends" is the ModelRoute controller's own rule for
+// sizing CART's dynamic concurrency, so using it here means the fleet's capacity and the
+// route's cannot disagree. It also tracks scaling by itself: a member that doubles its
+// replicas doubles its capacity with nobody editing a field.
+//
+// 0 when the route declares no ceiling, which is how openresty treats it too (the route's
+// default_max applies) - reported as 0 rather than guessed.
+func routeMaxConcurrency(mr *routingv1.ModelRoute) int32 {
+	perInstance := 0
+	for _, p := range mr.Spec.Nginx.Peers {
+		if p.Use == "backend" && p.MaxConcurrency > 0 {
+			perInstance = p.MaxConcurrency
+		}
+	}
+	if perInstance == 0 || mr.Status.Backends <= 0 {
+		return 0
+	}
+	return int32(perInstance * mr.Status.Backends)
+}
+
 // checkModelNameIsUnique refuses a model name another fleet on the same gateway already
 // serves. Two fleets with the same effective modelName publish two Ingresses carrying the
 // same exact-match header, and which one a request lands on is then not defined - the two
@@ -406,10 +429,6 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 			// 10000, so three members come out 3334/3333/3333 rather than drifting.
 			view.Weight = 1
 		}
-		if m.Capabilities != nil {
-			view.MaxConcurrency = m.Capabilities.MaxConcurrency
-		}
-
 		var mr routingv1.ModelRoute
 		ns, name := splitRef(m.Backend.ModelRouteRef, fleet.Namespace)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &mr); err != nil {
@@ -430,6 +449,7 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		// would give two answers to one question whenever the two disagree.
 		view.Ready = mr.Status.Ready && mr.Status.Backends > 0
 		view.ReadyReplicas = int32(mr.Status.Backends)
+		view.MaxConcurrency = routeMaxConcurrency(&mr)
 		rend.members = append(rend.members, view)
 	}
 
@@ -1053,7 +1073,7 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 				// make the next round withdraw from the namespace it is trying to write to.
 				st.AppliedGatewayNamespace = gatewayNamespace(&fleet)
 			}
-			st.TotalCapacity = totalCapacity(st.Members, &fleet)
+			st.TotalCapacity = totalCapacity(st.Members)
 
 			policyOK, policyReason, policyMsg := metav1.ConditionTrue, "Applied", "traffic policy applied"
 			if len(rend.uncovered) > 0 {
@@ -1108,6 +1128,7 @@ func memberStatuses(fleet *routingv1.ModelFleet, rend *fleetRender) []routingv1.
 			ReadyReplicas:   v.ReadyReplicas,
 			EffectiveWeight: rend.effective[spec.Name],
 			Tier:            v.Tier,
+			MaxConcurrency:  v.MaxConcurrency,
 		})
 	}
 	return out
@@ -1116,19 +1137,17 @@ func memberStatuses(fleet *routingv1.ModelFleet, rend *fleetRender) []routingv1.
 // totalCapacity sums only the members that are actually ready: capacity is what can serve a
 // request right now, and counting a drained member would overstate the fleet exactly when
 // someone is looking at it to decide whether to shift traffic.
-func totalCapacity(members []routingv1.MemberStatus, fleet *routingv1.ModelFleet) *routingv1.TotalCapacity {
-	caps := map[string]int32{}
-	for _, m := range fleet.Spec.Members {
-		if m.Capabilities != nil {
-			caps[m.Name] = m.Capabilities.MaxConcurrency
-		}
-	}
+func totalCapacity(members []routingv1.MemberStatus) *routingv1.TotalCapacity {
 	var tc routingv1.TotalCapacity
 	for _, m := range members {
 		if m.Phase != routingv1.MemberReady {
 			continue
 		}
-		tc.MaxConcurrency += caps[m.Name]
+		// Each member's own figure, already derived from its ModelRoute. Summing the members'
+		// status rather than the spec is what makes this the capacity that can actually serve:
+		// it follows a member scaling, and it is 0 only when the route really declares no
+		// ceiling - not because somebody left a field out of the CR.
+		tc.MaxConcurrency += m.MaxConcurrency
 		tc.ReadyReplicas += m.ReadyReplicas
 	}
 	return &tc

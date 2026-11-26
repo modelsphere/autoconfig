@@ -212,27 +212,6 @@ spec:
                       required:
                       - modelRouteRef
                       type: object
-                    capabilities:
-                      description: 'Capabilities: declared limits, reserved (see the
-                        type''s note).'
-                      properties:
-                        maxConcurrency:
-                          description: |-
-                            MaxConcurrency: in-flight requests this member can take. Reserved for the same reason —
-                            concurrency admission is openresty's job (per-route max_concurrency), not the gateway's.
-                            The reconciler only sums it into status.totalCapacity for display.
-                          format: int32
-                          minimum: 1
-                          type: integer
-                        maxContextTokens:
-                          description: |-
-                            MaxContextTokens: the longest request this member can serve. Reserved: routing does not
-                            consult it yet (the plugin cannot admit by context length), so a request longer than this
-                            can still be routed here and will fail at the engine. Tracked as a plugin feature request.
-                          format: int32
-                          minimum: 1
-                          type: integer
-                      type: object
                     hardware:
                       description: 'Hardware: which accelerator this member runs on
                         (display only).'
@@ -524,6 +503,16 @@ spec:
                       - model
                       - vendor
                       type: object
+                    maxConcurrency:
+                      description: |-
+                        MaxConcurrency: in-flight requests this member can take, derived from its ModelRoute as
+                        "per-instance ceiling × discovered backends" — the same rule that controller uses to
+                        size CART's dynamic concurrency, so the two cannot disagree. It is read rather than
+                        declared: the authoritative value is spec.nginx.peers[].maxConcurrency on the
+                        ModelRoute, and a copy of it here would be a second source of truth that goes stale
+                        exactly when a member scales.
+                      format: int32
+                      type: integer
                     name:
                       description: Name of the member.
                       type: string

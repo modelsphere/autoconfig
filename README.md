@@ -300,7 +300,6 @@ spec:
   - name: h100                  # = 决策表 backend id = 网关指标标签,改名等于删了重建
     hardware: {vendor: nvidia, model: H100, replicas: 2}
     backend: {modelRouteRef: glm-53-h100}           # 路径前缀从 ModelRoute 的 nginx.route 读
-    capabilities: {maxContextTokens: 131072, maxConcurrency: 16}
   - name: ascend
     hardware: {vendor: huawei, model: 910B4, replicas: 1}
     backend: {modelRouteRef: glm-53-ascend}
@@ -417,8 +416,12 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
   condition 上并忽略该条,不拒收整份策略 —— 拒了就是 console 的删除和 decision-gen 的旧策略互锁。
 - **`stickiness` 在 apply 时直接拒**:ai-backend-router 目前只有 WeightedRandom、没有 hash picker,
   收下它等于配了个永远不生效的开关。
-- `capabilities` 的两个字段目前都是**保留字段**:并发准入在 openresty 不在网关,
-  按上下文长度准入插件没有落点。只用于展示与 `status.totalCapacity` 求和。
+- **容量不在 CR 里声明,从 ModelRoute 读**:`status.members[].maxConcurrency` =
+  `每实例并发 × 已发现后端数`(ModelRoute 的 `spec.nginx.peers[].maxConcurrency`,
+  和那个 controller 给 CART 算动态并发用的是同一条规则,两边不可能对不上),
+  `status.totalCapacity` 是各 **Ready** 成员的和。成员扩缩时自动跟着变,不用改任何字段。
+  路由没声明上限时报 0 —— openresty 那边走 route 的 `default_max`,这里编一个数只会在
+  console 上显示一个没人执行的值。
 
 **CRD 装在 chart 的 `crds/` 目录,而 `helm upgrade` 不会更新它** —— 以后给 ModelFleet 加字段,
 升级 autoconfig 不生效,必须单独 `kubectl apply --server-side -f` 那份 CRD。

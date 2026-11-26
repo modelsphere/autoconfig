@@ -42,25 +42,6 @@ type MemberBackend struct {
 	ModelRouteRef string `json:"modelRouteRef"`
 }
 
-// Capabilities are the member's declared limits. They are NOT enforced at the gateway today:
-// admission by concurrency lives in openresty, and the router plugin has no landing place for
-// a per-member context-length check. They are carried so the console can show them and so the
-// policy writer can reason about them; see the status note on MaxConcurrency.
-type Capabilities struct {
-	// MaxContextTokens: the longest request this member can serve. Reserved: routing does not
-	// consult it yet (the plugin cannot admit by context length), so a request longer than this
-	// can still be routed here and will fail at the engine. Tracked as a plugin feature request.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxContextTokens int32 `json:"maxContextTokens,omitempty"`
-	// MaxConcurrency: in-flight requests this member can take. Reserved for the same reason —
-	// concurrency admission is openresty's job (per-route max_concurrency), not the gateway's.
-	// The reconciler only sums it into status.totalCapacity for display.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
-}
-
 // FleetMember is one hardware type's service inside the fleet. Written by the console.
 type FleetMember struct {
 	// Name identifies the member everywhere: it is the backend id in the router's decision
@@ -73,9 +54,6 @@ type FleetMember struct {
 	Hardware Hardware `json:"hardware"`
 	// Backend: the ModelRoute that already serves this member.
 	Backend MemberBackend `json:"backend"`
-	// Capabilities: declared limits, reserved (see the type's note).
-	// +optional
-	Capabilities *Capabilities `json:"capabilities,omitempty"`
 }
 
 // StickinessKey says what identifies a session.
@@ -332,6 +310,14 @@ type MemberStatus struct {
 	EffectiveWeight int32 `json:"effectiveWeight"`
 	// Tier the member was placed in.
 	Tier int32 `json:"tier"`
+	// MaxConcurrency: in-flight requests this member can take, derived from its ModelRoute as
+	// "per-instance ceiling × discovered backends" — the same rule that controller uses to
+	// size CART's dynamic concurrency, so the two cannot disagree. It is read rather than
+	// declared: the authoritative value is spec.nginx.peers[].maxConcurrency on the
+	// ModelRoute, and a copy of it here would be a second source of truth that goes stale
+	// exactly when a member scales.
+	// +optional
+	MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
 }
 
 // ModelFleetStatus is written only by this controller, through the status subresource.

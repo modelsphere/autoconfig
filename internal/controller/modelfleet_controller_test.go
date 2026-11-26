@@ -88,7 +88,9 @@ func modelRoute(name, ns, route string, backends int, ready bool) *routingv1.Mod
 			Discovery: routingv1.Discovery{Service: name + "-leader", Port: 8050},
 			Nginx: routingv1.NginxSpec{
 				Route: route, OutputConfigMap: ns + "/openresty-conf",
-				Peers: []routingv1.RoutePeer{{Use: "backend"}},
+				// 8 per instance: the fleet reads its capacity from here, so the helper has
+				// to carry one — a route with no ceiling legitimately reports 0.
+				Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 8}},
 			},
 		},
 		Status: routingv1.ModelRouteStatus{Backends: backends, Ready: ready},
@@ -111,11 +113,9 @@ func fleetFixture() *routingv1.ModelFleet {
 			},
 			Members: []routingv1.FleetMember{
 				{Name: "h100", Hardware: routingv1.Hardware{Vendor: "nvidia", Model: "H100", Replicas: 2},
-					Backend:      routingv1.MemberBackend{ModelRouteRef: "glm-53-h100"},
-					Capabilities: &routingv1.Capabilities{MaxConcurrency: 16}},
+					Backend: routingv1.MemberBackend{ModelRouteRef: "glm-53-h100"}},
 				{Name: "ascend", Hardware: routingv1.Hardware{Vendor: "huawei", Model: "910B4", Replicas: 1},
-					Backend:      routingv1.MemberBackend{ModelRouteRef: "glm-53-ascend"},
-					Capabilities: &routingv1.Capabilities{MaxConcurrency: 8}},
+					Backend: routingv1.MemberBackend{ModelRouteRef: "glm-53-ascend"}},
 			},
 			TrafficPolicy: &routingv1.TrafficPolicy{
 				Revision: 42,
@@ -1994,7 +1994,7 @@ func TestFleetTotalCapacityCountsReadyMembersOnly(t *testing.T) {
 	if tc == nil {
 		t.Fatal("no totalCapacity")
 	}
-	// The fixture declares 16 for h100 and 8 for ascend, with 2 and 1 replicas.
+	// Read from the routes, not declared: h100 has 2 backends at 8 each, ascend is down.
 	if tc.MaxConcurrency != 16 || tc.ReadyReplicas != 2 {
 		t.Fatalf("totalCapacity = %+v, want only the ready member's 16/2", tc)
 	}
@@ -2107,5 +2107,79 @@ func TestFleetWithOneMemberGetsEverything(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if fleet.Status.MemberCount != 1 {
 		t.Fatalf("status.memberCount = %d", fleet.Status.MemberCount)
+	}
+}
+
+// Capacity is READ from each member's ModelRoute, not declared on the fleet: "per-instance
+// ceiling × discovered backends", the same rule the ModelRoute controller uses to size CART's
+// dynamic concurrency. It therefore follows a member scaling with nobody editing a field —
+// which is the whole reason the declared copy was removed.
+func TestFleetCapacityFollowsTheRoute(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	capacity := func() (int32, map[string]int32) {
+		var f routingv1.ModelFleet
+		_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &f)
+		per := map[string]int32{}
+		for _, m := range f.Status.Members {
+			per[m.Name] = m.MaxConcurrency
+		}
+		return f.Status.TotalCapacity.MaxConcurrency, per
+	}
+	total, per := capacity()
+	// 8 per instance in the helper: h100 has 2 backends, ascend 1.
+	if per["h100"] != 16 || per["ascend"] != 8 || total != 24 {
+		t.Fatalf("capacity = %d, per member %v, want 16+8", total, per)
+	}
+
+	// The member scales out. Nothing in the fleet changes, and the capacity has to move.
+	var mr routingv1.ModelRoute
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "glm-53-h100"}, &mr); err != nil {
+		t.Fatal(err)
+	}
+	mr.Status.Backends = 5
+	// A plain Update: only ModelFleet is registered as having a status subresource on this
+	// fake client, so Status().Update on a ModelRoute fails with a confusing NotFound.
+	if err := c.Update(context.Background(), &mr); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	total, per = capacity()
+	if per["h100"] != 40 || total != 48 {
+		t.Fatalf("after scaling to 5 backends: capacity = %d, per member %v, want 40+8", total, per)
+	}
+}
+
+// A route that declares no per-instance ceiling reports 0 rather than a guess: openresty
+// falls back to the route's default_max there, and inventing a number here would put a
+// figure on the console that nothing enforces.
+func TestFleetCapacityIsZeroWhenTheRouteDeclaresNone(t *testing.T) {
+	route := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true)
+	route.Spec.Nginx.Peers = []routingv1.RoutePeer{{Use: "backend"}} // no maxConcurrency
+	f := fleetFixture()
+	f.Spec.Members = f.Spec.Members[:1]
+	f.Spec.TrafficPolicy = nil
+	r, c := newFleetReconciler(t, f, route,
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if got := fleet.Status.TotalCapacity.MaxConcurrency; got != 0 {
+		t.Fatalf("totalCapacity.maxConcurrency = %d, want 0", got)
+	}
+	if got := fleet.Status.Members[0].MaxConcurrency; got != 0 {
+		t.Fatalf("member maxConcurrency = %d, want 0", got)
+	}
+	// ...and the fleet is otherwise perfectly healthy: no ceiling is not an error.
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a route with no declared ceiling failed the sync: %+v", fleet.Status.Conditions)
 	}
 }
