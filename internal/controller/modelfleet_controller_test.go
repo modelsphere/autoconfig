@@ -2501,6 +2501,14 @@ func TestFleetCapacityUnderCartUsesTheCartCeiling(t *testing.T) {
 	if got := routeMaxConcurrency(mr); got != 48 {
 		t.Fatalf("capacity = %d, want the cart ceiling 48 (not 4 backends x 25)", got)
 	}
+	// ...and the other direction, which taking the cart ceiling alone got wrong: a CART that
+	// accepts more than the engines behind it can serve does not make the route bigger, it
+	// queues the surplus inside CART.
+	mr.Spec.Nginx.Peers[0].MaxConcurrency = 200
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 4 x 25 = 100: the engines bind, not CART's 200", got)
+	}
+	mr.Spec.Nginx.Peers[0].MaxConcurrency = 48
 	mr.Spec.Nginx.Peers[0].MaxConcurrencyFromBackend = true
 	if got := routeMaxConcurrency(mr); got != 100 {
 		t.Fatalf("capacity = %d, want 4 backends x 25 = 100 when the cart limit follows them", got)

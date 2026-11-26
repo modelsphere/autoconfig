@@ -343,30 +343,45 @@ func isPublicRoute(fleet *routingv1.ModelFleet) bool {
 //
 // 0 when the route declares no ceiling, which is how openresty treats it too (the route's
 // default_max applies) - reported as 0 rather than guessed.
-// routeMaxConcurrency is what openresty will actually admit for this route.
+// routeMaxConcurrency is how many concurrent requests this route can actually serve: the
+// SMALLER of the two ceilings on the path, because either one on its own overstates it.
 //
-// Which peer group decides depends on whether CART is in front. With a cart peer carrying a
-// fixed ceiling, that ceiling is the admission limit however many backends there are, so
-// multiplying the backends out would report a capacity openresty refuses to use. With
-// maxConcurrencyFromBackend the cart peer's limit IS the backend sum (that is what the flag
-// means), so the backend groups answer, and so they do when there is no cart peer at all.
+// The backends alone ignore that openresty admits requests to the CART peer, which has a
+// limit of its own: 4 x 25 behind a CART that accepts 48 serves 48. The CART peer alone is
+// the opposite error: a CART that accepts 200 in front of 4 x 25 does not serve 200, it
+// queues the surplus internally. min() is the binding constraint in both directions.
+//
+// maxConcurrencyFromBackend needs no special case under min(): the flag means the CART limit
+// IS the backend sum, so the two values are the same number.
+//
+// 0 means "unknown" and keeps this route out of the fleet's total rather than contributing a
+// guess - no ceiling is declared, or there are no ready backends to multiply, or there are
+// several backend ceilings, which is several answers and not one.
 func routeMaxConcurrency(mr *routingv1.ModelRoute) int32 {
-	perInstance, backendGroups := 0, 0
+	perInstance, backendGroups, cart := 0, 0, 0
 	for _, p := range mr.Spec.Nginx.Peers {
 		if p.Use == "cart" && p.MaxConcurrency > 0 && !p.MaxConcurrencyFromBackend {
-			return int32(p.MaxConcurrency)
+			cart = p.MaxConcurrency
 		}
 		if p.Use == "backend" && p.MaxConcurrency > 0 {
-			// Several backend groups mean several ceilings and no single answer. Reporting
-			// one of them (the last, as this did) would be a number nobody can trace.
 			backendGroups++
 			perInstance = p.MaxConcurrency
 		}
 	}
-	if perInstance == 0 || backendGroups > 1 || mr.Status.Backends <= 0 {
-		return 0
+	backend := 0
+	if perInstance > 0 && backendGroups == 1 && mr.Status.Backends > 0 {
+		backend = perInstance * mr.Status.Backends
 	}
-	return int32(perInstance * mr.Status.Backends)
+	switch {
+	case cart > 0 && backend > 0:
+		return int32(min(cart, backend))
+	case cart > 0:
+		// No usable backend figure, but the CART ceiling is still a real limit, and saying
+		// it beats saying nothing.
+		return int32(cart)
+	default:
+		return int32(backend)
+	}
 }
 
 // checkModelNameIsUnique refuses a model name another fleet on the same gateway already
