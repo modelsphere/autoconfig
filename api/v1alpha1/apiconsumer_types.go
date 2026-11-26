@@ -69,8 +69,16 @@ type APIConsumerStatus struct {
 	// forever, with nothing in the object pointing at it.
 	// +optional
 	AppliedGatewayNamespace string `json:"appliedGatewayNamespace,omitempty"`
-	// LastSyncTime: when this object was last reconciled, including rounds that wrote
-	// nothing. "Is the controller still looking at this", not "when did the gateway change".
+	// LastSyncTime: when this object's status was last written — on every pass that changed
+	// something, including the ones that failed before touching the gateway, and otherwise
+	// once per resync interval as a heartbeat. It is NOT stamped on every pass: that write
+	// is an update event on this object, which the controller watches, so an unconditional
+	// stamp made each round trigger the next one — and a round here reads every consumer's
+	// Secret uncached.
+	//
+	// So a value a little older than the resync interval means "settled, nothing to say",
+	// not "stalled". It answers "is the controller still looking at this", not "when did the
+	// gateway change"; observedGeneration and Programmed answer the latter.
 	// +optional
 	LastSyncTime *metav1.Time `json:"lastSyncTime,omitempty"`
 	// Conditions: Programmed (the gateway carries this consumer's credentials).
