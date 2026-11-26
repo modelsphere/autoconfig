@@ -2,8 +2,10 @@ package controller
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,6 +54,16 @@ func keyAuthWith(consumers ...map[string]any) *unstructured.Unstructured {
 	_ = unstructured.SetNestedSlice(o.Object, list, "spec", "defaultConfig", "consumers")
 	_ = unstructured.SetNestedField(o.Object, false, "spec", "defaultConfig", "global_auth")
 	_ = unstructured.SetNestedStringSlice(o.Object, []string{"x-higress-dummy-key"}, "spec", "defaultConfig", "keys")
+	return o
+}
+
+// ...and the same key-auth with those entries recorded as this controller's own, which is
+// what it looks like after a previous programming round. Entries with no such record are
+// somebody else's (the gateway chart's, mid-migration) and are carried over untouched, so a
+// test about revoking OUR entry has to say that it is ours.
+func keyAuthManagedBy(names string, consumers ...map[string]any) *unstructured.Unstructured {
+	o := keyAuthWith(consumers...)
+	o.SetAnnotations(map[string]string{managedConsumersAnnotation: names})
 	return o
 }
 
@@ -229,7 +241,8 @@ func TestConsumerDeleteRevokesTheKey(t *testing.T) {
 		doomed,
 		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
 		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
-		keyAuthWith(liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b")),
+		keyAuthManagedBy("tenant-a,tenant-b",
+			liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b")),
 	)
 	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
 		t.Fatal(err)
@@ -401,6 +414,17 @@ func TestConsumerListFailureWritesNothing(t *testing.T) {
 func keyAuthInNamespace(ns string, consumers ...map[string]any) *unstructured.Unstructured {
 	o := keyAuthWith(consumers...)
 	o.SetNamespace(ns)
+	// Recorded as this controller's own: the consumer being moved was programmed into this
+	// gateway by a previous round, which is the only reason withdrawing it is allowed to
+	// remove the entry.
+	names := make([]string, 0, len(consumers))
+	for _, c := range consumers {
+		names = append(names, c["name"].(string))
+	}
+	sort.Strings(names)
+	if len(names) > 0 {
+		o.SetAnnotations(map[string]string{managedConsumersAnnotation: strings.Join(names, ",")})
+	}
 	return o
 }
 
@@ -413,4 +437,135 @@ func condMessage(conds []metav1.Condition, typ string) string {
 		}
 	}
 	return ""
+}
+
+// The migration case, and the first step the documentation tells people to take: the gateway
+// chart renders the tenants, somebody creates ONE APIConsumer. A full replacement of the list
+// would revoke everyone else - a 401 each, with nothing but a healthy-looking CR to show for
+// it. The empty-list guard does not catch this, because the rendered list is not empty.
+func TestConsumerDoesNotRevokeEntriesItDoesNotOwn(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-new", "tenant-new-keys"),
+		credSecret("tenant-new-keys", map[string]string{"key": "sk-new"}),
+		// Rendered by the chart: no managed-consumers record, so not ours.
+		keyAuthWith(liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b"),
+			liveConsumer("ops", "sk-ops")),
+	)
+	if err := reconcileConsumer(t, r, "tenant-new"); err != nil {
+		t.Fatal(err)
+	}
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	want := []string{"ops", "tenant-a", "tenant-b", "tenant-new"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("consumers = %v, want %v - the chart's tenants must survive", names, want)
+	}
+	// Their credentials have to survive too, not just their names: an entry carried over
+	// with an empty credential list is a 403 rather than a 401, which is not an improvement.
+	for _, lc := range gatewayConsumers(t, c, "higress-system") {
+		m := lc.(map[string]any)
+		if creds, _ := m["credentials"].([]any); len(creds) == 0 {
+			t.Fatalf("consumer %v was carried over without its credentials", m["name"])
+		}
+	}
+	// ...and only the new one is recorded as ours, so deleting it later revokes exactly it.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if got := ka.GetAnnotations()[managedConsumersAnnotation]; got != "tenant-new" {
+		t.Fatalf("managed-consumers = %q, want just tenant-new", got)
+	}
+}
+
+// A list this controller cannot account for is not rewritten at all. Carrying entries over
+// means reproducing them verbatim, and an entry that is not an object, or has no name, cannot
+// be told apart from one of ours - so the safe move is to refuse rather than to guess.
+func TestConsumerRefusesAnUnreadableLiveList(t *testing.T) {
+	r, _ := newConsumerReconciler(t,
+		consumerFixture("tenant-new", "tenant-new-keys"),
+		credSecret("tenant-new-keys", map[string]string{"key": "sk-new"}),
+		keyAuthWith(map[string]any{"credentials": []any{"sk-x"}}), // no name
+	)
+	err := r.programGateway(context.Background(), "higress-system", nil)
+	if err == nil || !strings.Contains(err.Error(), "no name") {
+		t.Fatalf("expected a refusal naming the problem, got %v", err)
+	}
+}
+
+// Deleting a consumer must not be able to wedge the object. The rewrite that revokes the key
+// goes through programGateway, which refuses the whole round if ANY consumer on that gateway
+// has an unreadable Secret - so somebody else's broken Secret used to hold this object in
+// Terminating for good, freeable only by hand-editing a finalizer.
+func TestConsumerDeleteIsNotWedgedByAnotherConsumersSecret(t *testing.T) {
+	stale := metav1.NewTime(time.Now().Add(-20 * time.Minute)) // past the revoke deadline
+	doomed := consumerFixture("tenant-b", "tenant-b-keys")
+	doomed.DeletionTimestamp = &stale
+	broken := consumerFixture("tenant-a", "secret-that-does-not-exist")
+	r, c := newConsumerReconciler(t, doomed, broken,
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
+		keyAuthManagedBy("tenant-a,tenant-b",
+			liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b")),
+	)
+	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
+		t.Fatalf("deletion returned an error instead of letting the object go: %v", err)
+	}
+	var con routingv1.APIConsumer
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-b"}, &con)
+	if err == nil && len(con.Finalizers) > 0 {
+		t.Fatalf("object still held by %v after the revoke deadline", con.Finalizers)
+	}
+}
+
+// ...but before the deadline it keeps trying, and says so. Giving up immediately would make
+// "delete" mean "the key may or may not still work", which is worse than a slow delete.
+func TestConsumerDeleteKeepsTryingBeforeTheDeadline(t *testing.T) {
+	now := metav1.Now()
+	doomed := consumerFixture("tenant-b", "tenant-b-keys")
+	doomed.DeletionTimestamp = &now
+	broken := consumerFixture("tenant-a", "secret-that-does-not-exist")
+	r, c := newConsumerReconciler(t, doomed, broken,
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
+		keyAuthManagedBy("tenant-a,tenant-b",
+			liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b")),
+	)
+	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	var con routingv1.APIConsumer
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "tenant-b"}, &con); err != nil {
+		t.Fatalf("the object was released although the key was never revoked: %v", err)
+	}
+	if len(con.Finalizers) == 0 {
+		t.Fatal("the finalizer was dropped although the key was never revoked")
+	}
+	if msg := condMessage(con.Status.Conditions, condProgrammed); !strings.Contains(msg, "still retrying") {
+		t.Fatalf("the condition does not say it is still trying: %q", msg)
+	}
+	// The key is still live, which is the honest state - and the reason the object is held.
+	if n := len(consumerNames(gatewayConsumers(t, c, "higress-system"))); n != 2 {
+		t.Fatalf("live consumers = %d, want both (nothing was written)", n)
+	}
+}
+
+// A gateway that is gone, or whose CRD has been uninstalled, needs no rewrite: there is
+// nothing left to revoke the key from, so the object goes immediately rather than waiting out
+// a deadline for a write that can never succeed.
+func TestConsumerDeleteReleasesWhenTheGatewayIsGone(t *testing.T) {
+	now := metav1.Now()
+	doomed := consumerFixture("tenant-b", "tenant-b-keys")
+	doomed.DeletionTimestamp = &now
+	r, c := newConsumerReconciler(t, doomed,
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
+	) // no key-auth anywhere
+	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	var con routingv1.APIConsumer
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-b"}, &con)
+	if err == nil && len(con.Finalizers) > 0 {
+		t.Fatalf("held on a gateway that does not exist: %v", con.Finalizers)
+	}
 }

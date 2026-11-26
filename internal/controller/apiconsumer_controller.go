@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -31,6 +32,13 @@ const (
 	consumerFinalizer  = "routing.modelsphere.dev/apiconsumer"
 	condProgrammed     = "Programmed"
 	consumerResyncTime = 60 * time.Second
+	// How long deletion keeps trying to revoke the key before it releases the object anyway.
+	// Long enough to ride out a gateway rollout or a Secret that is briefly unreadable, short
+	// enough that nobody has to hand-edit a finalizer.
+	consumerRevokeDeadline = 15 * time.Minute
+
+	// Records which consumer names in key-auth came from APIConsumers.
+	managedConsumersAnnotation = "routing.modelsphere.dev/managed-consumers"
 )
 
 // ModelFleetReconciler already defines wasmPluginGVK, gatewayNamespace and isAbsent; this
@@ -68,9 +76,28 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// gone nothing would remember that this credential is still accepted. Deleting
 			// an APIConsumer has to actually revoke the key.
 			for _, ns := range distinctNamespaces(gwNS, consumer.Status.AppliedGatewayNamespace) {
-				if err := r.programGateway(ctx, ns, &consumer); err != nil {
-					return ctrl.Result{}, err
+				err := r.programGateway(ctx, ns, &consumer)
+				// A gateway that is GONE needs no rewrite, and neither does one whose CRD
+				// has been uninstalled: there is nothing left to revoke the key from.
+				// Anything else - a misspelled namespace, an unreadable Secret belonging to
+				// ANOTHER consumer on the same gateway ("one broken Secret stops the whole
+				// round") - would otherwise block the finalizer on every pass and leave this
+				// object in Terminating for good, needing a hand-edited finalizer to free.
+				// Deletion keeps retrying for a while and then gives up and lets go, with
+				// the reason on the object: a stuck object is worse than a stale entry
+				// nobody can point at.
+				if err == nil || errors.Is(err, errGatewayAbsent) {
+					continue
 				}
+				if time.Since(consumer.DeletionTimestamp.Time) < consumerRevokeDeadline {
+					r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "RevokeError",
+						fmt.Sprintf("could not take this consumer out of gateway %q: %v "+
+							"(still retrying; the object is held until this succeeds or "+
+							"%s has passed)", ns, err, consumerRevokeDeadline), 0, "")
+					return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
+				}
+				log.Error(err, "giving up on revoking a consumer; releasing the object anyway",
+					"gateway", ns, "deadline", consumerRevokeDeadline)
 			}
 			if err := r.patchConsumerFinalizer(ctx, &consumer, false); err != nil {
 				return ctrl.Result{}, err
@@ -88,7 +115,10 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Moving gateway.namespace must take the credentials out of the gateway they used to be
 	// in. Same reason ModelFleet records appliedGatewayNamespace: nothing else remembers.
 	if old := consumer.Status.AppliedGatewayNamespace; old != "" && old != gwNS {
-		if err := r.programGateway(ctx, old, nil); err != nil {
+		// isAbsent: the gateway it used to be in has been uninstalled, so there is nothing
+		// to take it out of. Retrying that forever would mean this consumer's key never
+		// reaches its NEW gateway - the one failure mode worse than a stale entry.
+		if err := r.programGateway(ctx, old, nil); err != nil && !errors.Is(err, errGatewayAbsent) {
 			r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "WithdrawError",
 				fmt.Sprintf("could not take this consumer out of its previous gateway %q: %v", old, err), 0, "")
 			return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
@@ -120,6 +150,10 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 //
 // `excluding` is the object being deleted: it still exists in the API server while its
 // finalizer runs, so it has to be left out explicitly.
+// errGatewayAbsent: this gateway's key-auth, or the WasmPlugin CRD itself, is not there. The
+// only failure that means "there is nothing left to revoke a key from".
+var errGatewayAbsent = errors.New("the gateway's key-auth is not present")
+
 func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string, excluding *routingv1.APIConsumer) error {
 	var list routingv1.APIConsumerList
 	if err := r.List(ctx, &list); err != nil {
@@ -185,6 +219,14 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(wasmPluginGVK)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+			if isAbsent(err) {
+				// Distinguished by a sentinel rather than by IsNotFound on whatever came
+				// back: a MISSING SECRET is also NotFound, and treating that as "the gateway
+				// is gone" would let a deletion release its object while the credential is
+				// still live in key-auth. The one case that must be told apart from every
+				// other failure deserves its own signal, not a shared error class.
+				return fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
+			}
 			return fmt.Errorf("key-auth in namespace %q: %w", gwNS, err)
 		}
 		live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
@@ -211,13 +253,47 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		}
 
 		next := make([]any, 0, len(consumers))
+		mine := make(map[string]bool, len(consumers))
 		for _, c := range consumers {
 			m, err := sink.ToMap(c)
 			if err != nil {
 				return err
 			}
+			mine[c.Name] = true
 			next = append(next, m)
 		}
+		// Carry over the live entries this controller did not write. The empty-list guard
+		// above only catches a write that renders NOTHING, which left the much more likely
+		// case open: the gateway chart renders three tenants, someone creates their first
+		// APIConsumer, and a full replacement with one entry revokes the other three - a 401
+		// for each of them, from the first step the documentation tells people to take.
+		//
+		// Anything whose name is not in managedConsumerNames is somebody else's and is kept
+		// verbatim. A name this controller HAS managed is not carried over, because that is
+		// what deleting an APIConsumer has to mean: the key stops working.
+		managed, err := managedConsumerNames(obj)
+		if err != nil {
+			return err
+		}
+		var foreign []string
+		for _, lc := range live {
+			m, ok := lc.(map[string]any)
+			if !ok {
+				return fmt.Errorf("%s/key-auth: defaultConfig.consumers holds a %T, not an "+
+					"object; refusing to rewrite a list this controller cannot read", gwNS, lc)
+			}
+			name, _ := m["name"].(string)
+			if name == "" {
+				return fmt.Errorf("%s/key-auth: a live consumer has no name; refusing to "+
+					"rewrite a list this controller cannot account for", gwNS)
+			}
+			if mine[name] || managed[name] {
+				continue
+			}
+			foreign = append(foreign, name)
+			next = append(next, lc)
+		}
+		sortConsumerList(next)
 		if sameRules(live, next) {
 			// Unchanged: do not write. Every write here is an ECDS push of key-auth to the
 			// whole data plane, and the console calls this on every key edit.
@@ -226,7 +302,12 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		if err := unstructured.SetNestedSlice(obj.Object, next, "spec", "defaultConfig", "consumers"); err != nil {
 			return err
 		}
-		log.Info("programming gateway consumers", "gateway", gwNS, "consumers", len(next), "was", len(live))
+		// Written next to the data it describes, because nothing else can tell the two apart
+		// later: once an APIConsumer is deleted, its object is gone and its entry would look
+		// exactly like one of the chart's.
+		setManagedConsumerNames(obj, consumers)
+		log.Info("programming gateway consumers", "gateway", gwNS,
+			"mine", len(consumers), "carried over", len(foreign), "was", len(live))
 		return r.Update(ctx, obj)
 	})
 }
@@ -361,4 +442,52 @@ func (r *APIConsumerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&routingv1.APIConsumer{}).
 		Complete(r)
+}
+
+// managedConsumerNames: the consumer names this controller wrote last time, recorded on the
+// WasmPlugin itself. It is the only way to tell "an entry I own, whose APIConsumer has since
+// been deleted, and which must now stop working" from "an entry somebody else owns, which I
+// must not touch". Both are just names in a list with no object behind them.
+func managedConsumerNames(obj *unstructured.Unstructured) (map[string]bool, error) {
+	out := map[string]bool{}
+	raw := obj.GetAnnotations()[managedConsumersAnnotation]
+	if raw == "" {
+		return out, nil
+	}
+	for _, n := range strings.Split(raw, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			out[n] = true
+		}
+	}
+	return out, nil
+}
+
+func setManagedConsumerNames(obj *unstructured.Unstructured, consumers []sink.KeyAuthConsumer) {
+	names := make([]string, 0, len(consumers))
+	for _, c := range consumers {
+		names = append(names, c.Name)
+	}
+	sort.Strings(names)
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	if len(names) == 0 {
+		delete(ann, managedConsumersAnnotation)
+	} else {
+		ann[managedConsumersAnnotation] = strings.Join(names, ",")
+	}
+	obj.SetAnnotations(ann)
+}
+
+// Stable order, so that carrying foreign entries over does not produce a different list every
+// round and an ECDS push with it.
+func sortConsumerList(list []any) {
+	sort.SliceStable(list, func(i, j int) bool {
+		a, _ := list[i].(map[string]any)
+		b, _ := list[j].(map[string]any)
+		an, _ := a["name"].(string)
+		bn, _ := b["name"].(string)
+		return an < bn
+	})
 }
