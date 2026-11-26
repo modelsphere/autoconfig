@@ -332,9 +332,18 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 			next = append(next, lc)
 		}
 		sortConsumerList(next)
-		if sameRules(live, next) {
-			// Unchanged: do not write. Every write here is an ECDS push of key-auth to the
-			// whole data plane, and the console calls this on every key edit.
+		// Unchanged AND already attributed: do not write. Every write here is an ECDS push
+		// of key-auth to the whole data plane, and the console calls this on every key edit.
+		//
+		// The second half is not decoration. Adopting a consumer whose entry the chart
+		// already renders, with the same credential, leaves the list byte-identical - so a
+		// check on the list alone returns early and never records that the entry is now
+		// OURS. That is how the live migration ended up with an annotation naming one of
+		// three adopted consumers: the first write recorded itself, and the next two were
+		// skipped as no-ops. Deleting either of those two would then have left its entry in
+		// place as somebody else's, and the key would have kept working - the one thing
+		// deleting an APIConsumer must never do.
+		if sameRules(live, next) && sameNames(managed, mine) {
 			return nil
 		}
 		if err := unstructured.SetNestedSlice(obj.Object, next, "spec", "defaultConfig", "consumers"); err != nil {
@@ -585,4 +594,17 @@ func (r *APIConsumerReconciler) claimConsumers(ctx context.Context, gwNS string,
 	logf.FromContext(ctx).Info("taking ownership of the gateway consumer list",
 		"gateway", gwNS, "entries", len(value))
 	return r.Patch(ctx, claim, client.Apply, client.ForceOwnership, client.FieldOwner(fieldManagerName))
+}
+
+// sameNames: do the two name sets hold the same names?
+func sameNames(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for n := range a {
+		if !b[n] {
+			return false
+		}
+	}
+	return true
 }

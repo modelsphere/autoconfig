@@ -809,3 +809,54 @@ func TestConsumerTakesOwnershipOfTheConsumerList(t *testing.T) {
 		t.Fatalf("server-side applies = %d after four passes, want 1: the claim repeats", n)
 	}
 }
+
+// Adopting a consumer whose entry the chart already renders, with the same credential, leaves
+// the list byte-identical - so the "nothing changed, do not write" check returns early and the
+// entry is never recorded as ours. Deleting that APIConsumer afterwards leaves its entry in
+// place as somebody else's and the key keeps working, which is the one thing deleting a
+// consumer must never do.
+//
+// Found on the live migration: three consumers were adopted and the annotation named one.
+func TestConsumerAdoptionIsRecordedEvenWhenTheListDoesNotChange(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		consumerFixture("tenant-b", "tenant-b-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
+		// Exactly what the two APIConsumers render, so no round changes the list at all.
+		keyAuthWith(liveConsumer("tenant-a", "Bearer sk-a"), liveConsumer("tenant-b", "Bearer sk-b")),
+	)
+	for _, n := range []string{"tenant-a", "tenant-b"} {
+		if err := reconcileConsumer(t, r, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if got := ka.GetAnnotations()[managedConsumersAnnotation]; got != "tenant-a,tenant-b" {
+		t.Fatalf("managed-consumers = %q, want both: the second adoption was skipped as a no-op", got)
+	}
+
+	// And the point of recording it: deleting one revokes its key. deletionTimestamp is
+	// immutable on an existing object, so the deletion is made the way the API server makes
+	// it - a Delete, which parks the object on its finalizer.
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "tenant-b"}
+	var con routingv1.APIConsumer
+	if err := c.Get(context.Background(), nn, &con); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &con); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "tenant-a" {
+		t.Fatalf("consumers = %v, want only tenant-a: the adopted entry was not revoked", names)
+	}
+}
