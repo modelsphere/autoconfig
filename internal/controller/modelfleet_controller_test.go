@@ -2756,3 +2756,49 @@ func TestFleetStreamGuardNotWrittenWithoutDetectors(t *testing.T) {
 		t.Fatalf("rules = %d after detectors were configured, want 1", n)
 	}
 }
+
+// Clearing the chart's detectors must WITHDRAW the rule, not just stop writing a new one.
+// Skipping the write alone left the previous rule in place: the chart had no detectors any
+// more, the fleet reported "not written", and the gateway went on cutting streams at a
+// threshold that existed nowhere but in that stale rule. The condition said one thing and the
+// gateway did another - found by the cluster probe, which is where that asymmetry shows.
+func TestFleetStreamGuardRuleIsWithdrawnWhenDetectorsGoAway(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), streamGuardPlugin(),
+	)
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 1 {
+		t.Fatalf("rules = %d before the change, want 1", n)
+	}
+
+	// The chart drops its detectors.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "ai-stream-guard"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedSlice(ka.Object, []any{}, "spec", "defaultConfig", "detectors"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(context.Background(), &ka); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("rules = %d: the old rule survived, so the gateway keeps cutting at a "+
+			"threshold that exists nowhere else", n)
+	}
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("the fleet stopped publishing over an unconfigured guard")
+	}
+	if msg := condMessage(fleet.Status.Conditions, condGatewaySynced); !strings.Contains(msg, "not written") {
+		t.Fatalf("the condition does not mention the withdrawn rule: %q", msg)
+	}
+}

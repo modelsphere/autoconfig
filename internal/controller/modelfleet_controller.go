@@ -1133,9 +1133,16 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 		// Would our rule be unwritable given this plugin's own global config? Asked after the
 		// Get, because the answer is on the object. A rule that cannot load is worse than no
 		// rule: it stalls the config push for every plugin on this gateway.
+		// An unusable plugin config does not just stop us writing - it WITHDRAWS the rule we
+		// wrote before. Skipping the write alone left the previous rule in place: the chart
+		// had no detectors any more, the fleet reported "not written", and the gateway went
+		// on cutting streams at a threshold that existed nowhere but in that stale rule.
+		// Caught by the cluster probe, which is also where the asymmetry is obvious - the
+		// condition says one thing and the gateway does another.
+		unusableWhy := ""
 		if cfg != nil && p.unusable != nil {
-			if why := p.unusable(obj); why != "" {
-				return &pluginUnusableError{plugin: p.name, why: why}
+			if unusableWhy = p.unusable(obj); unusableWhy != "" {
+				cfg = nil // fall through to the withdrawal path below
 			}
 		}
 		// Substitute the plugin's own defaultConfig for the marker config. The gateway never
@@ -1194,13 +1201,27 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 			// Nothing changed: do not write. Every write here is a config push to the
 			// gateway, and a controller that rewrites an identical object on each resync
 			// turns a 30s resync into a 30s config churn across the data plane.
-			return nil
+			return unusableErr(p.name, unusableWhy)
 		}
 		if err := unstructured.SetNestedSlice(obj.Object, kept, "spec", "matchRules"); err != nil {
 			return err
 		}
-		return r.Update(ctx, obj)
+		if err := r.Update(ctx, obj); err != nil {
+			return err
+		}
+		// Written (or withdrawn). If the withdrawal was because the plugin's own config
+		// cannot support a rule, say so now - the rule is gone, which is what the message
+		// claims, and the caller reports it on the fleet without failing the sync.
+		return unusableErr(p.name, unusableWhy)
 	})
+}
+
+// unusableErr: nil unless there is a reason, so the write paths can return it unconditionally.
+func unusableErr(plugin, why string) error {
+	if why == "" {
+		return nil
+	}
+	return &pluginUnusableError{plugin: plugin, why: why}
 }
 
 // cleanupPluginRules withdraws every rule this fleet put into the gateway plugins.
