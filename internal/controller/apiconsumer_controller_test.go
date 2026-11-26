@@ -1032,3 +1032,155 @@ func TestConsumerDeleteOfANeverProgrammedObjectIsImmediate(t *testing.T) {
 		t.Fatalf("the chart's list has %d entries, want 1", n)
 	}
 }
+
+// Taking over a consumer NAME that already exists in the gateway and belongs to nobody must
+// require proof that the writer holds the key it already accepts. An APIConsumer can be
+// created in any namespace with any consumerName, and whatever it renders replaces the entry
+// - so without this, putting consumerName: tenant-a and your own key in your own Secret
+// inherits every route tenant-a is allowed on, and the real tenant-a gets 401. Neither
+// existing guard fires: the names do not collide between APIConsumers, and no credential is
+// shared.
+func TestConsumerCannotTakeOverANameWithoutItsKey(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		// Created in some other namespace, claiming the chart's consumer name.
+		func() client.Object {
+			o := consumerFixture("team-x-impostor", "team-x-keys")
+			o.Namespace = "team-x"
+			o.Spec.ConsumerName = "tenant-a"
+			return o
+		}(),
+		func() client.Object {
+			s := credSecret("team-x-keys", map[string]string{"key": "sk-attacker"})
+			s.Namespace = "team-x"
+			return s
+		}(),
+		// The chart's entry, with the real key, managed by nobody.
+		keyAuthWith(liveConsumer("tenant-a", "Bearer sk-the-real-key")),
+	)
+	err := r.programGateway(context.Background(), "higress-system", nil)
+	if err == nil {
+		t.Fatal("a foreign consumer name was taken over with a different key")
+	}
+	for _, want := range []string{"tenant-a", "existing", "consumerName"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error does not explain the refusal (%s missing): %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "sk-the-real-key") || strings.Contains(err.Error(), "sk-attacker") {
+		t.Fatalf("the error leaks a credential: %v", err)
+	}
+	// The real key still works: nothing was written.
+	creds := creds0Of(t, c, "higress-system", "tenant-a")
+	if strings.Join(creds, ",") != "Bearer sk-the-real-key" {
+		t.Fatalf("live credentials = %v, want the original untouched", creds)
+	}
+
+	// ...and carrying the existing key DOES adopt it, which is what a migration does.
+	var imp routingv1.APIConsumer
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "team-x", Name: "team-x-impostor"}, &imp); err != nil {
+		t.Fatal(err)
+	}
+	sec := credSecret("team-x-keys", map[string]string{"key": "sk-the-real-key"})
+	sec.Namespace = "team-x"
+	if err := c.Update(context.Background(), sec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("adoption with the existing key was refused: %v", err)
+	}
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-the-real-key" {
+		t.Fatalf("after adoption the credentials are %v", got)
+	}
+}
+
+// A fresh object that has never been programmed must not stop every OTHER consumer on the
+// gateway from being added, rotated or revoked. Fail-closed is for a consumer that has a key
+// in the list and would lose it; one that has nothing in there loses nothing by being skipped,
+// and holding the whole gateway hostage blocks exactly the operation you need in a hurry -
+// removing a leaked key.
+func TestConsumerBrokenNewObjectDoesNotFreezeTheGateway(t *testing.T) {
+	broken := consumerFixture("tenant-new", "secret-that-does-not-exist")
+	existing := consumerFixture("tenant-a", "tenant-a-keys")
+	existing.Status.ConsumerName = "tenant-a"
+	existing.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, broken, existing,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-rotated"}),
+		keyAuthManagedBy("tenant-a", liveConsumer("tenant-a", "Bearer sk-old")),
+	)
+	if err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("one never-programmed object blocked the whole round: %v", err)
+	}
+	// tenant-a's rotation went through...
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-rotated" {
+		t.Fatalf("tenant-a credentials = %v, want the rotated key", got)
+	}
+	// ...and the broken one is simply not in the list.
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "tenant-a" {
+		t.Fatalf("consumers = %v, want only tenant-a", names)
+	}
+
+	// But a consumer that IS in the list and whose Secret breaks still fails the round
+	// closed, because dropping it would revoke a working key.
+	if err := c.Delete(context.Background(), credSecret("tenant-a-keys", map[string]string{"key": "x"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.programGateway(context.Background(), "higress-system", nil); err == nil {
+		t.Fatal("an unreadable Secret for a consumer that HAS a key did not fail the round")
+	}
+}
+
+// creds0Of: one live consumer's credentials.
+func creds0Of(t *testing.T, c client.Client, gwNS, name string) []string {
+	t.Helper()
+	for _, lc := range gatewayConsumers(t, c, gwNS) {
+		m := lc.(map[string]any)
+		if n, _ := m["name"].(string); n == name {
+			raw, _ := m["credentials"].([]any)
+			out := make([]string, 0, len(raw))
+			for _, v := range raw {
+				out = append(out, v.(string))
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// Revoking the LAST consumer on a gateway, when no status claims that gateway any more.
+//
+// It happens when the gateway write succeeded and the status write that follows it did not -
+// the key is live with no record on the object - and that object is then deleted. No status
+// names the gateway, so "has this controller ever owned this list" cannot be answered from
+// statuses alone, and the empty-list guard refuses: the finalizer gives up at the revoke
+// deadline and the key stays live, with no APIConsumer left to ever clean it up. The
+// annotation on key-auth knows better, and emptying a list that it says is ours IS the
+// revocation.
+func TestConsumerRevokesTheLastConsumerWithoutAStatus(t *testing.T) {
+	doomed := consumerFixture("tenant-a", "tenant-a-keys")
+	// Programmed, then the status write failed: no appliedGatewayNamespace.
+	doomed.Status.AppliedGatewayNamespace = ""
+	r, c := newConsumerReconciler(t, doomed,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		// ...but the gateway's own annotation records the entry as ours.
+		keyAuthManagedBy("tenant-a", liveConsumer("tenant-a", "Bearer sk-a")),
+	)
+	var con routingv1.APIConsumer
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}
+	if err := c.Get(context.Background(), nn, &con); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &con); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(consumerNames(gatewayConsumers(t, c, "higress-system"))); n != 0 {
+		t.Fatalf("the gateway still accepts %d consumer(s): the key was never revoked", n)
+	}
+	if err := c.Get(context.Background(), nn, &con); err == nil && len(con.Finalizers) > 0 {
+		t.Fatalf("still held: %v", con.Finalizers)
+	}
+}

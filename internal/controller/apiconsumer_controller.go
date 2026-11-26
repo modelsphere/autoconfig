@@ -213,6 +213,15 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		}
 	}
 
+	// The names already in this gateway's list. Needed before rendering, to tell "this
+	// consumer's Secret is unreadable and it has a key in there" (fail closed) from "...and
+	// it has nothing in there" (skip it rather than freeze everyone else).
+	liveNames, err := r.liveConsumerNames(ctx, gwNS)
+	if err != nil && !errors.Is(err, errGatewayAbsent) {
+		return err
+	}
+
+	var skipped []string
 	views := make([]sink.ConsumerView, 0, len(list.Items))
 	for i := range list.Items {
 		c := &list.Items[i]
@@ -227,11 +236,24 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		}
 		creds, err := r.readCredentials(ctx, c)
 		if err != nil {
-			// Do NOT drop this consumer and write the rest. A consumer missing from the list
-			// is a caller that gets 401 on its next request, and a Secret that is briefly
-			// unreadable must not revoke someone's key. Refusing the whole write leaves the
-			// gateway on its last good list - every caller keeps working - and the failure
-			// is reported on the object that caused it.
+			// Fail closed for a consumer that HAS a key in this gateway: dropping it from
+			// the list is a 401 on its next request, and a Secret that is briefly
+			// unreadable must not revoke anyone. The whole round is refused, the gateway
+			// keeps its last good list, and the failure is reported on the object that
+			// caused it.
+			//
+			// But a consumer that was never programmed here has nothing in the list to
+			// lose, and refusing the round on its behalf freezes the gateway for everybody
+			// else: while a fresh object with a typo'd secretRef exists, no other consumer
+			// can be added, rotated or REVOKED - including removing a leaked key, and
+			// including a deletion, which then retries for the revoke deadline and
+			// releases with the key still live. One new broken object must not hold the
+			// rest hostage, so it is skipped, with the error on its own object.
+			if c.Status.AppliedGatewayNamespace != gwNS &&
+				!claimed[consumerName(c)] && !hasLiveEntry(liveNames, consumerName(c)) {
+				skipped = append(skipped, fmt.Sprintf("%s/%s (%v)", c.Namespace, c.Name, err))
+				continue
+			}
 			return fmt.Errorf("%s/%s: %w (nothing was written; the gateway keeps its "+
 				"current consumer list)", c.Namespace, c.Name, err)
 		}
@@ -242,6 +264,10 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		})
 	}
 
+	if len(skipped) > 0 {
+		logf.FromContext(ctx).Info("skipped consumers that have nothing in this gateway yet",
+			"gateway", gwNS, "skipped", skipped)
+	}
 	consumers, err := sink.RenderConsumers(views)
 	if err != nil {
 		return err
@@ -310,6 +336,22 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		// list is ours and emptying it is a revocation. If none does, the live entries came
 		// from somewhere else (the chart, during a half-finished migration) and wiping them
 		// would take the site's authentication down for a reason nobody asked for.
+		// Which names this controller wrote last time, read before the guard below because
+		// the guard needs it.
+		managed, err := managedConsumerNames(obj)
+		if err != nil {
+			return err
+		}
+
+		// The annotation counts as ownership too, not only a status. Otherwise the last
+		// consumer on a gateway cannot be revoked in one specific case: its gateway write
+		// succeeded, its status write did not, and it is then deleted - no status claims the
+		// gateway, so ownedBefore is false, the guard refuses, the finalizer gives up at the
+		// deadline, and the key stays live with no APIConsumer left to clean it up. If the
+		// annotation says the live entries are ours, emptying the list IS the revocation.
+		if len(managed) > 0 {
+			ownedBefore = true
+		}
 		if len(consumers) == 0 && len(live) > 0 && !ownedBefore {
 			return fmt.Errorf("refusing to write an empty consumer list over %d live consumer(s) "+
 				"in %s/key-auth: no APIConsumer has ever programmed this gateway, so those "+
@@ -320,12 +362,17 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 
 		next := make([]any, 0, len(consumers))
 		mine := make(map[string]bool, len(consumers))
+		myCreds := make(map[string]map[string]bool, len(consumers))
 		for _, c := range consumers {
 			m, err := sink.ToMap(c)
 			if err != nil {
 				return err
 			}
 			mine[c.Name] = true
+			myCreds[c.Name] = make(map[string]bool, len(c.Credentials))
+			for _, cred := range c.Credentials {
+				myCreds[c.Name][cred] = true
+			}
 			next = append(next, m)
 		}
 		// Carry over the live entries this controller did not write. The empty-list guard
@@ -337,10 +384,6 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		// Anything whose name is not in managedConsumerNames is somebody else's and is kept
 		// verbatim. A name this controller HAS managed is not carried over, because that is
 		// what deleting an APIConsumer has to mean: the key stops working.
-		managed, err := managedConsumerNames(obj)
-		if err != nil {
-			return err
-		}
 		var foreign []string
 		for _, lc := range live {
 			m, ok := lc.(map[string]any)
@@ -353,7 +396,38 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 				return fmt.Errorf("%s/key-auth: a live consumer has no name; refusing to "+
 					"rewrite a list this controller cannot account for", gwNS)
 			}
-			if mine[name] || managed[name] || claimed[name] {
+			if managed[name] || claimed[name] {
+				continue // already ours; this is a rotation, not an adoption
+			}
+			if mine[name] {
+				// Adopting an entry nobody has claimed before, by NAME. Taking it over has
+				// to require proof that the writer already holds the key, or the name is a
+				// free identity: an APIConsumer can be created in any namespace, its
+				// consumerName is free-form, and whatever it renders replaces the entry. A
+				// writer who put consumerName: tenant-a and their own key in their own
+				// Secret would inherit every route tenant-a is allowed on, and the real
+				// tenant-a would get 401 on its next request. Nothing else would notice:
+				// the names do not collide between APIConsumers, and no credential is
+				// shared, so neither existing guard fires.
+				//
+				// credentialsSecretRef is pinned to the object's own namespace for exactly
+				// this reason - a namespace-scoped writer is not trusted with other
+				// people's credentials - and an identity is worth no less than a key.
+				//
+				// The proof is: carry every credential the live entry already has. That is
+				// what a migration does anyway, because the point is that the caller
+				// changes nothing. Dropping an old key comes after adoption, as a rotation,
+				// when the entry is ours and no proof is needed.
+				if missing := credentialsNotCovered(m, myCreds[name]); missing > 0 {
+					return fmt.Errorf("%s/key-auth: consumer %q already exists in this "+
+						"gateway and is not managed by any APIConsumer, and the APIConsumer "+
+						"claiming that name does not carry %d of its %d existing "+
+						"credential(s). Adopting an existing consumer requires its current "+
+						"key(s), so that taking over a name cannot grant someone else's "+
+						"access; nothing was written. Add the existing key to the Secret to "+
+						"adopt it, then rotate, or give this APIConsumer a different "+
+						"consumerName", gwNS, name, missing, liveCredentialCount(m))
+				}
 				continue
 			}
 			foreign = append(foreign, name)
@@ -398,7 +472,14 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		setManagedConsumerNames(obj, consumers)
 		log.Info("programming gateway consumers", "gateway", gwNS,
 			"mine", len(consumers), "carried over", len(foreign), "was", len(live))
-		return r.Update(ctx, obj)
+		// FieldOwner spelled out, although the client's default manager happens to be this
+		// same name (measured on the test cluster: managedFields carries `autoconfig
+		// Update`). consumers is an atomic field, so if the default were ever something
+		// else - it is derived from the user agent, which a binary name or a library bump
+		// can change - each changing Update would move ownership away from the name
+		// ownsConsumers looks for, and every change would then cost a force-apply plus an
+		// Update: two config pushes where one belongs.
+		return r.Update(ctx, obj, client.FieldOwner(fieldManagerName))
 	})
 }
 
@@ -723,3 +804,49 @@ func (r *APIConsumerReconciler) hasNoLiveEntry(ctx context.Context, gwNS, name s
 	}
 	return true, nil
 }
+
+// credentialsNotCovered: how many of a live entry's credentials the rendered consumer does not
+// carry. 0 means the writer demonstrably holds every key that entry already accepts.
+func credentialsNotCovered(live map[string]any, rendered map[string]bool) int {
+	creds, _ := live["credentials"].([]any)
+	missing := 0
+	for _, c := range creds {
+		key, ok := c.(string)
+		if !ok || !rendered[key] {
+			missing++
+		}
+	}
+	return missing
+}
+
+func liveCredentialCount(live map[string]any) int {
+	creds, _ := live["credentials"].([]any)
+	return len(creds)
+}
+
+// liveConsumerNames: the consumer names this gateway's key-auth currently holds.
+func (r *APIConsumerReconciler) liveConsumerNames(ctx context.Context, gwNS string) (map[string]bool, error) {
+	out := map[string]bool{}
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(wasmPluginGVK)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+		if isAbsent(err) {
+			return out, fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
+		}
+		return out, err
+	}
+	live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
+	if err != nil {
+		return out, err
+	}
+	for _, lc := range live {
+		if m, ok := lc.(map[string]any); ok {
+			if n, _ := m["name"].(string); n != "" {
+				out[n] = true
+			}
+		}
+	}
+	return out, nil
+}
+
+func hasLiveEntry(names map[string]bool, name string) bool { return names[name] }
