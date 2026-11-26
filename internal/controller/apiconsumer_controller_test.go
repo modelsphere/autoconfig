@@ -906,29 +906,46 @@ func TestConsumerAdoptionIsRecordedEvenWhenTheListDoesNotChange(t *testing.T) {
 // Reachable on the documented migration path: a chart entry whose name is not a DNS label
 // cannot be adopted under that name (consumerName is pinned to one), so it gets a new
 // APIConsumer carrying the SAME key - the whole point being that the caller changes nothing.
-func TestConsumerRefusesACredentialSharedWithAForeignEntry(t *testing.T) {
+func TestConsumerSharingACredentialWithAForeignEntryCostsOnlyItself(t *testing.T) {
+	// Reachable on the documented migration path: a chart entry under a name no APIConsumer
+	// can take (consumerName is a DNS label, "tenant_a" is not) gets a new APIConsumer
+	// carrying the SAME key, because the point of the migration is that no caller changes
+	// anything. key-auth refuses a duplicate credential by failing to parse its whole config
+	// and denies everyone, so the pair must not be written - but it used to cost the round,
+	// and with it every other tenant's ability to add, rotate or revoke a key.
+	other := consumerFixture("tenant-b", "tenant-b-keys")
+	other.Status.ConsumerName = "tenant-b"
+	other.Status.AppliedGatewayNamespace = "higress-system"
 	r, c := newConsumerReconciler(t,
-		consumerFixture("tenant-a", "tenant-a-keys"),
+		consumerFixture("tenant-a", "tenant-a-keys"), other,
 		credSecret("tenant-a-keys", map[string]string{"key": "sk-shared"}),
-		// The chart's entry, under a name no APIConsumer can take, with the same key.
-		keyAuthWith(liveConsumer("tenant_a", "Bearer sk-shared")),
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b-rotated"}),
+		keyAuthManagedBy("tenant-b",
+			liveConsumer("tenant_a", "Bearer sk-shared"),
+			liveConsumer("tenant-b", "Bearer sk-b")),
 	)
-	_, err := r.programGateway(context.Background(), "higress-system", nil)
-	if err == nil {
-		t.Fatal("wrote a list key-auth refuses to parse: every caller on the gateway would be denied")
+	round, err := r.programGateway(context.Background(), "higress-system", nil)
+	if err != nil {
+		t.Fatalf("one object's duplicate key froze the gateway: %v", err)
 	}
-	for _, want := range []string{"tenant_a", "tenant-a", "every caller on every route"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("the error does not mention %s: %v", want, err)
+	// The reason is on the offending object, and names the entry it collides with.
+	why := round.skipped["llm-route/tenant-a"]
+	for _, want := range []string{"tenant_a", "left out"} {
+		if !strings.Contains(why, want) {
+			t.Fatalf("the reason on tenant-a does not mention %s: %q", want, why)
 		}
 	}
-	if strings.Contains(err.Error(), "sk-shared") {
-		t.Fatalf("the error leaks the credential: %v", err)
+	if strings.Contains(why, "sk-shared") {
+		t.Fatalf("the reason leaks the credential: %q", why)
 	}
-	// Nothing was written: the gateway keeps the list it had.
+	// The duplicate was NOT written...
 	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
-	if strings.Join(names, ",") != "tenant_a" {
-		t.Fatalf("consumers = %v, want the live list untouched", names)
+	if strings.Join(names, ",") != "tenant-b,tenant_a" { // sorted, and "-" sorts before "_"
+		t.Fatalf("consumers = %v, want the foreign entry plus tenant-b", names)
+	}
+	// ...and tenant-b's rotation went through, which is what the freeze used to block.
+	if got := creds0Of(t, c, "higress-system", "tenant-b"); strings.Join(got, ",") != "Bearer sk-b-rotated" {
+		t.Fatalf("tenant-b credentials = %v, want its rotated key", got)
 	}
 }
 
@@ -1917,5 +1934,88 @@ func TestConsumerPreservedNameDoesNotCauseAWritePerRound(t *testing.T) {
 		Namespace: "higress-system", Name: "key-auth"}, &ka)
 	if got := ka.GetAnnotations()[managedConsumersAnnotation]; !strings.Contains(got, "tenant-a") {
 		t.Fatalf("managed-consumers = %q, want the preserved name kept", got)
+	}
+}
+
+// The takeover路径 that routed around the proof-of-key check: do it through a BROKEN Secret.
+//
+// Point consumerName at a chart-rendered consumer with a secretRef that does not exist. If the
+// entry is preserved on the strength of the name alone, it is also recorded as
+// autoconfig-managed - and from then on the proof-of-key check is skipped for that name, so
+// creating the Secret afterwards with your own key replaces the real tenant's. 401 for them,
+// every route they were allowed on for you. Anyone who can create an APIConsumer in their own
+// namespace could do it.
+func TestConsumerCannotPreserveSomebodyElsesEntry(t *testing.T) {
+	impostor := consumerFixture("team-x", "does-not-exist-yet")
+	impostor.Namespace = "team-x"
+	impostor.Spec.ConsumerName = "chart-a"
+	// A healthy consumer too, so the round actually WRITES. Without one the empty-list guard
+	// refuses, nothing is recorded, and the test passes whether or not the bug is there -
+	// which is how the first version of it passed against the reverted fix. zoboth's scenario
+	// says it plainly: the next write for any reason is what records the stolen name.
+	healthy := consumerFixture("tenant-ok", "ok-keys")
+	r, c := newConsumerReconciler(t, impostor, healthy,
+		credSecret("ok-keys", map[string]string{"key": "sk-ok"}),
+		// The chart's entry, owned by no APIConsumer.
+		keyAuthWith(liveConsumer("chart-a", "Bearer sk-the-real-key")),
+	)
+	// The round may well return an error here - with the impostor left out there is nothing
+	// of ours to write, and the empty-list guard refuses to wipe the chart's entry. Which
+	// guard fires is not the point; the invariants are.
+	_, _ = r.programGateway(context.Background(), "higress-system", nil)
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	// The name must NOT have become autoconfig-managed on the back of a broken Secret.
+	if got := ka.GetAnnotations()[managedConsumersAnnotation]; strings.Contains(got, "chart-a") {
+		t.Fatalf("managed-consumers = %q: an object with no readable Secret claimed a name it "+
+			"never proved it holds, which skips the proof check from here on", got)
+	}
+	// The real key is untouched.
+	if got := creds0Of(t, c, "higress-system", "chart-a"); strings.Join(got, ",") != "Bearer sk-the-real-key" {
+		t.Fatalf("chart-a credentials = %v, want the original", got)
+	}
+
+	// ...and now that it has a Secret with its OWN key, the proof check still refuses it.
+	sec := credSecret("does-not-exist-yet", map[string]string{"key": "sk-attacker"})
+	sec.Namespace = "team-x"
+	if err := c.Create(context.Background(), sec); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = r.programGateway(context.Background(), "higress-system", nil)
+	if got := creds0Of(t, c, "higress-system", "chart-a"); strings.Join(got, ",") != "Bearer sk-the-real-key" {
+		t.Fatalf("chart-a credentials = %v: the impostor took the name over", got)
+	}
+}
+
+// Renaming spec.consumerName must not make an object an incumbent for a name it has never
+// served. It did - the status shortcut compared only the gateway - so an object renamed onto a
+// name somebody else serves produced two incumbents, and the collision check refused the round
+// for the whole gateway: every add, rotation and revocation blocked, every round, with an
+// error claiming that dropping either would revoke a working key.
+func TestConsumerRenameDoesNotFreezeTheGateway(t *testing.T) {
+	x := consumerFixture("obj-x", "x-keys")
+	x.Spec.ConsumerName = "tenant-b" // renamed onto Y's name
+	x.Status.ConsumerName = "tenant-x"
+	x.Status.AppliedGatewayNamespace = "higress-system"
+	y := consumerFixture("obj-y", "y-keys")
+	y.Spec.ConsumerName = "tenant-b"
+	y.Status.ConsumerName = "tenant-b"
+	y.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, x, y,
+		credSecret("x-keys", map[string]string{"key": "sk-x"}),
+		credSecret("y-keys", map[string]string{"key": "sk-y-rotated"}),
+		keyAuthManagedBy("tenant-b,tenant-x",
+			liveConsumer("tenant-b", "Bearer sk-y"), liveConsumer("tenant-x", "Bearer sk-x")),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("a renamed object froze the whole gateway: %v", err)
+	}
+	// Y keeps the name it actually serves, with its rotation applied.
+	if got := creds0Of(t, c, "higress-system", "tenant-b"); strings.Join(got, ",") != "Bearer sk-y-rotated" {
+		t.Fatalf("tenant-b credentials = %v, want Y's rotated key", got)
 	}
 }

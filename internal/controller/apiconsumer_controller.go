@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -355,33 +356,32 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// plausibly its own: that is the object whose gateway write landed and whose status
 	// write did not, and skipping it WOULD revoke a live key.
 	incumbent := func(c *routingv1.APIConsumer) bool {
-		if c.Status.AppliedGatewayNamespace == gwNS {
+		// The status shortcut needs BOTH halves: the gateway it programmed and the name it
+		// programmed there. Without the name check, renaming spec.consumerName made the
+		// object an incumbent for a name it has never served - so an object renamed onto a
+		// name somebody else serves produced two incumbents, and the collision check then
+		// refused the round for the whole gateway, every round, blocking every add, rotation
+		// and revocation. The error even claimed "dropping either revokes a working key",
+		// which was false: the renamed object's new name served nothing.
+		if c.Status.AppliedGatewayNamespace == gwNS && c.Status.ConsumerName == consumerName(c) {
 			return true
 		}
+		// Failing that, the ANNOTATION decides - not "a live entry exists under this name".
+		//
+		// The fallback is here for one case: the gateway write landed and the status write
+		// after it did not, so the key is live with nothing on the object to say so. But that
+		// write recorded the name in managed-consumers, because setManagedConsumerNames runs
+		// inside it. So an entry we actually wrote is always in the annotation, status or no
+		// status - while an entry the gateway chart rendered is not.
+		//
+		// Keyed on the name alone this was a takeover path: point consumerName at a
+		// chart-rendered consumer, and an object with no status and no readable Secret came
+		// out an "incumbent" of somebody else's entry.
 		name := consumerName(c)
-		if !hasLiveEntry(liveNames, name) {
+		if !liveManaged[name] {
 			return false
 		}
-		for i := range list.Items {
-			o := &list.Items[i]
-			if o.Namespace == c.Namespace && o.Name == c.Name {
-				continue
-			}
-			if o.Status.AppliedGatewayNamespace == gwNS && o.Status.ConsumerName == name {
-				return false // that entry is on record as somebody else's
-			}
-		}
-		// An entry with no status behind it can only be attributed to ONE object. If a second
-		// object claims the same consumerName, nothing on record says which of them the live
-		// entry belongs to - so neither is an incumbent, and both are handled as newcomers:
-		// the collision check then leaves them both out instead of refusing the round.
-		//
-		// Without this, two brand-new objects claiming a CHART-rendered name both came out as
-		// incumbents (each sees a live entry and no other object's STATUS claiming it), the
-		// collision check hit "more than one incumbent" and froze the whole gateway - no key
-		// addable, rotatable or revocable, and a deletion in flight giving up at the deadline
-		// with its key still live. The earlier tiebreak only covered names this controller
-		// had written, which a chart-rendered one is not.
+		// Ours, and contested: the object that was here first keeps it.
 		for i := range list.Items {
 			o := &list.Items[i]
 			if o.Namespace == c.Namespace && o.Name == c.Name {
@@ -390,11 +390,19 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 			if consumerName(o) != name || !o.DeletionTimestamp.IsZero() {
 				continue
 			}
-			if liveManaged[name] && o.CreationTimestamp.Before(&c.CreationTimestamp) {
-				return false // ours, and somebody was here first
+			if o.Status.AppliedGatewayNamespace == gwNS && o.Status.ConsumerName == name {
+				return false // on record as somebody else's
 			}
-			if !liveManaged[name] {
-				return false // contested, and nothing on record says it is this object's
+			if o.CreationTimestamp.Before(&c.CreationTimestamp) {
+				return false
+			}
+			// CreationTimestamp has one-second resolution, so two objects created in the same
+			// second are neither Before the other and BOTH would come out incumbent - two
+			// incumbents, and the collision check refuses the round for the whole gateway.
+			// Any total order does: it only has to be the same one for both objects.
+			if o.CreationTimestamp.Equal(&c.CreationTimestamp) &&
+				o.Namespace+"/"+o.Name < c.Namespace+"/"+c.Name {
+				return false
 			}
 		}
 		return true
@@ -430,7 +438,22 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 			// same thing done for an entry this controller does not manage - so nobody
 			// loses access, everyone else's changes go through, and the reason sits on the
 			// object whose Secret is missing.
-			if hasLiveEntry(liveNames, consumerName(c)) {
+			// incumbent(c), not just "a live entry exists under this name". Keyed on the name
+			// alone, this was a takeover path for anyone who can create an APIConsumer in
+			// their own namespace: point consumerName at a chart-rendered consumer, give it a
+			// secretRef that does not exist, and the entry is preserved AND recorded as
+			// autoconfig-managed in the annotation. From then on the proof-of-key check is
+			// skipped for that name, so creating the Secret with your own key replaces the
+			// real tenant's - 401 for them, every route they were allowed on for you. It
+			// also let a second claimant put a duplicate entry in the list, which either
+			// freezes the gateway on the duplicate-credential guard or leaves a rotated-away
+			// key accepted.
+			//
+			// So: only an entry that is demonstrably this object's, and never a name another
+			// view renders this round (that view's rendered entry is the current one; keeping
+			// a stale copy beside it is how the duplicate arose).
+			if incumbent(c) && hasLiveEntry(liveNames, consumerName(c)) &&
+				!renderedThisRound(views, consumerName(c)) {
 				preserve[consumerName(c)] = true
 				round.skipped[c.Namespace+"/"+c.Name] = err.Error() +
 					" (this consumer's existing entry was left in the gateway untouched, so " +
@@ -447,7 +470,18 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 			// releases with the key still live. One new broken object must not hold the
 			// rest hostage, so it is skipped, with the error on its own object.
 			if !incumbent(c) {
-				round.skipped[c.Namespace+"/"+c.Name] = err.Error()
+				why := err.Error() + " (this consumer was left out of this round; nothing " +
+					"else on this gateway is blocked)"
+				// Say whether an entry under that name is in the list - without claiming it
+				// is this consumer's, which is exactly what cannot be shown here. The
+				// operator's question is "did I just break a tenant", and the answer is no.
+				if hasLiveEntry(liveNames, consumerName(c)) {
+					why = err.Error() + " (an existing entry named " +
+						strconv.Quote(consumerName(c)) + " is in the gateway and was left " +
+						"untouched, so its key keeps working - this controller cannot show " +
+						"that entry is this object's, so it was not rewritten either)"
+				}
+				round.skipped[c.Namespace+"/"+c.Name] = why
 				continue
 			}
 			return round, fmt.Errorf("%s/%s: %w (nothing was written; the gateway keeps its "+
@@ -486,6 +520,7 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// rather than failing the round: wanting an identity it is not entitled to must not stop
 	// every other consumer on this gateway from being added, rotated or revoked.
 	views = dropUnprovenAdoptions(views, liveEntries, liveManaged, claimed, round, gwNS)
+	views = dropDuplicatesAgainstCarriedOver(views, liveEntries, liveManaged, claimed, round)
 
 	if len(round.skipped) > 0 {
 		logf.FromContext(ctx).Info("left consumers out of this round",
@@ -1475,4 +1510,78 @@ func ourGateway(o *unstructured.Unstructured, named map[string]bool) bool {
 		return true
 	}
 	return o.GetNamespace() == defaultGatewayNamespace
+}
+
+// renderedThisRound: is some view already rendering this consumer name? Used to keep a
+// preserved (unrenderable) entry from sitting in the list beside a freshly rendered one with
+// the same name - two entries for one consumer, which the duplicate-credential guard then
+// refuses for the whole gateway, or which leaves a rotated-away key accepted.
+func renderedThisRound(views []sink.ConsumerView, name string) bool {
+	for _, v := range views {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// dropDuplicatesAgainstCarriedOver leaves out a view whose credential already exists in an
+// entry this controller does not own and will copy over verbatim.
+//
+// key-auth refuses a duplicate credential by failing to parse its whole defaultConfig, and it
+// is FAIL_CLOSE, so the pair would deny every caller on every route of the gateway. The guard
+// in the write path catches it - but it caught it by refusing the ROUND, which is one object's
+// problem becoming everybody's: nobody could add, rotate or revoke a key while that object
+// existed. Same shape as every other freeze fixed in this PR, and reachable on the documented
+// migration path rather than in theory: a chart entry whose name cannot be adopted
+// (consumerName is pinned to a DNS label, the chart's name might not be one) gets a new
+// APIConsumer carrying the SAME key, because the point of the migration is that no caller has
+// to change anything.
+//
+// So it costs the newcomer, and the reason lands on the newcomer's own object - where someone
+// can act on it, by adopting that entry under its own name or by removing it from the chart.
+// The write-path guard stays as a backstop; a guard that never fires is fine, a freeze on a
+// normal path is not.
+func dropDuplicatesAgainstCarriedOver(views []sink.ConsumerView,
+	liveEntries map[string][]string, liveManaged, claimed map[string]bool,
+	round gatewayRound) []sink.ConsumerView {
+	rendered := map[string]bool{}
+	for _, v := range views {
+		rendered[v.Name] = true
+	}
+	// Which live entries will be carried over as somebody else's, and under what name.
+	ownerOf := map[string]string{}
+	for name, creds := range liveEntries {
+		if rendered[name] || liveManaged[name] || claimed[name] {
+			continue
+		}
+		for _, c := range creds {
+			ownerOf[strings.TrimPrefix(c, bearerPrefixValue)] = name
+		}
+	}
+	if len(ownerOf) == 0 {
+		return views
+	}
+	kept := make([]sink.ConsumerView, 0, len(views))
+	for _, v := range views {
+		clash := ""
+		for _, c := range v.Credentials {
+			if n := ownerOf[strings.TrimPrefix(c, bearerPrefixValue)]; n != "" {
+				clash = n
+				break
+			}
+		}
+		if clash == "" {
+			kept = append(kept, v)
+			continue
+		}
+		round.skipped[v.Source] = fmt.Sprintf("one of its credentials is already in use by "+
+			"consumer %q, which this controller does not manage (the gateway chart renders it "+
+			"until the migration is finished). key-auth refuses a duplicate credential by "+
+			"failing to parse its whole config, and it denies every caller when it cannot "+
+			"parse - so this consumer was left out instead, and nothing else on this gateway "+
+			"is blocked. Either adopt %q with this APIConsumer (set consumerName to it, if it "+
+			"is a valid DNS label) or remove it from the chart", clash, clash)
+	}
+	return kept
 }

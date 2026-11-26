@@ -1,7 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	clienttesting "k8s.io/client-go/testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	fakediscovery "k8s.io/client-go/discovery/fake"
@@ -81,9 +85,25 @@ func TestKeyAuthWatchWanted(t *testing.T) {
 // crash-looped the pod and took ModelRoute down with it, the exact outcome the gate exists to
 // prevent. There is no unit hook on runController, so this pins the contract where it can be
 // pinned: the decision function treats "cannot tell" the same as "not served".
-func TestKeyAuthWatchWantedOnDiscoveryFailure(t *testing.T) {
-	// The caller turns an error into false; this asserts what false then means.
-	if keyAuthWatchWanted(false) {
-		t.Fatal("a cluster we could not ask about would get the watch registered anyway")
+func TestDiscoveryFailureLeavesTheWatchUnregistered(t *testing.T) {
+	// Through the real path, not keyAuthWatchWanted(false): that only restated its argument.
+	// What matters is that a discovery error becomes "not served" rather than "assume yes" -
+	// registering a For() watch on a kind that does not exist makes the manager wait for a
+	// cache that never syncs and then exit, crash-looping the pod and taking ModelRoute with
+	// it on every cluster without Higress.
+	cs := fake.NewSimpleClientset()
+	cs.Fake.PrependReactor("get", "*", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("the API server is not answering")
+	})
+	served, err := kindServed(cs, "extensions.higress.io/v1alpha1", "WasmPlugin")
+	if err == nil {
+		t.Fatal("a discovery failure was reported as a successful answer")
+	}
+	if served {
+		t.Fatal("a discovery failure came back as \"the kind is served\": the watch would be " +
+			"registered on a cluster that may not have Higress at all")
+	}
+	if keyAuthWatchWanted(served) {
+		t.Fatal("the gate wants the watch after a discovery failure")
 	}
 }

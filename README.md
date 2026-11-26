@@ -543,12 +543,22 @@ Higress controller 根本不下发 `defaultConfig`,空规则到达插件时全�
 
 **两条写入安全规则**(这个改动最危险的地方,都是「宁可不写」):
 
-- **坏一个,全不写**。某个 `APIConsumer` 的 Secret 读不到时,**不会**把它从名单里摘掉再写剩下的 ——
-  名单里少一个 consumer,就是那个调用方下一个请求 401。这一轮整个不写,网关保持上一份好名单,
-  失败报在那个对象的 `Programmed` 上。
+- **一个坏对象不连累别人,但绝不因此摘掉任何活 key**。名单里少一个 consumer,就是那个调用方下一个
+  请求 401 —— 所以某个 `APIConsumer` 的 Secret 读不到时,**它在网关里的那条已有条目原样留着**
+  (key 继续有效),其余人的增删改照常进行,失败报在那个对象自己的 `Programmed` 上。
+  **「原样留着」只对能证明属于它的条目成立** —— 判据是 annotation `routing.modelsphere.dev/managed-consumers`
+  (我们写网关的那一次就把名字记进去了,所以 status 没写成功也不影响),**不是「名字对得上」**:
+  否则谁都能用「指向 chart 渲染的 consumer 名 + 一个不存在的 secretRef」把别人的条目认领走。
+  同理,**一个对象的问题一律只让它自己付代价**:撞名、与结转条目撞 key、证明不了的认领,
+  都是把它剔出这一轮并把原因写在它自己身上,而不是拒绝整轮(拒绝整轮就等于谁都不能轮换或**吊销**
+  key,包括吊销一个已泄漏的 —— 这一类错在这个 PR 里反复出现过,每次都是「一个对象的问题变成全网关的问题」)。
 - **不能把名单写空**,除非这个网关的名单**本来就是我们写的**(有 `APIConsumer` 的
   `status.appliedGatewayNamespace` 指着它)。「删掉最后一个 consumer」和「还没迁移、名单还是 chart 渲染的」
   从期望态看一模一样(都是零个对象),而后者写空 = 全站所有路由对所有人 403。
+
+⚠ **不要给租户 `apiconsumers/status` 的写权限**:归属判定看 `status.appliedGatewayNamespace`
++ `status.consumerName`,能改 status 就能让自己变成某个名字的「在位者」从而跳过持有证明。
+`spec` 可以给(那是自助改 key 的入口),`status` 只能 controller 写。
 
 ⚠ **它给的是「源头唯一、可在线轮换、不用发版」,不是「密钥不可见」**:key-auth 的配置是经 ECDS 推下去的
 一段 blob,插件没有读 Secret 的能力,所以密钥最终仍然明文躺在 `WasmPlugin` 对象里 ——
