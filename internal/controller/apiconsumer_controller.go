@@ -341,6 +341,7 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// could not be read. Not the same as "ours to rewrite" and not the same as "somebody
 	// else's": it is "ours, and we cannot render it right now".
 	preserve := map[string]bool{}
+	preservedBy := map[string]string{} // name -> the object keeping it, for the message
 	// incumbent: is the entry under this consumer's name in this gateway THIS object's?
 	// Everything that can go wrong with a newcomer is survivable by leaving it out; the same
 	// thing wrong with an incumbent means refusing the round, because dropping it revokes a
@@ -382,6 +383,21 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 			return false
 		}
 		// Ours, and contested: the object that was here first keeps it.
+		//
+		// KNOWN GAP, deliberately not closed here. If this object's gateway write landed and
+		// its status write did not, an OLDER object renamed onto its name wins this tiebreak
+		// (neither has a conclusive status), and because the name is in the annotation the
+		// proof-of-key check is skipped, so the older object's key is written as a rotation.
+		// The window is a failed status write with a rename landing inside it.
+		//
+		// The obvious tightening - require the proof whenever no status claims the name - can
+		// REVOKE a key, which is worse than the gap: gateway write lands with key K1, the
+		// owner then rotates the Secret to K2, status still missing. The rendered K2 does not
+		// cover the live K1, the proof fails, the view is dropped - and a managed name with no
+		// view is exactly the revocation path. A safe version has to prefer the object whose
+		// credentials cover the live entry rather than require it, which needs credentials for
+		// both candidates at a point where one of them may be unreadable. Left as is until it
+		// can be done without trading a management-plane gap for a data-plane outage.
 		for i := range list.Items {
 			o := &list.Items[i]
 			if o.Namespace == c.Namespace && o.Name == c.Name {
@@ -449,12 +465,16 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 			// freezes the gateway on the duplicate-credential guard or leaves a rotated-away
 			// key accepted.
 			//
-			// So: only an entry that is demonstrably this object's, and never a name another
-			// view renders this round (that view's rendered entry is the current one; keeping
-			// a stale copy beside it is how the duplicate arose).
-			if incumbent(c) && hasLiveEntry(liveNames, consumerName(c)) &&
-				!renderedThisRound(views, consumerName(c)) {
+			// So: only an entry that is demonstrably this object's. Whether another object
+			// also claims that name is settled AFTER this loop - asking here consulted a
+			// half-built `views` and so depended on List order, which is namespace/name and
+			// therefore chosen by whoever picks the namespace. Either the newcomer sorted
+			// after and both entries were written (its key accepted as this consumer, or a
+			// duplicate name failing the whole gateway closed), or it sorted before and the
+			// round was refused on every pass while the Secret stayed broken.
+			if incumbent(c) && hasLiveEntry(liveNames, consumerName(c)) {
 				preserve[consumerName(c)] = true
+				preservedBy[consumerName(c)] = c.Namespace + "/" + c.Name
 				round.skipped[c.Namespace+"/"+c.Name] = err.Error() +
 					" (this consumer's existing entry was left in the gateway untouched, so " +
 					"its key keeps working; nothing else on this gateway is blocked. Fix the " +
@@ -505,7 +525,30 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// namespace-scoped writer from stealing a managed consumer name, and the duplicate
 	// credential one is what stops a gateway-wide parse failure. Only who pays for the
 	// collision changes: the newcomer, not everybody.
-	views, err = r.dropCollidingNewcomers(ctx, views, list.Items, gwNS, incumbent, round)
+	// A preserved incumbent still HOLDS its name, so a view claiming it is a colliding
+	// newcomer - but it is not in `views`, so the collision step below cannot see it. Settled
+	// here, now that every view exists, which is what makes the outcome independent of List
+	// order.
+	if len(preserve) > 0 {
+		kept := make([]sink.ConsumerView, 0, len(views))
+		for _, v := range views {
+			if holder := preservedBy[v.Name]; holder != "" {
+				round.skipped[v.Source] = fmt.Sprintf("consumer name %q is already served by "+
+					"%s, whose credentials this controller cannot read at the moment, so its "+
+					"existing entry is being kept as it is. This consumer was left out of "+
+					"this round rather than written beside it - two entries for one consumer "+
+					"name either accept both keys or make key-auth reject the list and deny "+
+					"every caller on this gateway. Pick a different consumerName, or wait "+
+					"until %s is fixed if the name is meant to be yours", v.Name, holder,
+					holder)
+				continue
+			}
+			kept = append(kept, v)
+		}
+		views = kept
+	}
+
+	views, err = r.dropCollidingNewcomers(views, list.Items, gwNS, incumbent, round)
 	if err != nil {
 		return round, err
 	}
@@ -552,7 +595,7 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 //   - two claimants are already serving it: refused as an error. One bad newcomer cannot
 //     produce this, it means two live consumers genuinely share an identity, and dropping
 //     either revokes a working key. A person has to look.
-func (r *APIConsumerReconciler) dropCollidingNewcomers(ctx context.Context,
+func (r *APIConsumerReconciler) dropCollidingNewcomers(
 	views []sink.ConsumerView, items []routingv1.APIConsumer, gwNS string,
 	incumbent func(*routingv1.APIConsumer) bool, round gatewayRound) ([]sink.ConsumerView, error) {
 	bySource := map[string]*routingv1.APIConsumer{}
@@ -642,7 +685,6 @@ func (r *APIConsumerReconciler) dropCollidingNewcomers(ctx context.Context,
 		}
 		kept = append(kept, v)
 	}
-	_ = ctx
 	return kept, nil
 }
 
@@ -1510,19 +1552,6 @@ func ourGateway(o *unstructured.Unstructured, named map[string]bool) bool {
 		return true
 	}
 	return o.GetNamespace() == defaultGatewayNamespace
-}
-
-// renderedThisRound: is some view already rendering this consumer name? Used to keep a
-// preserved (unrenderable) entry from sitting in the list beside a freshly rendered one with
-// the same name - two entries for one consumer, which the duplicate-credential guard then
-// refuses for the whole gateway, or which leaves a rotated-away key accepted.
-func renderedThisRound(views []sink.ConsumerView, name string) bool {
-	for _, v := range views {
-		if v.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 // dropDuplicatesAgainstCarriedOver leaves out a view whose credential already exists in an

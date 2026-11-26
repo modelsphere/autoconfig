@@ -2019,3 +2019,57 @@ func TestConsumerRenameDoesNotFreezeTheGateway(t *testing.T) {
 		t.Fatalf("tenant-b credentials = %v, want Y's rotated key", got)
 	}
 }
+
+// A preserved incumbent plus a newcomer on the same name, in BOTH List orders.
+//
+// The preserve decision used to consult a half-built view list, so the outcome depended on
+// List order - which is namespace/name, so whoever picks the namespace picks the outcome:
+//
+//   - newcomer sorting AFTER the broken incumbent: both entries written, so the newcomer's own
+//     key authenticates as that consumer on every route it is allowed on (or key-auth rejects
+//     the duplicate name and the whole gateway fails closed);
+//   - newcomer sorting BEFORE it: the incumbent is not preserved, falls through to the hard
+//     error, and the gateway's round is refused on every pass while the Secret stays broken.
+//
+// Both orders must now reach the same place: the round writes, the name keeps exactly one
+// entry with the original key, and the newcomer is told why on its own object.
+func TestConsumerPreservedIncumbentBeatsANewcomerInEitherListOrder(t *testing.T) {
+	for _, tc := range []struct{ name, newcomerNS string }{
+		{"newcomer sorts after the incumbent", "zz-team"},
+		{"newcomer sorts before the incumbent", "aa-team"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The incumbent: programmed, Secret now unreadable.
+			a := consumerFixture("obj-a", "gone-secret")
+			a.Namespace = "mm-team"
+			a.Spec.ConsumerName = "tenant-a"
+			a.Status.ConsumerName = "tenant-a"
+			a.Status.AppliedGatewayNamespace = "higress-system"
+			// The newcomer: readable Secret holding its OWN key, same consumerName.
+			b := consumerFixture("obj-b", "b-keys")
+			b.Namespace = tc.newcomerNS
+			b.Spec.ConsumerName = "tenant-a"
+			bSec := credSecret("b-keys", map[string]string{"key": "sk-attacker"})
+			bSec.Namespace = tc.newcomerNS
+			r, c := newConsumerReconciler(t, a, b, bSec,
+				keyAuthManagedBy("tenant-a", liveConsumer("tenant-a", "Bearer sk-real")))
+
+			round, err := r.programGateway(context.Background(), "higress-system", nil)
+			if err != nil {
+				t.Fatalf("the round was refused for the whole gateway: %v", err)
+			}
+			entries := gatewayConsumers(t, c, "higress-system")
+			if n := len(entries); n != 1 {
+				t.Fatalf("tenant-a has %d entries, want exactly 1: two entries for one "+
+					"consumer name either accept both keys or deny every caller", n)
+			}
+			if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-real" {
+				t.Fatalf("tenant-a credentials = %v, want only the original key", got)
+			}
+			why := round.skipped[tc.newcomerNS+"/obj-b"]
+			if !strings.Contains(why, "already served by") {
+				t.Fatalf("the newcomer was not told why: %q", why)
+			}
+		})
+	}
+}
