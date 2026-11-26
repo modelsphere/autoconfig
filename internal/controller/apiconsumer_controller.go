@@ -314,6 +314,10 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	}
 
 	round := gatewayRound{skipped: map[string]string{}}
+	// Names whose LIVE entry this round must keep as it is, because their own credentials
+	// could not be read. Not the same as "ours to rewrite" and not the same as "somebody
+	// else's": it is "ours, and we cannot render it right now".
+	preserve := map[string]bool{}
 	// incumbent: is the entry under this consumer's name in this gateway THIS object's?
 	// Everything that can go wrong with a newcomer is survivable by leaving it out; the same
 	// thing wrong with an incumbent means refusing the round, because dropping it revokes a
@@ -345,6 +349,23 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 				return false // that entry is on record as somebody else's
 			}
 		}
+		// Two objects can reach this point for one name: the one whose gateway write landed
+		// while its status write did not - the case this fallback exists for - and a
+		// newcomer claiming the same consumerName. Both would count as incumbents, and two
+		// incumbents make the collision check refuse the round for the whole gateway, which
+		// is the impostor-driven freeze this is supposed to avoid. The annotation records
+		// which names this controller actually wrote, so it breaks the tie: an entry it
+		// wrote belongs to whoever was there, and a second claimant is a newcomer.
+		if liveManaged[name] {
+			for i := range list.Items {
+				o := &list.Items[i]
+				if o.Namespace != c.Namespace || o.Name != c.Name {
+					if consumerName(o) == name && o.CreationTimestamp.Before(&c.CreationTimestamp) {
+						return false // somebody was here first
+					}
+				}
+			}
+		}
 		return true
 	}
 	views := make([]sink.ConsumerView, 0, len(list.Items))
@@ -361,11 +382,31 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		}
 		creds, err := r.readCredentials(ctx, c)
 		if err != nil {
-			// Fail closed for a consumer that HAS a key in this gateway: dropping it from
-			// the list is a 401 on its next request, and a Secret that is briefly
-			// unreadable must not revoke anyone. The whole round is refused, the gateway
-			// keeps its last good list, and the failure is reported on the object that
-			// caused it.
+			// Fail closed for a consumer that HAS a key in this gateway, but only for a
+			// TRANSIENT failure: a Secret that is briefly unreadable must not revoke
+			// anyone, so the round is refused and the gateway keeps its last good list.
+			//
+			// ...and failing the round forever is not the answer either. A Secret that is
+			// absent, or present with nothing usable in it, is a state somebody put the
+			// cluster in rather than a blip: waiting for it froze the gateway for
+			// EVERYBODY - no other consumer could be added, rotated or REVOKED, including
+			// pulling a leaked key - and a deletion in flight kept failing until the revoke
+			// deadline and then released with its key still live.
+			//
+			// Dropping this consumer instead would revoke a working key because somebody
+			// deleted an unrelated Secret: a management-plane problem traded for a
+			// data-plane outage. So neither. Its LIVE entry is carried over verbatim - the
+			// same thing done for an entry this controller does not manage - so nobody
+			// loses access, everyone else's changes go through, and the reason sits on the
+			// object whose Secret is missing.
+			if hasLiveEntry(liveNames, consumerName(c)) {
+				preserve[consumerName(c)] = true
+				round.skipped[c.Namespace+"/"+c.Name] = err.Error() +
+					" (this consumer's existing entry was left in the gateway untouched, so " +
+					"its key keeps working; nothing else on this gateway is blocked. Fix the " +
+					"Secret, or delete this APIConsumer to revoke the key)"
+				continue
+			}
 			//
 			// But a consumer that was never programmed here has nothing in the list to
 			// lose, and refusing the round on its behalf freezes the gateway for everybody
@@ -423,7 +464,7 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	if err != nil {
 		return round, err
 	}
-	return round, r.writeConsumers(ctx, gwNS, consumers, ownedBefore, claimed)
+	return round, r.writeConsumers(ctx, gwNS, consumers, ownedBefore, claimed, preserve)
 }
 
 // dropCollidingNewcomers resolves two claims on one identity - the same consumer name, or the
@@ -562,7 +603,7 @@ func sourcesOf(views []sink.ConsumerView) string {
 // writeConsumers replaces defaultConfig.consumers in the gateway's key-auth plugin, leaving
 // every other key in that config alone.
 func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
-	consumers []sink.KeyAuthConsumer, ownedBefore bool, claimed map[string]bool) error {
+	consumers []sink.KeyAuthConsumer, ownedBefore bool, claimed, preserve map[string]bool) error {
 	log := logf.FromContext(ctx)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
@@ -666,17 +707,12 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 
 		next := make([]any, 0, len(consumers))
 		mine := make(map[string]bool, len(consumers))
-		myCreds := make(map[string]map[string]bool, len(consumers))
 		for _, c := range consumers {
 			m, err := sink.ToMap(c)
 			if err != nil {
 				return err
 			}
 			mine[c.Name] = true
-			myCreds[c.Name] = make(map[string]bool, len(c.Credentials))
-			for _, cred := range c.Credentials {
-				myCreds[c.Name][cred] = true
-			}
 			next = append(next, m)
 		}
 		// Carry over the live entries this controller did not write. The empty-list guard
@@ -699,6 +735,13 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 			if name == "" {
 				return fmt.Errorf("%s/key-auth: a live consumer has no name; refusing to "+
 					"rewrite a list this controller cannot account for", gwNS)
+			}
+			if preserve[name] {
+				// Ours, but unrenderable this round: keep what is live. Checked before the
+				// managed/claimed skip, which is what would otherwise drop it.
+				foreign = append(foreign, name)
+				next = append(next, lc)
+				continue
 			}
 			if managed[name] || claimed[name] {
 				continue // already ours; this is a rotation, not an adoption
@@ -1108,41 +1151,9 @@ func (r *APIConsumerReconciler) hasNoLiveEntry(ctx context.Context, gwNS, name s
 	return true, nil
 }
 
-// credentialsNotCovered: how many of a live entry's credentials the rendered consumer does not
-// carry. 0 means the writer demonstrably holds every key that entry already accepts.
-func credentialsNotCovered(live map[string]any, rendered map[string]bool) int {
-	creds, _ := live["credentials"].([]any)
-	// Compared with the prefix stripped from BOTH sides. The rendered set is already
-	// prefixed, so a live entry stored bare could never be matched by any Secret content:
-	// `sk-x` renders as `Bearer sk-x`, and `Bearer sk-x` renders as the same thing, so the
-	// proof was impossible and the refusal told the operator to add a key they had already
-	// added. Possession of the key is the question here; how the entry spells it is not.
-	//
-	// Live entries do carry the prefix on these clusters (the gateway chart requires it), but
-	// a hand-written one need not, and ModelFleet's own checkAuth strips it for the same
-	// reason.
-	bare := make(map[string]bool, len(rendered))
-	for c := range rendered {
-		bare[strings.TrimPrefix(c, bearerPrefixValue)] = true
-	}
-	missing := 0
-	for _, c := range creds {
-		key, ok := c.(string)
-		if !ok || !bare[strings.TrimPrefix(key, bearerPrefixValue)] {
-			missing++
-		}
-	}
-	return missing
-}
-
 // bearerPrefixValue mirrors sink's prefix. Duplicated rather than exported, because the sink
 // owns how a credential is RENDERED and this is only about recognising one.
 const bearerPrefixValue = "Bearer "
-
-func liveCredentialCount(live map[string]any) int {
-	creds, _ := live["credentials"].([]any)
-	return len(creds)
-}
 
 // liveConsumerState: what this gateway's key-auth currently holds - each consumer name with
 // its credentials - and which of those names this controller recorded as its own.
@@ -1184,31 +1195,6 @@ func (r *APIConsumerReconciler) liveConsumerState(ctx context.Context, gwNS stri
 		entries[name] = vals
 	}
 	return entries, managed, nil
-}
-
-// liveConsumerNames: the consumer names this gateway's key-auth currently holds.
-func (r *APIConsumerReconciler) liveConsumerNames(ctx context.Context, gwNS string) (map[string]bool, error) {
-	out := map[string]bool{}
-	obj := &unstructured.Unstructured{}
-	obj.SetGroupVersionKind(wasmPluginGVK)
-	if err := r.gatewayReader().Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
-		if isAbsent(err) {
-			return out, fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
-		}
-		return out, err
-	}
-	live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
-	if err != nil {
-		return out, err
-	}
-	for _, lc := range live {
-		if m, ok := lc.(map[string]any); ok {
-			if n, _ := m["name"].(string); n != "" {
-				out[n] = true
-			}
-		}
-	}
-	return out, nil
 }
 
 func hasLiveEntry(names map[string]bool, name string) bool { return names[name] }
@@ -1260,22 +1246,6 @@ func (r *KeyAuthReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}))).
 		Named("keyauth").
 		Complete(r)
-}
-
-// credentialsReformatted: would adoption keep the same key but change how it is spelled? True
-// when a live credential lacks the prefix the rendered one carries.
-func credentialsReformatted(live map[string]any, rendered map[string]bool) bool {
-	creds, _ := live["credentials"].([]any)
-	for _, c := range creds {
-		key, ok := c.(string)
-		if !ok || strings.HasPrefix(key, bearerPrefixValue) {
-			continue
-		}
-		if rendered[bearerPrefixValue+key] {
-			return true
-		}
-	}
-	return false
 }
 
 // dropUnprovenAdoptions leaves out any view that claims a consumer name already present in
@@ -1430,8 +1400,14 @@ const consumersLabel = "routing.modelsphere.dev/consumers"
 // ourGateway: may this controller write the consumer list of this key-auth? See the call site
 // for why there are three answers and not one.
 func ourGateway(o *unstructured.Unstructured, named map[string]bool) bool {
-	if o.GetLabels()[consumersLabel] == "autoconfig" {
-		return true
+	// The label is read as an ANSWER, not as a hint: present and naming somebody else is a
+	// veto, and it has to be checked before the fallbacks, not alongside them. Granting
+	// ownership on `== "autoconfig"` and otherwise falling through meant a key-auth labelled
+	// for another manager was still rewritten whenever it sat in higress-system or in a
+	// namespace some fleet names - the first of the two cases the cluster probe caught, and
+	// the one I thought I had fixed by moving the check rather than by making it decide.
+	if v, labelled := o.GetLabels()[consumersLabel]; labelled {
+		return v == "autoconfig"
 	}
 	// Our own record on the object: this controller wrote this list before, so it is ours to
 	// keep correct even if nothing names the namespace any more. It is also what lets a

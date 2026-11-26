@@ -75,3 +75,15 @@ func TestKeyAuthWatchWanted(t *testing.T) {
 			"nothing creates key-auth's consumers key and the gateway stays FAIL_CLOSE")
 	}
 }
+
+// A discovery failure for a group this project does not own must not stop the binary. The
+// gate's own plumbing used to return the error, which aborted startup - so one flaky call
+// crash-looped the pod and took ModelRoute down with it, the exact outcome the gate exists to
+// prevent. There is no unit hook on runController, so this pins the contract where it can be
+// pinned: the decision function treats "cannot tell" the same as "not served".
+func TestKeyAuthWatchWantedOnDiscoveryFailure(t *testing.T) {
+	// The caller turns an error into false; this asserts what false then means.
+	if keyAuthWatchWanted(false) {
+		t.Fatal("a cluster we could not ask about would get the watch registered anyway")
+	}
+}

@@ -98,9 +98,17 @@ func runController(leaderElect bool) error {
 	if err != nil {
 		return err
 	}
+	// A discovery failure for a group this project does not own must not stop this binary.
+	// Returning the error aborted runController, so one flaky call crash-looped the pod and
+	// took ModelRoute - openresty peers, CART workers, monitor.conf - down with it: the exact
+	// outcome the gate and its test exist to prevent, reintroduced by the gate's own plumbing.
+	// Failing closed means no watch, and the periodic sweep picks Higress up anyway.
 	higressServed, err := kindServed(cs, wasmPluginGroupVersion, "WasmPlugin")
 	if err != nil {
-		return err
+		log.Printf("could not ask whether %s is served (%v): skipping the key-auth watch. "+
+			"The periodic gateway sweep still runs, so this self-corrects without a restart",
+			wasmPluginGroupVersion, err)
+		higressServed = false
 	}
 	if served["ModelFleet"] {
 		if err := (&controller.ModelFleetReconciler{

@@ -470,7 +470,11 @@ reconciler 把同一个网关下所有 `APIConsumer` 聚合、按名字排序,�
 ⚠️ **撤销(从 Secret 里删掉一个 value)也是同一个 60s 口径** —— 这件事比"加 key 慢一分钟"要紧:
 key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。**要立刻生效就动对象本身**
 (改一个 annotation 即可,如 `kubectl annotate apiconsumer <名字> rotated-at=$(date +%s) --overwrite`),
-那是 generation 变化、下一秒就 reconcile。更彻底的是直接 `kubectl delete apiconsumer <名字>`:
+下一秒就会 reconcile。
+⚠️ 注意 annotation 改动**不会推进 `metadata.generation`**(带 status 子资源的 CR 只在 spec 变化时推进),
+所以 `status.observedGeneration` 不会动 —— 也就是说**这条路子没法用 observedGeneration 来确认已生效**,
+得看 `status.lastSyncTime` 或直接去网关上核 consumer 列表。要确认收敛的紧急场景,改 spec 里的字段
+(或直接 `kubectl delete apiconsumer`)比改 annotation 更合适。更彻底的是直接 `kubectl delete apiconsumer <名字>`:
 删除走 finalizer,key 在对象消失之前就已经从网关名单里撤掉了。
 
 渲染出的 credential 带 `Bearer ` 前缀(Secret 里存裸 key 即可):key-auth 比较的是

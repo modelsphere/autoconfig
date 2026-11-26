@@ -232,9 +232,15 @@ func TestConsumerAcceptsEveryKeyInTheSecret(t *testing.T) {
 	}
 }
 
-// THE guard. An unreadable Secret must not quietly drop that consumer from the list: a
-// consumer missing from key-auth is a caller that gets 401 on its next request. The gateway
-// keeps its last good list and the failure is reported.
+// THE guard, in its current form. An unreadable Secret must not drop that consumer from the
+// list - a consumer missing from key-auth is a caller that gets 401 on its next request - and
+// it must not freeze the gateway either, which is what failing the round did: nobody else
+// could be added, rotated or revoked until somebody restored a Secret.
+//
+// So its LIVE entry is carried over verbatim and everyone else's changes go through. The
+// alternative the review suggested - fail just that object, i.e. drop it - trades a
+// management-plane problem for a data-plane outage: a tenant denied because somebody deleted
+// an unrelated Secret.
 func TestConsumerUnreadableSecretDoesNotRevokeAnyone(t *testing.T) {
 	r, c := newConsumerReconciler(t,
 		consumerFixture("tenant-a", "tenant-a-keys"),
@@ -242,20 +248,35 @@ func TestConsumerUnreadableSecretDoesNotRevokeAnyone(t *testing.T) {
 		credSecret("tenant-a-keys", map[string]string{"key": "sk-tenant-a"}),
 		keyAuthWith(liveConsumer("tenant-a", "sk-tenant-a"), liveConsumer("tenant-b", "sk-tenant-b")),
 	)
-	// Reconciling the healthy one must not publish a list that drops the broken one. The
-	// round reports the failure on the object and requeues rather than returning an error -
-	// returning one would hot-loop on a Secret that may be minutes from existing.
 	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
+	// Nobody lost access...
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "tenant-a,tenant-b" {
+		t.Fatalf("live consumers = %v, want both: someone's key just stopped working", names)
+	}
+	if got := creds0Of(t, c, "higress-system", "tenant-b"); strings.Join(got, ",") != "sk-tenant-b" {
+		t.Fatalf("tenant-b's entry = %v, want it untouched", got)
+	}
+	// ...the healthy one was programmed, so the gateway is not frozen...
 	var healthy routingv1.APIConsumer
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}, &healthy)
-	if condTrue(healthy.Status.Conditions, condProgrammed) {
-		t.Fatal("the round reported success although one consumer could not be resolved")
+	if !condTrue(healthy.Status.Conditions, condProgrammed) {
+		t.Fatalf("the healthy consumer was blocked by somebody else's Secret: %s",
+			consumerCondMessage(healthy.Status.Conditions, condProgrammed))
 	}
-	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
-	if len(names) != 2 {
-		t.Fatalf("the live consumer list was rewritten to %v - someone's key just stopped working", names)
+	// ...and the object whose Secret is missing says so.
+	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	var broken routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-b"}, &broken)
+	if condTrue(broken.Status.Conditions, condProgrammed) {
+		t.Fatal("the consumer with no Secret reports Programmed")
+	}
+	if msg := consumerCondMessage(broken.Status.Conditions, condProgrammed); !strings.Contains(msg, "keeps working") {
+		t.Fatalf("the message does not say its existing key still works: %q", msg)
 	}
 }
 
@@ -572,35 +593,44 @@ func TestConsumerDeleteIsNotWedgedByAnotherConsumersSecret(t *testing.T) {
 	}
 }
 
-// ...but before the deadline it keeps trying, and says so. Giving up immediately would make
-// "delete" mean "the key may or may not still work", which is worse than a slow delete.
-func TestConsumerDeleteKeepsTryingBeforeTheDeadline(t *testing.T) {
+// Deleting a consumer is no longer blocked by somebody else's broken Secret at all: that
+// consumer's live entry is carried over instead of failing the round, so the deletion goes
+// through and revokes exactly its own key.
+//
+// This replaces a test that asserted the opposite - held under RevokeError until the deadline -
+// which was the behaviour the review called out: a deletion that cannot complete is how a
+// leaked key stays live.
+func TestConsumerDeleteIsNotBlockedByAnotherBrokenSecret(t *testing.T) {
 	now := metav1.Now()
 	doomed := consumerFixture("tenant-b", "tenant-b-keys")
 	doomed.DeletionTimestamp = &now
+	doomed.Status.ConsumerName = "tenant-b"
+	doomed.Status.AppliedGatewayNamespace = "higress-system"
 	broken := consumerFixture("tenant-a", "secret-that-does-not-exist")
+	broken.Status.ConsumerName = "tenant-a"
+	broken.Status.AppliedGatewayNamespace = "higress-system"
 	r, c := newConsumerReconciler(t, doomed, broken,
 		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
 		keyAuthManagedBy("tenant-a,tenant-b",
-			liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b")),
+			liveConsumer("tenant-a", "Bearer sk-a"), liveConsumer("tenant-b", "Bearer sk-b")),
 	)
 	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
 		t.Fatal(err)
 	}
+	// tenant-b's key is gone...
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "tenant-a" {
+		t.Fatalf("consumers = %v, want only tenant-a: the deletion did not revoke", names)
+	}
+	// ...tenant-a keeps the key it still has, despite its Secret being gone...
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-a" {
+		t.Fatalf("tenant-a credentials = %v, want them preserved", got)
+	}
+	// ...and the object was released rather than held to the deadline.
 	var con routingv1.APIConsumer
-	if err := c.Get(context.Background(), types.NamespacedName{
-		Namespace: "llm-route", Name: "tenant-b"}, &con); err != nil {
-		t.Fatalf("the object was released although the key was never revoked: %v", err)
-	}
-	if len(con.Finalizers) == 0 {
-		t.Fatal("the finalizer was dropped although the key was never revoked")
-	}
-	if msg := consumerCondMessage(con.Status.Conditions, condProgrammed); !strings.Contains(msg, "still retrying") {
-		t.Fatalf("the condition does not say it is still trying: %q", msg)
-	}
-	// The key is still live, which is the honest state - and the reason the object is held.
-	if n := len(consumerNames(gatewayConsumers(t, c, "higress-system"))); n != 2 {
-		t.Fatalf("live consumers = %d, want both (nothing was written)", n)
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-b"}, &con)
+	if err == nil && len(con.Finalizers) > 0 {
+		t.Fatalf("still held: %v", con.Finalizers)
 	}
 }
 
@@ -1129,13 +1159,17 @@ func TestConsumerBrokenNewObjectDoesNotFreezeTheGateway(t *testing.T) {
 		t.Fatalf("consumers = %v, want only tenant-a", names)
 	}
 
-	// But a consumer that IS in the list and whose Secret breaks still fails the round
-	// closed, because dropping it would revoke a working key.
+	// And a consumer that IS in the list and whose Secret breaks does not fail the round
+	// either: its live entry is preserved, so it keeps working and nobody else is blocked.
+	// Dropping it would revoke a working key; failing the round would freeze the gateway.
 	if err := c.Delete(context.Background(), credSecret("tenant-a-keys", map[string]string{"key": "x"})); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.programGateway(context.Background(), "higress-system", nil); err == nil {
-		t.Fatal("an unreadable Secret for a consumer that HAS a key did not fail the round")
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("an unreadable Secret for a live consumer froze the round: %v", err)
+	}
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-rotated" {
+		t.Fatalf("tenant-a credentials = %v, want the entry preserved as it was", got)
 	}
 }
 
