@@ -348,8 +348,8 @@ func TestConsumerDuplicateNameIsRefused(t *testing.T) {
 	if condTrue(first.Status.Conditions, condProgrammed) {
 		t.Fatal("two objects were allowed to claim one consumer name")
 	}
-	if !strings.Contains(condMessage(first.Status.Conditions, condProgrammed), "team-b") {
-		t.Fatalf("the other claimant is not named: %q", condMessage(first.Status.Conditions, condProgrammed))
+	if !strings.Contains(consumerCondMessage(first.Status.Conditions, condProgrammed), "team-b") {
+		t.Fatalf("the other claimant is not named: %q", consumerCondMessage(first.Status.Conditions, condProgrammed))
 	}
 	if n := len(gatewayConsumers(t, c, "higress-system")); n != 0 {
 		t.Fatalf("something was written anyway: %d consumers", n)
@@ -475,9 +475,14 @@ func keyAuthInNamespace(ns string, consumers ...map[string]any) *unstructured.Un
 	return o
 }
 
-// condMessage: a condition's message, for tests that check the failure NAMES what went wrong
-// rather than just that something did.
-func condMessage(conds []metav1.Condition, typ string) string {
+// consumerCondMessage: a condition's message, for tests that check the failure NAMES what
+// went wrong rather than just that something did.
+//
+// Not called condMessage: the ModelFleet suite declares a helper of that name, and two files
+// in one package cannot both declare it. On separate branches each builds fine and whichever
+// merged second would fail on main - a collision git never reports as a conflict, because the
+// two branches never touch the same file.
+func consumerCondMessage(conds []metav1.Condition, typ string) string {
 	for i := range conds {
 		if conds[i].Type == typ {
 			return conds[i].Message
@@ -588,7 +593,7 @@ func TestConsumerDeleteKeepsTryingBeforeTheDeadline(t *testing.T) {
 	if len(con.Finalizers) == 0 {
 		t.Fatal("the finalizer was dropped although the key was never revoked")
 	}
-	if msg := condMessage(con.Status.Conditions, condProgrammed); !strings.Contains(msg, "still retrying") {
+	if msg := consumerCondMessage(con.Status.Conditions, condProgrammed); !strings.Contains(msg, "still retrying") {
 		t.Fatalf("the condition does not say it is still trying: %q", msg)
 	}
 	// The key is still live, which is the honest state - and the reason the object is held.
