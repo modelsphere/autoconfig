@@ -188,6 +188,14 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // programGateway renders every APIConsumer that names this gateway namespace into its
 // key-auth plugin, in one write.
 //
+// Cost, since it is quadratic and that should be written down rather than discovered: one
+// round reads every consumer's Secret, uncached, so with N consumers on a gateway each of
+// their reconciles costs N Secret GETs - about N^2 per resync interval, plus one uncached GET
+// of key-auth per round. At a dozen consumers that is noise. The way out, if it ever matters,
+// is to collapse the rounds (one per gateway per interval rather than one per object), not to
+// cache the Secrets: a cluster-wide Secret informer is the thing this controller deliberately
+// does not have.
+//
 // `excluding` is the object being deleted: it still exists in the API server while its
 // finalizer runs, so it has to be left out explicitly.
 // errGatewayAbsent: this gateway's key-auth, or the WasmPlugin CRD itself, is not there. The
@@ -547,20 +555,22 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		}
 		// Take ownership of the field before writing it, if it is not ours yet.
 		//
-		// Why this cannot be left to the write itself: a non-apply Update only takes
-		// ownership of the fields whose VALUES it changes, and the first thing this
-		// controller does on an already-populated gateway is adopt the live entries
-		// unchanged. Measured on the test cluster, a same-value Update moves nothing, so the
-		// field stays helm's for as long as the rendered list happens to match - and the
-		// gateway chart holds its upgrade back until a non-helm manager owns the field,
-		// which would then never happen.
+		// Why the write cannot be left to do it: a non-apply Update only takes ownership of
+		// the fields whose VALUES it changes, and the first thing this controller does on an
+		// already-populated gateway is adopt the live entries unchanged. Measured on the
+		// test cluster, a same-value Update moves nothing, so the field would stay with
+		// whoever rendered it for as long as the rendered list happened to match.
 		//
 		// A force apply of just this field is enough: it leaves the value alone and makes
-		// autoconfig a CO-OWNER alongside helm (also measured - it does not dispossess
-		// helm), which is what the chart waits for. The chart then stops rendering the
-		// field, helm's claim on it lapses, and this controller is left as the only owner.
-		// `keys` and `global_auth` are untouched and stay helm's: defaultConfig is tracked
-		// field by field, not as one atomic blob.
+		// autoconfig a CO-OWNER alongside the previous owner (also measured - it does not
+		// dispossess it). Once that owner stops rendering the field, its claim lapses and
+		// this controller is left as the only one. `keys` and `global_auth` are untouched
+		// and stay with the chart: defaultConfig is tracked field by field, not as one
+		// atomic blob.
+		//
+		// What this is FOR, now that the chart renders no consumers at all: clusters that
+		// were installed before that change, where helm still owns the field from its last
+		// apply. A fresh install has nobody to take it from and this does nothing.
 		if len(consumers) > 0 && !ownsConsumers(obj) {
 			if err := r.claimConsumers(ctx, gwNS, live); err != nil {
 				return fmt.Errorf("take ownership of %s/key-auth defaultConfig.consumers: %w", gwNS, err)
@@ -921,14 +931,16 @@ func sortConsumerList(list []any) {
 	})
 }
 
-// fieldManagerName is the manager this controller writes under. It is what the gateway chart
-// looks for before it yields defaultConfig.consumers, so it is part of an agreed contract
-// with that chart, not an internal detail - see modelsphere/modelsphere#90.
+// fieldManagerName is the manager this controller writes under. It used to be part of an
+// agreed contract: the gateway chart looked the field's owner up in the live cluster and
+// yielded to any manager that was not helm. That design is gone - the chart renders no
+// consumers at all now, and reads nothing from the cluster - so this is once again an
+// internal detail. It is still spelled out in one place, because ownsConsumers looks for it
+// and SSA ownership is per manager NAME.
 const fieldManagerName = "autoconfig"
 
 // ownsConsumers: does this controller already own defaultConfig.consumers? Any entry under
-// its own manager counts, whether recorded by an apply or by an update - the chart yields to
-// any manager that is not helm.
+// its own manager counts, whether recorded by an apply or by an update.
 func ownsConsumers(obj *unstructured.Unstructured) bool {
 	for _, mf := range obj.GetManagedFields() {
 		if mf.Manager != fieldManagerName || mf.FieldsV1 == nil {
