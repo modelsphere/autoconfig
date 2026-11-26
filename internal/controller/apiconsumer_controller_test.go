@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sort"
 	"strings"
@@ -1517,4 +1518,69 @@ func TestGatewaySweepIsQuietWithoutHigress(t *testing.T) {
 	c := ctrlfake.NewClientBuilder().WithScheme(s).Build()
 	r := &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}
 	r.ensureGateways(context.Background()) // must not panic, must not block
+}
+
+// Every read of key-auth has to avoid the client's cache. The cached client builds an informer
+// on first use of a kind, and this controller runs where the WasmPlugin kind does not exist
+// yet - which is exactly why the watch is gated on discovery. A cached read here would
+// reintroduce that dependency one layer down, where nothing would notice until a cluster
+// without Higress fell over.
+//
+// Checked by giving the reconciler a client that fails every read and an APIReader that
+// works: anything that reaches for the cache instead shows up as a failure.
+func TestKeyAuthReadsBypassTheCache(t *testing.T) {
+	working := ctrlfake.NewClientBuilder().WithScheme(fleetScheme(t)).
+		WithObjects(keyAuthWithoutConsumers()).
+		WithStatusSubresource(&routingv1.APIConsumer{}).
+		Build()
+	r := &APIConsumerReconciler{
+		Client:    &readRefusingClient{Client: working},
+		APIReader: working,
+		Scheme:    fleetScheme(t),
+	}
+	// The sweep lists and then programs, so this covers both.
+	r.ensureGateways(context.Background())
+
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := working.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers"); !found {
+		t.Fatal("the consumers key was not written: something read key-auth through the cache, " +
+			"which on a cluster without the WasmPlugin kind is the dependency the discovery " +
+			"gate exists to avoid")
+	}
+}
+
+// readRefusingClient fails reads of WasmPlugin only - the kind that may not exist - and
+// passes everything else through. Refusing every read would prove nothing: APIConsumer and
+// Secret reads are allowed to use the cache, since this controller is only registered where
+// the APIConsumer CRD is served. The first version of this refused everything and failed for
+// that reason, which looked exactly like the bug it was written to find.
+type readRefusingClient struct {
+	client.Client
+}
+
+func (c *readRefusingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object,
+	opts ...client.GetOption) error {
+	if isWasmPlugin(obj) {
+		return fmt.Errorf("read key-auth through the cache: %s", key)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *readRefusingClient) List(ctx context.Context, list client.ObjectList,
+	opts ...client.ListOption) error {
+	if u, ok := list.(*unstructured.UnstructuredList); ok &&
+		strings.Contains(u.GetObjectKind().GroupVersionKind().Kind, "WasmPlugin") {
+		return fmt.Errorf("list WasmPlugins through the cache")
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+func isWasmPlugin(obj client.Object) bool {
+	u, ok := obj.(*unstructured.Unstructured)
+	return ok && u.GetObjectKind().GroupVersionKind() == wasmPluginGVK
 }

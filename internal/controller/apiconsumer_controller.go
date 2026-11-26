@@ -194,6 +194,27 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // only failure that means "there is nothing left to revoke a key from".
 var errGatewayAbsent = errors.New("the gateway's key-auth is not present")
 
+// gatewayReader: every read of a key-auth WasmPlugin goes through the uncached reader, not the
+// client's cache.
+//
+// Not a performance choice. The cached client builds an informer for a kind on first use, and
+// this controller runs on clusters where the WasmPlugin kind does not exist yet - Higress's
+// CRDs come from the higress CORE release, and autoconfig is deployed before higress-llm,
+// which needs it. The key-auth watch is gated on discovery for that reason; routing these
+// reads through the cache would reintroduce the same dependency one layer down, where no test
+// would notice, and the behaviour when a CRD appears mid-run (does a lazy informer start, and
+// how long does it block?) is something I would then be asserting rather than knowing.
+//
+// Uncached, the answer is the same in every state: a missing kind is an error that isAbsent
+// recognises, and a kind installed later works on the next read. The cost is one GET per
+// gateway per round.
+func (r *APIConsumerReconciler) gatewayReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 // gatewayRound reports what one programming round did with objects it could not include.
 // Keyed by "namespace/name", the value is why. It exists because this round is shared by every
 // APIConsumer on the gateway: a newcomer that cannot be rendered must not fail the round for
@@ -509,7 +530,7 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(wasmPluginGVK)
-		if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+		if err := r.gatewayReader().Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
 			if isAbsent(err) {
 				// Distinguished by a sentinel rather than by IsNotFound on whatever came
 				// back: a MISSING SECRET is also NotFound, and treating that as "the gateway
@@ -546,7 +567,7 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 			}
 			// Re-read: the apply bumped resourceVersion, and the Update below would be
 			// refused on the stale one.
-			if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+			if err := r.gatewayReader().Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
 				return fmt.Errorf("key-auth in namespace %q after taking ownership: %w", gwNS, err)
 			}
 		}
@@ -1009,7 +1030,7 @@ func refuseDuplicateCredentials(gwNS string, list []any) error {
 func (r *APIConsumerReconciler) hasNoLiveEntry(ctx context.Context, gwNS, name string) (bool, error) {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(wasmPluginGVK)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+	if err := r.gatewayReader().Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
 		return false, err
 	}
 	live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
@@ -1071,7 +1092,7 @@ func (r *APIConsumerReconciler) liveConsumerState(ctx context.Context, gwNS stri
 	entries := map[string][]string{}
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(wasmPluginGVK)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+	if err := r.gatewayReader().Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
 		if isAbsent(err) {
 			return entries, nil, fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
 		}
@@ -1111,7 +1132,7 @@ func (r *APIConsumerReconciler) liveConsumerNames(ctx context.Context, gwNS stri
 	out := map[string]bool{}
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(wasmPluginGVK)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+	if err := r.gatewayReader().Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
 		if isAbsent(err) {
 			return out, fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
 		}
