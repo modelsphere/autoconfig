@@ -1057,17 +1057,28 @@ func TestConsumerCannotTakeOverANameWithoutItsKey(t *testing.T) {
 		// The chart's entry, with the real key, managed by nobody.
 		keyAuthWith(liveConsumer("tenant-a", "Bearer sk-the-real-key")),
 	)
-	_, err := r.programGateway(context.Background(), "higress-system", nil)
-	if err == nil {
+	// The object is left out of the gateway rather than failing the round for everyone, and
+	// the reason lands on its own status - so this is checked through a reconcile, not
+	// through programGateway's return.
+	if err := reconcileConsumer2(t, r, "team-x", "team-x-impostor"); err != nil {
+		t.Fatal(err)
+	}
+	var imp0 routingv1.APIConsumer
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "team-x", Name: "team-x-impostor"}, &imp0); err != nil {
+		t.Fatal(err)
+	}
+	if condTrue(imp0.Status.Conditions, condProgrammed) {
 		t.Fatal("a foreign consumer name was taken over with a different key")
 	}
+	msg0 := consumerCondMessage(imp0.Status.Conditions, condProgrammed)
 	for _, want := range []string{"tenant-a", "existing", "consumerName"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("the error does not explain the refusal (%s missing): %v", want, err)
+		if !strings.Contains(msg0, want) {
+			t.Fatalf("the message does not explain the refusal (%s missing): %q", want, msg0)
 		}
 	}
-	if strings.Contains(err.Error(), "sk-the-real-key") || strings.Contains(err.Error(), "sk-attacker") {
-		t.Fatalf("the error leaks a credential: %v", err)
+	if strings.Contains(msg0, "sk-the-real-key") || strings.Contains(msg0, "sk-attacker") {
+		t.Fatalf("the message leaks a credential: %q", msg0)
 	}
 	// The real key still works: nothing was written.
 	creds := creds0Of(t, c, "higress-system", "tenant-a")
@@ -1076,11 +1087,6 @@ func TestConsumerCannotTakeOverANameWithoutItsKey(t *testing.T) {
 	}
 
 	// ...and carrying the existing key DOES adopt it, which is what a migration does.
-	var imp routingv1.APIConsumer
-	if err := c.Get(context.Background(), types.NamespacedName{
-		Namespace: "team-x", Name: "team-x-impostor"}, &imp); err != nil {
-		t.Fatal(err)
-	}
 	sec := credSecret("team-x-keys", map[string]string{"key": "sk-the-real-key"})
 	sec.Namespace = "team-x"
 	if err := c.Update(context.Background(), sec); err != nil {
@@ -1384,4 +1390,82 @@ func reconcileConsumer2(t *testing.T, r *APIConsumerReconciler, ns, name string)
 		NamespacedName: types.NamespacedName{Namespace: ns, Name: name},
 	})
 	return err
+}
+
+// The same value under two Secret keys is ordinary mid-rotation: copy `current` into `next`,
+// then edit it. It used to arrive as one consumer carrying a credential twice, which the
+// collision check read as two claimants on one credential - both from this very object - and
+// refused the round for the whole gateway, with a message about "two consumers" naming one
+// object twice.
+func TestConsumerSecretWithADuplicatedValueDoesNotFreezeTheGateway(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{
+			"current": "sk-a",
+			"next":    "sk-a", // copied, not yet edited
+		}),
+		keyAuthWith(),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("a Secret holding one value twice froze the round: %v", err)
+	}
+	got := creds0Of(t, c, "higress-system", "tenant-a")
+	if strings.Join(got, ",") != "Bearer sk-a" {
+		t.Fatalf("credentials = %v, want the value once", got)
+	}
+}
+
+// One consumer storing `sk-x` and another `Bearer sk-x` are the same credential once rendered,
+// and key-auth refuses a duplicate by failing to parse the whole config. Comparing raw values
+// let that pair past the collision check and into RenderConsumers, which refuses the round
+// instead of leaving the newcomer out.
+func TestConsumerPrefixedAndBareDuplicateIsCaughtAsACollision(t *testing.T) {
+	serving := consumerFixture("tenant-a", "tenant-a-keys")
+	serving.Status.ConsumerName = "tenant-a"
+	serving.Status.AppliedGatewayNamespace = "higress-system"
+	newcomer := consumerFixture("tenant-b", "tenant-b-keys")
+	r, c := newConsumerReconciler(t, serving, newcomer,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-shared"}),
+		// The same key, spelled the other way.
+		credSecret("tenant-b-keys", map[string]string{"key": "Bearer sk-shared"}),
+		keyAuthManagedBy("tenant-a", liveConsumer("tenant-a", "Bearer sk-shared")),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("the round failed instead of leaving the newcomer out: %v", err)
+	}
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "tenant-a" {
+		t.Fatalf("consumers = %v, want only the incumbent: a duplicate credential would make "+
+			"key-auth reject the whole configuration", names)
+	}
+}
+
+// An object that wants a name it cannot prove it holds is left out, not allowed to freeze the
+// gateway: everybody else must still be addable, rotatable and revocable.
+func TestConsumerUnprovenAdoptionDoesNotFreezeTheGateway(t *testing.T) {
+	serving := consumerFixture("tenant-a", "tenant-a-keys")
+	serving.Status.ConsumerName = "tenant-a"
+	serving.Status.AppliedGatewayNamespace = "higress-system"
+	impostor := consumerFixture("team-x", "team-x-keys")
+	impostor.Namespace = "team-x"
+	impostor.Spec.ConsumerName = "orphan" // a live entry owned by no APIConsumer
+	xsec := credSecret("team-x-keys", map[string]string{"key": "sk-x"})
+	xsec.Namespace = "team-x"
+	r, c := newConsumerReconciler(t, serving, impostor, xsec,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-rotated"}),
+		keyAuthManagedBy("tenant-a",
+			liveConsumer("tenant-a", "Bearer sk-old"),
+			liveConsumer("orphan", "Bearer sk-orphan")),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("an unprovable adoption froze the round: %v", err)
+	}
+	// tenant-a's rotation went through...
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-rotated" {
+		t.Fatalf("tenant-a credentials = %v, want the rotated key", got)
+	}
+	// ...the orphan entry is untouched, and the impostor's key is not in the gateway.
+	if got := creds0Of(t, c, "higress-system", "orphan"); strings.Join(got, ",") != "Bearer sk-orphan" {
+		t.Fatalf("orphan credentials = %v, want them untouched", got)
+	}
 }

@@ -97,6 +97,10 @@ func runController(leaderElect bool) error {
 	if err != nil {
 		return err
 	}
+	higressServed, err := kindServed(cs, wasmPluginGroupVersion, "WasmPlugin")
+	if err != nil {
+		return err
+	}
 	if served["ModelFleet"] {
 		if err := (&controller.ModelFleetReconciler{
 			Client:    mgr.GetClient(),
@@ -127,9 +131,24 @@ func runController(leaderElect bool) error {
 		// the gateway refuses everything). A fresh install has zero APIConsumers, so the
 		// APIConsumer watch would never fire; this one does, and the event also says which
 		// namespace, so no default has to be configured or guessed.
-		if err := (&controller.KeyAuthReconciler{APIConsumerReconciler: consumers}).
-			SetupWithManager(mgr); err != nil {
-			return err
+		//
+		// Gated on the WasmPlugin kind being served, for the reason spelled out above for
+		// ModelFleet and with a worse blast radius: a For() watch builds its informer at
+		// startup and blocks on the cache syncing, so on a cluster without Higress the
+		// manager would exit when CacheSyncTimeout ran out and the pod would crash-loop,
+		// taking ModelRoute - openresty peers, CART workers, monitor.conf - with it. Most
+		// clusters are in exactly that state: enabled.higress is false by default, while
+		// this release ships the APIConsumer CRD to all of them.
+		switch {
+		case !keyAuthWatchWanted(higressServed):
+			log.Print("Higress WasmPlugin CRD not installed: skipping the key-auth watch. " +
+				"Install Higress and restart to enable it - until then nothing creates " +
+				"key-auth's defaultConfig.consumers, which the gateway chart relies on")
+		default:
+			if err := (&controller.KeyAuthReconciler{APIConsumerReconciler: consumers}).
+				SetupWithManager(mgr); err != nil {
+				return err
+			}
 		}
 	} else {
 		log.Print("APIConsumer CRD not installed: skipping that reconciler " +
@@ -171,6 +190,34 @@ func servedKinds(cs kubernetes.Interface) (map[string]bool, error) {
 	}
 	return out, nil
 }
+
+// keyAuthWatchWanted: may the key-auth watch be registered? Its own function because the
+// consequence of getting it wrong is not local: that watch is a For(), so controller-runtime
+// builds its informer at startup and waits for the cache to sync, and where the kind is not
+// served the manager exits when CacheSyncTimeout runs out. The pod then crash-loops and takes
+// ModelRoute with it on a cluster that only ever wanted ModelRoute.
+func keyAuthWatchWanted(higressServed bool) bool { return higressServed }
+
+// kindServed: is one kind of some OTHER group served? Same question as servedKinds, asked of
+// a group this project does not own, so a missing group is an answer rather than an error.
+func kindServed(cs kubernetes.Interface, groupVersion, kind string) (bool, error) {
+	list, err := cs.Discovery().ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("discover %s: %w", groupVersion, err)
+	}
+	for _, r := range list.APIResources {
+		if r.Kind == kind {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// wasmPluginGroupVersion is Higress's, not ours.
+const wasmPluginGroupVersion = "extensions.higress.io/v1alpha1"
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {

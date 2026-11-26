@@ -154,17 +154,19 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	round, err := r.programGateway(ctx, gwNS, nil)
-	if err != nil {
-		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "ProgramError", err.Error(), 0, "", "")
-		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
-	}
-	// This object was left out of the round on purpose - a collision with somebody already
-	// serving traffic, or a Secret this controller cannot read. The round succeeded for
-	// everyone else, so there is nothing to retry quickly; the reason goes on this object,
-	// where whoever created it will look.
+	// A reason specific to THIS object comes first, even when the round also failed. It was
+	// left out on purpose - a collision with somebody already serving traffic, an identity it
+	// cannot prove it holds, a Secret that cannot be read - and that is what whoever created
+	// it needs to read. The round's own error is usually a consequence: leaving this object
+	// out can be what made the rendered list empty, and the empty-list guard then refuses to
+	// write it over live entries, which is correct but says nothing about this object.
 	if why := round.reasonFor(&consumer); why != "" {
 		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "NotProgrammed",
 			why, 0, "", "")
+		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
+	}
+	if err != nil {
+		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "ProgramError", err.Error(), 0, "", "")
 		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 	}
 
@@ -244,9 +246,13 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// The names already in this gateway's list. Needed before rendering, to tell "this
 	// consumer's Secret is unreadable and it has a key in there" (fail closed) from "...and
 	// it has nothing in there" (skip it rather than freeze everyone else).
-	liveNames, err := r.liveConsumerNames(ctx, gwNS)
+	liveEntries, liveManaged, err := r.liveConsumerState(ctx, gwNS)
 	if err != nil && !errors.Is(err, errGatewayAbsent) {
 		return gatewayRound{}, err
+	}
+	liveNames := map[string]bool{}
+	for n := range liveEntries {
+		liveNames[n] = true
 	}
 
 	round := gatewayRound{skipped: map[string]string{}}
@@ -340,6 +346,17 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		return round, err
 	}
 
+	// Taking over a consumer name that already exists here and belongs to no APIConsumer
+	// requires carrying every credential it accepts - proof that whoever wrote this object
+	// already holds the key. consumerName is free-form and an APIConsumer can be created in
+	// any namespace, so without it, writing `consumerName: tenant-a` and your own key
+	// inherits every route tenant-a is allowed on.
+	//
+	// Decided here, where the objects are, and the object that cannot prove it is left out
+	// rather than failing the round: wanting an identity it is not entitled to must not stop
+	// every other consumer on this gateway from being added, rotated or revoked.
+	views = dropUnprovenAdoptions(views, liveEntries, liveManaged, claimed, round, gwNS)
+
 	if len(round.skipped) > 0 {
 		logf.FromContext(ctx).Info("left consumers out of this round",
 			"gateway", gwNS, "skipped", round.skipped)
@@ -398,8 +415,12 @@ func (r *APIConsumerReconciler) dropCollidingNewcomers(ctx context.Context,
 	for _, v := range views {
 		add("consumer name", v.Name, v)
 		for _, cred := range v.Credentials {
-			// By credential VALUE, which is never put in a message.
-			add("credential", cred, v)
+			// By credential VALUE - never put in a message - and with the prefix normalised,
+			// because that is how key-auth will see them: `sk-x` in one consumer and
+			// `Bearer sk-x` in another render to the same string, so comparing raw values
+			// let that pair past this check and into RenderConsumers, which refuses the
+			// whole round instead of leaving the newcomer out.
+			add("credential", strings.TrimPrefix(cred, bearerPrefixValue), v)
 		}
 	}
 
@@ -605,45 +626,10 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 				continue // already ours; this is a rotation, not an adoption
 			}
 			if mine[name] {
-				// Adopting an entry nobody has claimed before, by NAME. Taking it over has
-				// to require proof that the writer already holds the key, or the name is a
-				// free identity: an APIConsumer can be created in any namespace, its
-				// consumerName is free-form, and whatever it renders replaces the entry. A
-				// writer who put consumerName: tenant-a and their own key in their own
-				// Secret would inherit every route tenant-a is allowed on, and the real
-				// tenant-a would get 401 on its next request. Nothing else would notice:
-				// the names do not collide between APIConsumers, and no credential is
-				// shared, so neither existing guard fires.
-				//
-				// credentialsSecretRef is pinned to the object's own namespace for exactly
-				// this reason - a namespace-scoped writer is not trusted with other
-				// people's credentials - and an identity is worth no less than a key.
-				//
-				// The proof is: carry every credential the live entry already has. That is
-				// what a migration does anyway, because the point is that the caller
-				// changes nothing. Dropping an old key comes after adoption, as a rotation,
-				// when the entry is ours and no proof is needed.
-				if reformatted := credentialsReformatted(m, myCreds[name]); reformatted {
-					// Adoption is allowed - the writer holds the key - but the entry's
-					// credential changes spelling, from a bare key to `Bearer <key>`, and
-					// key_auth compares the WHOLE Authorization header. A caller that was
-					// sending the bare form will start getting 401. Said out loud, because
-					// nothing else would say it.
-					logf.FromContext(ctx).Info("adopting a consumer whose credential was "+
-						"stored without the Bearer prefix; callers must send "+
-						"`Authorization: Bearer <key>` from now on",
-						"gateway", gwNS, "consumer", name)
-				}
-				if missing := credentialsNotCovered(m, myCreds[name]); missing > 0 {
-					return fmt.Errorf("%s/key-auth: consumer %q already exists in this "+
-						"gateway and is not managed by any APIConsumer, and the APIConsumer "+
-						"claiming that name does not carry %d of its %d existing "+
-						"credential(s). Adopting an existing consumer requires its current "+
-						"key(s), so that taking over a name cannot grant someone else's "+
-						"access; nothing was written. Add the existing key to the Secret to "+
-						"adopt it, then rotate, or give this APIConsumer a different "+
-						"consumerName", gwNS, name, missing, liveCredentialCount(m))
-				}
+				// Ours this round. Whether this object is ENTITLED to a name that already
+				// existed here is decided in programGateway, where the objects are: by the
+				// time a view reaches this function it has been cleared, and a view that was
+				// not is no longer in the list.
 				continue
 			}
 			foreign = append(foreign, name)
@@ -733,10 +719,22 @@ func (r *APIConsumerReconciler) readCredentials(ctx context.Context, c *routingv
 	}
 	sort.Strings(keys) // stable order, so an unchanged Secret renders an unchanged list
 	out := make([]string, 0, len(keys))
+	seen := map[string]bool{}
 	for _, k := range keys {
 		v := strings.TrimSpace(string(sec.Data[k]))
 		if v == "" {
 			continue // an empty value would be a credential that matches nothing
+		}
+		// Deduplicated, comparing with the prefix normalised. The same value under two
+		// Secret keys is ordinary mid-rotation (copy `current` to `next`, then edit it), and
+		// it used to arrive as one consumer carrying a credential twice: the collision check
+		// then saw two claimants on one credential - both from this same object, so both
+		// "incumbents" - and refused the round for the whole gateway, with a message about
+		// two consumers that named one object twice.
+		if norm := strings.TrimPrefix(v, bearerPrefixValue); seen[norm] {
+			continue
+		} else {
+			seen[norm] = true
 		}
 		out = append(out, v)
 	}
@@ -1066,6 +1064,48 @@ func liveCredentialCount(live map[string]any) int {
 	return len(creds)
 }
 
+// liveConsumerState: what this gateway's key-auth currently holds - each consumer name with
+// its credentials - and which of those names this controller recorded as its own.
+func (r *APIConsumerReconciler) liveConsumerState(ctx context.Context, gwNS string) (
+	map[string][]string, map[string]bool, error) {
+	entries := map[string][]string{}
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(wasmPluginGVK)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+		if isAbsent(err) {
+			return entries, nil, fmt.Errorf("key-auth in namespace %q: %w", gwNS, errGatewayAbsent)
+		}
+		return entries, nil, err
+	}
+	managed, err := managedConsumerNames(obj)
+	if err != nil {
+		return entries, nil, err
+	}
+	live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
+	if err != nil {
+		return entries, managed, err
+	}
+	for _, lc := range live {
+		m, ok := lc.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		if name == "" {
+			continue
+		}
+		creds, _ := m["credentials"].([]any)
+		vals := make([]string, 0, len(creds))
+		for _, c := range creds {
+			if v, ok := c.(string); ok {
+				vals = append(vals, v)
+			}
+		}
+		entries[name] = vals
+	}
+	return entries, managed, nil
+}
+
 // liveConsumerNames: the consumer names this gateway's key-auth currently holds.
 func (r *APIConsumerReconciler) liveConsumerNames(ctx context.Context, gwNS string) (map[string]bool, error) {
 	out := map[string]bool{}
@@ -1156,4 +1196,43 @@ func credentialsReformatted(live map[string]any, rendered map[string]bool) bool 
 		}
 	}
 	return false
+}
+
+// dropUnprovenAdoptions leaves out any view that claims a consumer name already present in
+// the gateway and owned by no APIConsumer, unless it carries every credential that entry
+// accepts. Comparison ignores the `Bearer ` prefix on either side: possession of the key is
+// the question, how the entry spells it is not.
+func dropUnprovenAdoptions(views []sink.ConsumerView, liveEntries map[string][]string,
+	liveManaged, claimed map[string]bool, round gatewayRound, gwNS string) []sink.ConsumerView {
+	kept := make([]sink.ConsumerView, 0, len(views))
+	for _, v := range views {
+		existing, present := liveEntries[v.Name]
+		if !present || liveManaged[v.Name] || claimed[v.Name] {
+			kept = append(kept, v) // nothing there, or already ours: a rotation
+			continue
+		}
+		have := make(map[string]bool, len(v.Credentials))
+		for _, c := range v.Credentials {
+			have[strings.TrimPrefix(c, bearerPrefixValue)] = true
+		}
+		missing := 0
+		for _, c := range existing {
+			if !have[strings.TrimPrefix(c, bearerPrefixValue)] {
+				missing++
+			}
+		}
+		if missing == 0 {
+			kept = append(kept, v)
+			continue
+		}
+		round.skipped[v.Source] = fmt.Sprintf(
+			"consumer %q already exists in gateway %s and is managed by no APIConsumer, and "+
+				"this object does not carry %d of its %d existing credential(s). Adopting an "+
+				"existing consumer requires its current key(s), so that taking over a name "+
+				"cannot grant someone else's access. Put the existing key in this object's "+
+				"Secret to adopt it and rotate afterwards, or give it a different "+
+				"consumerName. This object was left out of the gateway; everything else on "+
+				"it is unaffected", v.Name, gwNS, missing, len(existing))
+	}
+	return kept
 }
