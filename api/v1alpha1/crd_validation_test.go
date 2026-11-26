@@ -1,8 +1,11 @@
 package v1alpha1
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"testing"
 
 	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
@@ -57,4 +60,85 @@ func TestGeneratedCRDsAreAcceptedByTheAPIServer(t *testing.T) {
 			t.Errorf("%s would be rejected by the API server:\n%v", name, errs.ToAggregate())
 		}
 	}
+}
+
+// Every phase this package can WRITE has to be in the CRD's enum for that field. It is not a
+// style check: a value missing from the enum makes the API server reject the whole status
+// write, so the object keeps its previous status forever and the only sign is an error line
+// in the controller log. MemberDisabled shipped in exactly that state and got as far as a
+// test cluster, where "the route was withdrawn but status still says Ready" was the symptom -
+// nothing in the unit tests could see it, because they never go through CRD validation.
+func TestStatusEnumsCoverEveryConstant(t *testing.T) {
+	for _, tc := range []struct {
+		crd    string
+		path   []string
+		values []string
+	}{
+		{
+			crd: "routing.modelsphere.dev_modelfleets.yaml",
+			path: []string{"spec", "versions", "0", "schema", "openAPIV3Schema", "properties",
+				"status", "properties", "members", "items", "properties", "phase"},
+			values: []string{
+				string(MemberReady), string(MemberDegraded),
+				string(MemberNotFound), string(MemberDisabled),
+			},
+		},
+	} {
+		t.Run(tc.crd, func(t *testing.T) {
+			enum := enumAt(t, tc.crd, tc.path)
+			for _, want := range tc.values {
+				if !slices.Contains(enum, want) {
+					t.Errorf("the controller can write phase %q, but the CRD only allows %v - "+
+						"every status write carrying it will be rejected and the object will "+
+						"keep its old status", want, enum)
+				}
+			}
+		})
+	}
+}
+
+// enumAt reads the enum of one property out of a CRD on disk, walking the path given (list
+// indices as decimal strings).
+func enumAt(t *testing.T, file string, path []string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "helm", "autoconfig", "crds", file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	cur := doc
+	for _, step := range path {
+		switch node := cur.(type) {
+		case map[string]any:
+			next, ok := node[step]
+			if !ok {
+				t.Fatalf("%s: no %q under %v", file, step, path)
+			}
+			cur = next
+		case []any:
+			i, err := strconv.Atoi(step)
+			if err != nil || i >= len(node) {
+				t.Fatalf("%s: bad list index %q", file, step)
+			}
+			cur = node[i]
+		default:
+			t.Fatalf("%s: cannot walk %q into %T", file, step, cur)
+		}
+	}
+	prop, ok := cur.(map[string]any)
+	if !ok {
+		t.Fatalf("%s: %v is not a property object", file, path)
+	}
+	vals, ok := prop["enum"].([]any)
+	if !ok {
+		t.Fatalf("%s: %v has no enum - the check would pass for the wrong reason", file, path)
+	}
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		out = append(out, fmt.Sprint(v))
+	}
+	return out
 }

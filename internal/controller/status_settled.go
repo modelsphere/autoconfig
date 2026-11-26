@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -37,9 +38,15 @@ func statusSettled(prev, next any, resyncEvery time.Duration, lastSync *metav1.T
 // Reflection rather than a hand-written comparison per type: a field added to either status
 // would otherwise be left out of the comparison silently, and the symptom - a status that
 // stops updating for one particular field - is nothing like the cause.
+//
+// equality.Semantic, not reflect.DeepEqual: the latter calls a nil slice and an empty slice
+// different, and a status that round-trips through the API server comes back with one where
+// the renderer built the other. The first version of this used DeepEqual and never once
+// found a status settled - the comparison said "changed" on every pass while the serialised
+// status was byte for byte identical, so the write it was supposed to skip still happened.
 func sameIgnoringLastSync(prev, next any) bool {
 	a, b := zeroLastSync(prev), zeroLastSync(next)
-	return reflect.DeepEqual(a, b)
+	return equality.Semantic.DeepEqual(a, b)
 }
 
 func zeroLastSync(v any) any {
