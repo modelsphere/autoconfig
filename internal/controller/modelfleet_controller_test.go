@@ -2583,3 +2583,33 @@ func TestFleetSettledStatusIsNotRewritten(t *testing.T) {
 		t.Fatal("lastSyncTime was left stale")
 	}
 }
+
+// A route's capacity comes from the same function the ModelRoute controller uses to write the
+// peers table, so the two cannot disagree about what a tier admits. This covers the tier that
+// made the point: backend-svc gained a derived cap in PR #10 while this file was restating the
+// rules, and a restatement is a copy that goes stale.
+func TestFleetCapacityUsesTheSharedPeerRule(t *testing.T) {
+	mr := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 4, true)
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "backend", MaxConcurrency: 25},
+		// Lowest-priority fallback over the SAME backends: it adds nothing, and its own cap
+		// gates only the fallback path. A route is not smaller because its fallback is.
+		{Use: "backend-svc"},
+	}
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 4 x 25 = 100: backend-svc must not change it", got)
+	}
+	mr.Spec.Nginx.Peers[1].MaxConcurrency = 20
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d: a fallback tier's own cap must not shrink the route", got)
+	}
+	// And the derived CART cap arrives through peerMaxConcurrency, not through a second copy
+	// of the maxConcurrencyFromBackend rule.
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "cart", MaxConcurrencyFromBackend: true},
+		{Use: "backend", MaxConcurrency: 25},
+	}
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 100 (the cart cap follows the backends)", got)
+	}
+}

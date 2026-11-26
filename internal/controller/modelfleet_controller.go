@@ -351,36 +351,49 @@ func isPublicRoute(fleet *routingv1.ModelFleet) bool {
 // the opposite error: a CART that accepts 200 in front of 4 x 25 does not serve 200, it
 // queues the surplus internally. min() is the binding constraint in both directions.
 //
-// maxConcurrencyFromBackend needs no special case under min(): the flag means the CART limit
-// IS the backend sum, so the two values are the same number.
+// A tier's effective cap comes from peerMaxConcurrency, the same function the ModelRoute
+// controller writes into the peers table, rather than from restating its rules here. This
+// used to restate them and drifted within a day: `backend-svc` gained a derived cap
+// (PR #10) that this function knew nothing about. One route, one answer.
+//
+// backend-svc is deliberately left out of the min. It is the lowest-priority fallback over
+// the SAME backends, so it adds no capacity, and its cap gates only the fallback path - a
+// route is not smaller because its fallback is.
 //
 // 0 means "unknown" and keeps this route out of the fleet's total rather than contributing a
-// guess - no ceiling is declared, or there are no ready backends to multiply, or there are
+// guess: no ceiling is declared, or there are no ready backends to multiply, or there are
 // several backend ceilings, which is several answers and not one.
 func routeMaxConcurrency(mr *routingv1.ModelRoute) int32 {
-	perInstance, backendGroups, cart := 0, 0, 0
+	backends := mr.Status.Backends
+	perInstance, backendGroups := 0, 0
 	for _, p := range mr.Spec.Nginx.Peers {
-		if p.Use == "cart" && p.MaxConcurrency > 0 && !p.MaxConcurrencyFromBackend {
-			cart = p.MaxConcurrency
-		}
 		if p.Use == "backend" && p.MaxConcurrency > 0 {
 			backendGroups++
 			perInstance = p.MaxConcurrency
 		}
 	}
-	backend := 0
-	if perInstance > 0 && backendGroups == 1 && mr.Status.Backends > 0 {
-		backend = perInstance * mr.Status.Backends
+	backendTotal := 0
+	if perInstance > 0 && backendGroups == 1 && backends > 0 {
+		backendTotal = perInstance * backends
+	}
+	cart := 0
+	for _, p := range mr.Spec.Nginx.Peers {
+		if p.Use != "cart" {
+			continue
+		}
+		if c := peerMaxConcurrency(p, perInstance, backends); c > 0 {
+			cart = c
+		}
 	}
 	switch {
-	case cart > 0 && backend > 0:
-		return int32(min(cart, backend))
+	case cart > 0 && backendTotal > 0:
+		return int32(min(cart, backendTotal))
 	case cart > 0:
 		// No usable backend figure, but the CART ceiling is still a real limit, and saying
 		// it beats saying nothing.
 		return int32(cart)
 	default:
-		return int32(backend)
+		return int32(backendTotal)
 	}
 }
 
