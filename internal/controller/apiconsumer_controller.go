@@ -104,7 +104,7 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				}
 			}
 			for _, ns := range distinctNamespaces(gwNS, consumer.Status.AppliedGatewayNamespace) {
-				err := r.programGateway(ctx, ns, &consumer)
+				_, err := r.programGateway(ctx, ns, &consumer)
 				// A gateway that is GONE needs no rewrite, and neither does one whose CRD
 				// has been uninstalled: there is nothing left to revoke the key from.
 				// Anything else - a misspelled namespace, an unreadable Secret belonging to
@@ -146,15 +146,25 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// isAbsent: the gateway it used to be in has been uninstalled, so there is nothing
 		// to take it out of. Retrying that forever would mean this consumer's key never
 		// reaches its NEW gateway - the one failure mode worse than a stale entry.
-		if err := r.programGateway(ctx, old, nil); err != nil && !errors.Is(err, errGatewayAbsent) {
+		if _, err := r.programGateway(ctx, old, nil); err != nil && !errors.Is(err, errGatewayAbsent) {
 			r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "WithdrawError",
 				fmt.Sprintf("could not take this consumer out of its previous gateway %q: %v", old, err), 0, "", "")
 			return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 		}
 	}
 
-	if err := r.programGateway(ctx, gwNS, nil); err != nil {
+	round, err := r.programGateway(ctx, gwNS, nil)
+	if err != nil {
 		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "ProgramError", err.Error(), 0, "", "")
+		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
+	}
+	// This object was left out of the round on purpose - a collision with somebody already
+	// serving traffic, or a Secret this controller cannot read. The round succeeded for
+	// everyone else, so there is nothing to retry quickly; the reason goes on this object,
+	// where whoever created it will look.
+	if why := round.reasonFor(&consumer); why != "" {
+		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "NotProgrammed",
+			why, 0, "", "")
 		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 	}
 
@@ -182,13 +192,29 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // only failure that means "there is nothing left to revoke a key from".
 var errGatewayAbsent = errors.New("the gateway's key-auth is not present")
 
-func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string, excluding *routingv1.APIConsumer) error {
+// gatewayRound reports what one programming round did with objects it could not include.
+// Keyed by "namespace/name", the value is why. It exists because this round is shared by every
+// APIConsumer on the gateway: a newcomer that cannot be rendered must not fail the round for
+// everybody else, but it still has to learn about it on its own object, so skipping it
+// silently is not an option either.
+type gatewayRound struct {
+	skipped map[string]string
+}
+
+func (g gatewayRound) reasonFor(c *routingv1.APIConsumer) string {
+	if g.skipped == nil || c == nil {
+		return ""
+	}
+	return g.skipped[c.Namespace+"/"+c.Name]
+}
+
+func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string, excluding *routingv1.APIConsumer) (gatewayRound, error) {
 	var list routingv1.APIConsumerList
 	if err := r.List(ctx, &list); err != nil {
 		// A failed list renders an empty consumer list, which is the single most dangerous
 		// write this controller can make: it would lock every caller out of every route.
 		// Never guess from a partial read.
-		return fmt.Errorf("list APIConsumers: %w", err)
+		return gatewayRound{}, fmt.Errorf("list APIConsumers: %w", err)
 	}
 
 	// Has this controller ever programmed THIS gateway? It is the difference between "the
@@ -220,10 +246,43 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// it has nothing in there" (skip it rather than freeze everyone else).
 	liveNames, err := r.liveConsumerNames(ctx, gwNS)
 	if err != nil && !errors.Is(err, errGatewayAbsent) {
-		return err
+		return gatewayRound{}, err
 	}
 
-	var skipped []string
+	round := gatewayRound{skipped: map[string]string{}}
+	// incumbent: is the entry under this consumer's name in this gateway THIS object's?
+	// Everything that can go wrong with a newcomer is survivable by leaving it out; the same
+	// thing wrong with an incumbent means refusing the round, because dropping it revokes a
+	// working key.
+	//
+	// Not "is there an entry under that name", which is what this asked first and is a hole:
+	// an object whose consumerName names somebody else's live entry would have counted as an
+	// incumbent, so an impostor and the consumer it was impersonating came out as two
+	// incumbents and the round was refused for the whole gateway - exactly the freeze this
+	// is here to avoid, and with the impersonation deciding it.
+	//
+	// Its own status is conclusive. Failing that, an entry with no other claimant is
+	// plausibly its own: that is the object whose gateway write landed and whose status
+	// write did not, and skipping it WOULD revoke a live key.
+	incumbent := func(c *routingv1.APIConsumer) bool {
+		if c.Status.AppliedGatewayNamespace == gwNS {
+			return true
+		}
+		name := consumerName(c)
+		if !hasLiveEntry(liveNames, name) {
+			return false
+		}
+		for i := range list.Items {
+			o := &list.Items[i]
+			if o.Namespace == c.Namespace && o.Name == c.Name {
+				continue
+			}
+			if o.Status.AppliedGatewayNamespace == gwNS && o.Status.ConsumerName == name {
+				return false // that entry is on record as somebody else's
+			}
+		}
+		return true
+	}
 	views := make([]sink.ConsumerView, 0, len(list.Items))
 	for i := range list.Items {
 		c := &list.Items[i]
@@ -251,12 +310,11 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 			// including a deletion, which then retries for the revoke deadline and
 			// releases with the key still live. One new broken object must not hold the
 			// rest hostage, so it is skipped, with the error on its own object.
-			if c.Status.AppliedGatewayNamespace != gwNS &&
-				!claimed[consumerName(c)] && !hasLiveEntry(liveNames, consumerName(c)) {
-				skipped = append(skipped, fmt.Sprintf("%s/%s (%v)", c.Namespace, c.Name, err))
+			if !incumbent(c) {
+				round.skipped[c.Namespace+"/"+c.Name] = err.Error()
 				continue
 			}
-			return fmt.Errorf("%s/%s: %w (nothing was written; the gateway keeps its "+
+			return round, fmt.Errorf("%s/%s: %w (nothing was written; the gateway keeps its "+
 				"current consumer list)", c.Namespace, c.Name, err)
 		}
 		views = append(views, sink.ConsumerView{
@@ -266,15 +324,160 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 		})
 	}
 
-	if len(skipped) > 0 {
-		logf.FromContext(ctx).Info("skipped consumers that have nothing in this gateway yet",
-			"gateway", gwNS, "skipped", skipped)
+	// A newcomer that collides with somebody already here - same consumer name, or the same
+	// credential - is dropped the same way an unreadable Secret is, and for the same reason.
+	// RenderConsumers refuses the whole view set on a collision, which is right as a last
+	// line of defence but wrong as the response to one new object: it would freeze every key
+	// on the gateway, including REVOKING a leaked one, and a deletion in flight would retry
+	// to the deadline and then release with the key still live.
+	//
+	// The refusals themselves stay - the duplicate-name check is what stops a
+	// namespace-scoped writer from stealing a managed consumer name, and the duplicate
+	// credential one is what stops a gateway-wide parse failure. Only who pays for the
+	// collision changes: the newcomer, not everybody.
+	views, err = r.dropCollidingNewcomers(ctx, views, list.Items, gwNS, incumbent, round)
+	if err != nil {
+		return round, err
+	}
+
+	if len(round.skipped) > 0 {
+		logf.FromContext(ctx).Info("left consumers out of this round",
+			"gateway", gwNS, "skipped", round.skipped)
 	}
 	consumers, err := sink.RenderConsumers(views)
 	if err != nil {
-		return err
+		return round, err
 	}
-	return r.writeConsumers(ctx, gwNS, consumers, ownedBefore, claimed)
+	return round, r.writeConsumers(ctx, gwNS, consumers, ownedBefore, claimed)
+}
+
+// dropCollidingNewcomers resolves two claims on one identity - the same consumer name, or the
+// same credential - without failing the round for everybody else on the gateway.
+//
+// RenderConsumers refuses a colliding view set outright, which is right as a last line of
+// defence and wrong as the response to one new object: it would freeze every key on this
+// gateway, including REVOKING a leaked one, and a deletion in flight would retry to the
+// deadline and then release with the key still live.
+//
+// Who pays for the collision:
+//
+//   - exactly one claimant is already serving traffic here: it keeps the identity, and every
+//     newcomer is left out and told why. This is what stops a namespace-scoped writer from
+//     taking a name that belongs to someone else.
+//   - nobody is serving it yet: ALL the claimants are left out. Letting the first one win
+//     would be arbitrating "who is tenant-a" by list order, which is a coin flip in a
+//     dispute - and nobody is losing access, because nobody had the name.
+//   - two claimants are already serving it: refused as an error. One bad newcomer cannot
+//     produce this, it means two live consumers genuinely share an identity, and dropping
+//     either revokes a working key. A person has to look.
+func (r *APIConsumerReconciler) dropCollidingNewcomers(ctx context.Context,
+	views []sink.ConsumerView, items []routingv1.APIConsumer, gwNS string,
+	incumbent func(*routingv1.APIConsumer) bool, round gatewayRound) ([]sink.ConsumerView, error) {
+	bySource := map[string]*routingv1.APIConsumer{}
+	for i := range items {
+		bySource[items[i].Namespace+"/"+items[i].Name] = &items[i]
+	}
+	isIncumbent := func(v sink.ConsumerView) bool {
+		c, ok := bySource[v.Source]
+		return ok && incumbent(c)
+	}
+
+	// claims[identity] = the views claiming it, in list order.
+	type claim struct {
+		kind  string // "consumer name" or "credential"
+		views []sink.ConsumerView
+	}
+	claims := map[string]*claim{}
+	add := func(kind, identity string, v sink.ConsumerView) {
+		key := kind + "\x00" + identity
+		if claims[key] == nil {
+			claims[key] = &claim{kind: kind}
+		}
+		claims[key].views = append(claims[key].views, v)
+	}
+	for _, v := range views {
+		add("consumer name", v.Name, v)
+		for _, cred := range v.Credentials {
+			// By credential VALUE, which is never put in a message.
+			add("credential", cred, v)
+		}
+	}
+
+	drop := map[string]string{} // Source -> reason
+	for key, cl := range claims {
+		if len(cl.views) < 2 {
+			continue
+		}
+		identity := key[strings.Index(key, "\x00")+1:]
+		var incumbents, newcomers []sink.ConsumerView
+		for _, v := range cl.views {
+			if isIncumbent(v) {
+				incumbents = append(incumbents, v)
+			} else {
+				newcomers = append(newcomers, v)
+			}
+		}
+		switch {
+		case len(incumbents) > 1:
+			if cl.kind == "credential" {
+				return nil, fmt.Errorf("%s/key-auth: %d consumers already serving this "+
+					"gateway share one credential; key-auth refuses a duplicate credential "+
+					"and fails to parse its whole configuration, which denies every caller "+
+					"on every route. Nothing was written, and this needs a person: dropping "+
+					"either of them revokes a working key. The objects are %s",
+					gwNS, len(incumbents), sourcesOf(incumbents))
+			}
+			return nil, fmt.Errorf("%s/key-auth: consumer name %q is claimed by %s, and more "+
+				"than one of them is already serving this gateway. Nothing was written, and "+
+				"this needs a person: dropping either revokes a working key",
+				gwNS, identity, sourcesOf(incumbents))
+		case len(incumbents) == 1:
+			for _, v := range newcomers {
+				drop[v.Source] = collisionReason(cl.kind, identity, gwNS,
+					"it is already served by "+incumbents[0].Source)
+			}
+		default:
+			for _, v := range cl.views {
+				drop[v.Source] = collisionReason(cl.kind, identity, gwNS,
+					"it is claimed by "+sourcesOf(cl.views)+" and nothing here serves it yet, "+
+						"so none of them was given it - which of these objects owns this "+
+						"identity is not something this controller may decide")
+			}
+		}
+	}
+	if len(drop) == 0 {
+		return views, nil
+	}
+	kept := make([]sink.ConsumerView, 0, len(views))
+	for _, v := range views {
+		if why, dropped := drop[v.Source]; dropped {
+			round.skipped[v.Source] = why
+			continue
+		}
+		kept = append(kept, v)
+	}
+	_ = ctx
+	return kept, nil
+}
+
+// collisionReason: never names the credential, only what collided and with whom. This text
+// lands on a CR and in the logs.
+func collisionReason(kind, identity, gwNS, who string) string {
+	what := fmt.Sprintf("consumer name %q", identity)
+	if kind == "credential" {
+		what = "one of this object's credentials"
+	}
+	return fmt.Sprintf("%s collides on gateway %s: %s. This object was left out of the "+
+		"gateway; everything else on it is unaffected", what, gwNS, who)
+}
+
+func sourcesOf(views []sink.ConsumerView) string {
+	out := make([]string, 0, len(views))
+	for _, v := range views {
+		out = append(out, v.Source)
+	}
+	sort.Strings(out)
+	return strings.Join(out, " and ")
 }
 
 // writeConsumers replaces defaultConfig.consumers in the gateway's key-auth plugin, leaving
@@ -420,6 +623,17 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 				// what a migration does anyway, because the point is that the caller
 				// changes nothing. Dropping an old key comes after adoption, as a rotation,
 				// when the entry is ours and no proof is needed.
+				if reformatted := credentialsReformatted(m, myCreds[name]); reformatted {
+					// Adoption is allowed - the writer holds the key - but the entry's
+					// credential changes spelling, from a bare key to `Bearer <key>`, and
+					// key_auth compares the WHOLE Authorization header. A caller that was
+					// sending the bare form will start getting 401. Said out loud, because
+					// nothing else would say it.
+					logf.FromContext(ctx).Info("adopting a consumer whose credential was "+
+						"stored without the Bearer prefix; callers must send "+
+						"`Authorization: Bearer <key>` from now on",
+						"gateway", gwNS, "consumer", name)
+				}
 				if missing := credentialsNotCovered(m, myCreds[name]); missing > 0 {
 					return fmt.Errorf("%s/key-auth: consumer %q already exists in this "+
 						"gateway and is not managed by any APIConsumer, and the APIConsumer "+
@@ -820,15 +1034,32 @@ func (r *APIConsumerReconciler) hasNoLiveEntry(ctx context.Context, gwNS, name s
 // carry. 0 means the writer demonstrably holds every key that entry already accepts.
 func credentialsNotCovered(live map[string]any, rendered map[string]bool) int {
 	creds, _ := live["credentials"].([]any)
+	// Compared with the prefix stripped from BOTH sides. The rendered set is already
+	// prefixed, so a live entry stored bare could never be matched by any Secret content:
+	// `sk-x` renders as `Bearer sk-x`, and `Bearer sk-x` renders as the same thing, so the
+	// proof was impossible and the refusal told the operator to add a key they had already
+	// added. Possession of the key is the question here; how the entry spells it is not.
+	//
+	// Live entries do carry the prefix on these clusters (the gateway chart requires it), but
+	// a hand-written one need not, and ModelFleet's own checkAuth strips it for the same
+	// reason.
+	bare := make(map[string]bool, len(rendered))
+	for c := range rendered {
+		bare[strings.TrimPrefix(c, bearerPrefixValue)] = true
+	}
 	missing := 0
 	for _, c := range creds {
 		key, ok := c.(string)
-		if !ok || !rendered[key] {
+		if !ok || !bare[strings.TrimPrefix(key, bearerPrefixValue)] {
 			missing++
 		}
 	}
 	return missing
 }
+
+// bearerPrefixValue mirrors sink's prefix. Duplicated rather than exported, because the sink
+// owns how a credential is RENDERED and this is only about recognising one.
+const bearerPrefixValue = "Bearer "
 
 func liveCredentialCount(live map[string]any) int {
 	creds, _ := live["credentials"].([]any)
@@ -888,7 +1119,7 @@ func (r *KeyAuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Same path as an APIConsumer round, deliberately: it renders every APIConsumer for this
 	// gateway AND guarantees the consumers key exists. Re-deriving a smaller "just ensure the
 	// key" write here would be a second way to write one field.
-	if err := r.programGateway(ctx, req.Namespace, nil); err != nil {
+	if _, err := r.programGateway(ctx, req.Namespace, nil); err != nil {
 		if errors.Is(err, errGatewayAbsent) {
 			return ctrl.Result{}, nil // deleted again; the next create re-triggers this
 		}
@@ -909,4 +1140,20 @@ func (r *KeyAuthReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}))).
 		Named("keyauth").
 		Complete(r)
+}
+
+// credentialsReformatted: would adoption keep the same key but change how it is spelled? True
+// when a live credential lacks the prefix the rendered one carries.
+func credentialsReformatted(live map[string]any, rendered map[string]bool) bool {
+	creds, _ := live["credentials"].([]any)
+	for _, c := range creds {
+		key, ok := c.(string)
+		if !ok || strings.HasPrefix(key, bearerPrefixValue) {
+			continue
+		}
+		if rendered[bearerPrefixValue+key] {
+			return true
+		}
+	}
+	return false
 }

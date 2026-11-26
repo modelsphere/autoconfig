@@ -264,7 +264,7 @@ func TestConsumerRefusesToEmptyTheGateway(t *testing.T) {
 	r, c := newConsumerReconciler(t,
 		keyAuthWith(liveConsumer("tenant-a", "sk-a"), liveConsumer("ops", "sk-ops")),
 	)
-	err := r.programGateway(context.Background(), "higress-system", nil)
+	_, err := r.programGateway(context.Background(), "higress-system", nil)
 	if err == nil {
 		t.Fatal("an empty consumer list was written over a live gateway")
 	}
@@ -441,7 +441,7 @@ func TestConsumerListFailureWritesNothing(t *testing.T) {
 		}).Build()
 	r := &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}
 
-	err := r.programGateway(context.Background(), "higress-system", nil)
+	_, err := r.programGateway(context.Background(), "higress-system", nil)
 	if err == nil {
 		t.Fatal("a failed list was treated as an empty consumer set")
 	}
@@ -540,7 +540,7 @@ func TestConsumerRefusesAnUnreadableLiveList(t *testing.T) {
 		credSecret("tenant-new-keys", map[string]string{"key": "sk-new"}),
 		keyAuthWith(map[string]any{"credentials": []any{"sk-x"}}), // no name
 	)
-	err := r.programGateway(context.Background(), "higress-system", nil)
+	_, err := r.programGateway(context.Background(), "higress-system", nil)
 	if err == nil || !strings.Contains(err.Error(), "no name") {
 		t.Fatalf("expected a refusal naming the problem, got %v", err)
 	}
@@ -881,7 +881,7 @@ func TestConsumerRefusesACredentialSharedWithAForeignEntry(t *testing.T) {
 		// The chart's entry, under a name no APIConsumer can take, with the same key.
 		keyAuthWith(liveConsumer("tenant_a", "Bearer sk-shared")),
 	)
-	err := r.programGateway(context.Background(), "higress-system", nil)
+	_, err := r.programGateway(context.Background(), "higress-system", nil)
 	if err == nil {
 		t.Fatal("wrote a list key-auth refuses to parse: every caller on the gateway would be denied")
 	}
@@ -1057,7 +1057,7 @@ func TestConsumerCannotTakeOverANameWithoutItsKey(t *testing.T) {
 		// The chart's entry, with the real key, managed by nobody.
 		keyAuthWith(liveConsumer("tenant-a", "Bearer sk-the-real-key")),
 	)
-	err := r.programGateway(context.Background(), "higress-system", nil)
+	_, err := r.programGateway(context.Background(), "higress-system", nil)
 	if err == nil {
 		t.Fatal("a foreign consumer name was taken over with a different key")
 	}
@@ -1086,7 +1086,7 @@ func TestConsumerCannotTakeOverANameWithoutItsKey(t *testing.T) {
 	if err := c.Update(context.Background(), sec); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
 		t.Fatalf("adoption with the existing key was refused: %v", err)
 	}
 	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-the-real-key" {
@@ -1108,7 +1108,7 @@ func TestConsumerBrokenNewObjectDoesNotFreezeTheGateway(t *testing.T) {
 		credSecret("tenant-a-keys", map[string]string{"key": "sk-rotated"}),
 		keyAuthManagedBy("tenant-a", liveConsumer("tenant-a", "Bearer sk-old")),
 	)
-	if err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
 		t.Fatalf("one never-programmed object blocked the whole round: %v", err)
 	}
 	// tenant-a's rotation went through...
@@ -1126,7 +1126,7 @@ func TestConsumerBrokenNewObjectDoesNotFreezeTheGateway(t *testing.T) {
 	if err := c.Delete(context.Background(), credSecret("tenant-a-keys", map[string]string{"key": "x"})); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.programGateway(context.Background(), "higress-system", nil); err == nil {
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err == nil {
 		t.Fatal("an unreadable Secret for a consumer that HAS a key did not fail the round")
 	}
 }
@@ -1276,4 +1276,112 @@ func TestKeyAuthEventForAMissingGatewayIsNotAnError(t *testing.T) {
 	if res.RequeueAfter != 0 {
 		t.Fatalf("requeued after %v for a gateway that does not exist", res.RequeueAfter)
 	}
+}
+
+// One new object that collides must not freeze consumer management for the whole gateway.
+// RenderConsumers refuses a colliding view set, and letting that error out of programGateway
+// meant nobody on the gateway could be added, rotated or REVOKED - including pulling a leaked
+// key - and a deletion in flight would retry to the revoke deadline and then release with the
+// key still live.
+func TestConsumerCollidingNewcomerDoesNotFreezeTheGateway(t *testing.T) {
+	serving := consumerFixture("tenant-a", "tenant-a-keys")
+	serving.Status.ConsumerName = "tenant-a"
+	serving.Status.AppliedGatewayNamespace = "higress-system"
+	// A newcomer in its own namespace, claiming the name that tenant-a is serving.
+	impostor := consumerFixture("team-x", "team-x-keys")
+	impostor.Namespace = "team-x"
+	impostor.Spec.ConsumerName = "tenant-a"
+	xsec := credSecret("team-x-keys", map[string]string{"key": "sk-x"})
+	xsec.Namespace = "team-x"
+	r, c := newConsumerReconciler(t, serving, impostor, xsec,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-rotated"}),
+		keyAuthManagedBy("tenant-a", liveConsumer("tenant-a", "Bearer sk-old")),
+	)
+	// tenant-a's rotation must go through despite the collision...
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatalf("the colliding newcomer froze the round: %v", err)
+	}
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-rotated" {
+		t.Fatalf("tenant-a credentials = %v, want the rotated key", got)
+	}
+	// ...and the newcomer learns why it is not in the gateway, on its own object.
+	if err := reconcileConsumer2(t, r, "team-x", "team-x"); err != nil {
+		t.Fatal(err)
+	}
+	var imp routingv1.APIConsumer
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "team-x", Name: "team-x"}, &imp); err != nil {
+		t.Fatal(err)
+	}
+	if condTrue(imp.Status.Conditions, condProgrammed) {
+		t.Fatal("the newcomer reports Programmed although it was left out")
+	}
+	msg := consumerCondMessage(imp.Status.Conditions, condProgrammed)
+	for _, want := range []string{"tenant-a", "llm-route/tenant-a", "left out"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the message does not say what happened (%s missing): %q", want, msg)
+		}
+	}
+	// The impostor's key is not in the gateway.
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Contains(strings.Join(got, ","), "sk-x") {
+		t.Fatalf("the newcomer's key reached the gateway: %v", got)
+	}
+}
+
+// Two claimants and nobody serving the name yet: neither gets it. Letting the first win would
+// arbitrate "who is tenant-a" by list order, and nobody loses access by refusing, because
+// nobody had the name.
+func TestConsumerTwoNewcomersGetNeitherTheName(t *testing.T) {
+	a := consumerFixture("team-a", "a-keys")
+	a.Spec.ConsumerName = "shared"
+	b := consumerFixture("team-b", "b-keys")
+	b.Spec.ConsumerName = "shared"
+	r, c := newConsumerReconciler(t, a, b,
+		credSecret("a-keys", map[string]string{"key": "sk-a"}),
+		credSecret("b-keys", map[string]string{"key": "sk-b"}),
+		keyAuthWith(),
+	)
+	if err := reconcileConsumer(t, r, "team-a"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(gatewayConsumers(t, c, "higress-system")); n != 0 {
+		t.Fatalf("%d consumer(s) written: one of two disputed claims was granted", n)
+	}
+	var first routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "team-a"}, &first)
+	if condTrue(first.Status.Conditions, condProgrammed) {
+		t.Fatal("a disputed name was granted")
+	}
+	if msg := consumerCondMessage(first.Status.Conditions, condProgrammed); !strings.Contains(msg, "team-b") {
+		t.Fatalf("the other claimant is not named: %q", msg)
+	}
+}
+
+// A live entry whose credential is stored WITHOUT the Bearer prefix must still be adoptable by
+// whoever holds that key. The rendered side is always prefixed, so comparing verbatim made the
+// proof impossible - no Secret content could satisfy it - while the refusal told the operator
+// to add a key they had already added.
+func TestConsumerAdoptsAnEntryStoredWithoutThePrefix(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-bare"}),
+		// Written by hand, or by something that did not add the prefix.
+		keyAuthWith(liveConsumer("tenant-a", "sk-bare")),
+	)
+	if _, err := r.programGateway(context.Background(), "higress-system", nil); err != nil {
+		t.Fatalf("adoption refused although the Secret holds that very key: %v", err)
+	}
+	// Adopted, and now rendered in the form key_auth actually compares against.
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-bare" {
+		t.Fatalf("credentials = %v, want the prefixed form", got)
+	}
+}
+
+// reconcileConsumer2: reconcile an object outside the default namespace.
+func reconcileConsumer2(t *testing.T, r *APIConsumerReconciler, ns, name string) error {
+	t.Helper()
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: ns, Name: name},
+	})
+	return err
 }
