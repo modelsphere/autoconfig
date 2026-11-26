@@ -3,6 +3,7 @@ package sink
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // KeyAuthConsumer is one entry of key-auth's defaultConfig.consumers: a caller, the
@@ -26,7 +27,12 @@ type KeyAuthConsumer struct {
 // credentialHeader is where every consumer's credential is read from. Fixed rather than a CRD
 // field: it is what the chart renders for every consumer today, and a per-consumer choice is
 // a thing to add when something actually needs it, not before.
-const credentialHeader = "Authorization"
+const (
+	credentialHeader = "Authorization"
+	// What key_auth compares against is the whole header value, so the credential it is
+	// configured with has to include this.
+	bearerPrefix = "Bearer "
+)
 
 // ConsumerView is one APIConsumer flattened for rendering: the name it claims and the keys
 // read out of its Secret.
@@ -53,6 +59,11 @@ type ConsumerView struct {
 func RenderConsumers(views []ConsumerView) ([]KeyAuthConsumer, error) {
 	out := make([]KeyAuthConsumer, 0, len(views))
 	seen := map[string]string{}
+	// Which consumer claims which credential. One value under two consumers is not "one of
+	// them wins": key_auth logs `duplicate consumer credential` and returns false, the whole
+	// defaultConfig fails to parse, and the plugin is FAIL_CLOSE - so two tenants sharing a
+	// key takes the entire gateway down, every route, every caller.
+	credOwner := map[string]string{}
 	for _, v := range views {
 		if v.Name == "" {
 			return nil, fmt.Errorf("%s: empty consumer name", v.Source)
@@ -67,7 +78,31 @@ func RenderConsumers(views []ConsumerView) ([]KeyAuthConsumer, error) {
 			return nil, fmt.Errorf("consumer name %q is claimed by both %s and %s", v.Name, prev, v.Source)
 		}
 		seen[v.Name] = v.Source
-		creds := append([]string(nil), v.Credentials...)
+		creds := make([]string, 0, len(v.Credentials))
+		for i, c := range v.Credentials {
+			// The credential has to be the ENTIRE Authorization header value, because that
+			// is what is compared: extractCredential returns header->toString() verbatim -
+			// no prefix stripped, nothing trimmed - and the lookup into the credentials set
+			// is exact. A bare key would therefore 401 every standard client (which all send
+			// `Authorization: Bearer <key>`) while the CR reports it was programmed.
+			//
+			// The Secret holds the key itself, in openresty's key-file format, so the prefix
+			// is added here; one that already carries it is left alone rather than doubled.
+			if !strings.HasPrefix(c, bearerPrefix) {
+				c = bearerPrefix + c
+			}
+			if prev, dup := credOwner[c]; dup {
+				// The credential is NOT in this message. A rendering error surfaces on the
+				// CR, in logs, and in whatever collects them; a key does not belong in any
+				// of those. The position identifies it well enough to fix.
+				return nil, fmt.Errorf("consumer %q (%s) shares credential #%d with consumer "+
+					"%s: key-auth refuses a duplicate credential and fails to parse its whole "+
+					"configuration, which denies every caller on every route - give each "+
+					"consumer its own key", v.Name, v.Source, i+1, prev)
+			}
+			credOwner[c] = fmt.Sprintf("%q (%s)", v.Name, v.Source)
+			creds = append(creds, c)
+		}
 		sort.Strings(creds)
 		out = append(out, KeyAuthConsumer{
 			Name:        v.Name,

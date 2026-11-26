@@ -136,9 +136,12 @@ func TestConsumerIsProgrammedIntoTheGateway(t *testing.T) {
 	if n, _, _ := unstructured.NestedString(got, "name"); n != "tenant-a" {
 		t.Fatalf("name = %q", n)
 	}
+	// With the Bearer prefix, because that is what key_auth compares against: it takes the
+	// WHOLE Authorization header value and looks it up exactly. A bare key here would 401
+	// every standard client while this CR reported success.
 	creds, _, _ := unstructured.NestedStringSlice(got, "credentials")
-	if len(creds) != 1 || creds[0] != "sk-tenant-a" {
-		t.Fatalf("credentials = %v", creds)
+	if len(creds) != 1 || creds[0] != "Bearer sk-tenant-a" {
+		t.Fatalf("credentials = %v, want the key with the Bearer prefix", creds)
 	}
 	// The extraction config the plugin needs, which nothing else in Go checks.
 	keys, _, _ := unstructured.NestedStringSlice(got, "keys")
@@ -178,8 +181,8 @@ func TestConsumerAcceptsEveryKeyInTheSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	creds, _, _ := unstructured.NestedStringSlice(gatewayConsumers(t, c, "higress-system")[0].(map[string]any), "credentials")
-	if len(creds) != 2 || creds[0] != "sk-new" || creds[1] != "sk-old" {
-		t.Fatalf("credentials = %v, want both keys, sorted", creds)
+	if len(creds) != 2 || creds[0] != "Bearer sk-new" || creds[1] != "Bearer sk-old" {
+		t.Fatalf("credentials = %v, want both keys with the Bearer prefix, sorted", creds)
 	}
 }
 
