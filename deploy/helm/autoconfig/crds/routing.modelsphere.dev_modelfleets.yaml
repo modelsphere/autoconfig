@@ -573,6 +573,7 @@ spec:
                       - Ready
                       - Degraded
                       - NotFound
+                      - Disabled
                       type: string
                     readyReplicas:
                       description: 'ReadyReplicas: ready backends behind the referenced

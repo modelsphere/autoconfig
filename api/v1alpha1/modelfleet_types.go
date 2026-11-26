@@ -313,7 +313,7 @@ type TotalCapacity struct {
 }
 
 // MemberPhase is a member's routing state.
-// +kubebuilder:validation:Enum=Ready;Degraded;NotFound
+// +kubebuilder:validation:Enum=Ready;Degraded;NotFound;Disabled
 type MemberPhase string
 
 const (
