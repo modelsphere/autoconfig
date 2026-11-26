@@ -1584,3 +1584,77 @@ func isWasmPlugin(obj client.Object) bool {
 	u, ok := obj.(*unstructured.Unstructured)
 	return ok && u.GetObjectKind().GroupVersionKind() == wasmPluginGVK
 }
+
+// The sweep must not write to a key-auth in a namespace nothing in this cluster points at.
+// Adding `consumers: []` there means acting on an object nobody pointed this controller at -
+// another team's Higress in their own namespace - and taking SSA ownership of a field on it.
+func TestGatewaySweepLeavesForeignGatewaysAlone(t *testing.T) {
+	foreign := keyAuthWithoutConsumers()
+	foreign.SetNamespace("someone-elses-higress")
+	r, c := newConsumerReconciler(t, foreign)
+	r.ensureGateways(context.Background())
+
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "someone-elses-higress", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers"); found {
+		t.Fatal("wrote to a gateway nothing in this cluster points at")
+	}
+
+	// ...but it does act once something names it.
+	cons := consumerFixture("tenant-a", "tenant-a-keys")
+	cons.Spec.Gateway.Namespace = "someone-elses-higress"
+	if err := c.Create(context.Background(), cons); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(context.Background(), credSecret("tenant-a-keys",
+		map[string]string{"key": "sk-a"})); err != nil {
+		t.Fatal(err)
+	}
+	r.ensureGateways(context.Background())
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "someone-elses-higress", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers"); !found {
+		t.Fatal("did not write to a gateway an APIConsumer names")
+	}
+}
+
+// A key-auth configured the OTHER way key_auth allows - a top-level `credentials` list and no
+// consumers - must not have `consumers` added to it: the plugin refuses a config carrying
+// both, so the write would take that gateway down. And such a gateway is, by definition, not
+// one autoconfig set up.
+func TestConsumerRefusesAKeyAuthUsingTopLevelCredentials(t *testing.T) {
+	other := wasmPlugin("key-auth")
+	_ = unstructured.SetNestedStringSlice(other.Object, []string{"sk-theirs"},
+		"spec", "defaultConfig", "credentials")
+	_ = unstructured.SetNestedStringSlice(other.Object, []string{"x-api-key"},
+		"spec", "defaultConfig", "keys")
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		other,
+	)
+	_, err := r.programGateway(context.Background(), "higress-system", nil)
+	if err == nil {
+		t.Fatal("wrote consumers into a key-auth that uses top-level credentials: the plugin " +
+			"refuses a config carrying both, so that gateway would stop answering")
+	}
+	if !strings.Contains(err.Error(), "credentials") {
+		t.Fatalf("the error does not explain what is wrong: %v", err)
+	}
+	// Their config is untouched.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers"); found {
+		t.Fatal("consumers was added anyway")
+	}
+}

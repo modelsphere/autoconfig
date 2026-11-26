@@ -553,6 +553,24 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		if err != nil {
 			return fmt.Errorf("read defaultConfig.consumers: %w", err)
 		}
+		// Never alongside a top-level `credentials`. key_auth accepts consumers OR
+		// credentials and refuses a config carrying both ("cannot appear at the same
+		// level"), so adding consumers to a key-auth configured the credentials way would
+		// take that gateway down - and that gateway is then, by definition, not one this
+		// controller set up. Leaving it alone is the only safe answer; a round that has
+		// something of its own to write there says so instead of writing it.
+		if _, hasCreds, _ := unstructured.NestedFieldNoCopy(obj.Object,
+			"spec", "defaultConfig", "credentials"); hasCreds {
+			if len(consumers) == 0 {
+				return nil // nothing of ours to write there anyway
+			}
+			return fmt.Errorf("%s/key-auth configures its credentials with a top-level "+
+				"`credentials` list, not `consumers`. key_auth refuses a config carrying "+
+				"both, so writing the consumer list would take that gateway down; nothing "+
+				"was written. This gateway was not set up by autoconfig - point these "+
+				"APIConsumers at one that is", gwNS)
+		}
+
 		// Take ownership of the field before writing it, if it is not ours yet.
 		//
 		// Why the write cannot be left to do it: a non-apply Update only takes ownership of
@@ -1300,9 +1318,23 @@ func (r *APIConsumerReconciler) ensureGateways(ctx context.Context) {
 		log.V(1).Info("could not list WasmPlugins for the gateway sweep", "err", err.Error())
 		return
 	}
+	wanted, err := r.gatewayNamespacesInUse(ctx)
+	if err != nil {
+		log.V(1).Info("could not work out which gateways are ours", "err", err.Error())
+		return
+	}
 	for i := range list.Items {
 		o := &list.Items[i]
 		if o.GetName() != "key-auth" {
+			continue
+		}
+		// Only gateways something in this cluster points at. Writing to every key-auth
+		// anywhere would mean adding `consumers: []` to a Higress that another team runs in
+		// their own namespace, and taking SSA ownership of that field on it - acting on an
+		// object nobody pointed this controller at. A namespace no APIConsumer and no
+		// ModelFleet names has no routes from us either, so there is nothing of ours to keep
+		// working there.
+		if !wanted[o.GetNamespace()] {
 			continue
 		}
 		if _, err := r.programGateway(ctx, o.GetNamespace(), nil); err != nil &&
@@ -1329,4 +1361,43 @@ func (r *APIConsumerReconciler) StartGatewaySweep(ctx context.Context) error {
 			r.ensureGateways(ctx)
 		}
 	}
+}
+
+// gatewayNamespacesInUse: the gateway namespaces something in this cluster points at - every
+// APIConsumer's spec.gateway.namespace, and every ModelFleet's. The fleets count because they
+// are what puts match rules on a gateway: a gateway serving a fleet's route needs its
+// consumers key even if no APIConsumer has been created yet, which is the fresh-install case
+// the sweep exists for.
+//
+// A missing ModelFleet CRD is not an error here: that reconciler is optional and this is only
+// deciding which gateways to touch.
+func (r *APIConsumerReconciler) gatewayNamespacesInUse(ctx context.Context) (map[string]bool, error) {
+	out := map[string]bool{}
+	var consumers routingv1.APIConsumerList
+	if err := r.List(ctx, &consumers); err != nil {
+		return nil, fmt.Errorf("list APIConsumers: %w", err)
+	}
+	for i := range consumers.Items {
+		out[consumerGatewayNamespace(&consumers.Items[i])] = true
+	}
+	var fleets routingv1.ModelFleetList
+	if err := r.List(ctx, &fleets); err != nil {
+		if !isAbsent(err) {
+			return nil, fmt.Errorf("list ModelFleets: %w", err)
+		}
+	}
+	for i := range fleets.Items {
+		if ns := fleets.Items[i].Spec.Gateway.Namespace; ns != "" {
+			out[ns] = true
+		}
+	}
+	// The default gateway namespace, always. It is where the gateway chart installs, and on
+	// a fresh install nothing names it yet - no APIConsumer, no fleet - while key-auth's
+	// defaultConfig is already active (defaultConfigDisable is false) and therefore already
+	// has to parse. That is the case the sweep exists for, and restricting the sweep to
+	// named namespaces without this killed it: both sweep tests went red, which is how I
+	// found out rather than by reasoning.
+	out[defaultGatewayNamespace] = true
+	delete(out, "")
+	return out, nil
 }
