@@ -1,0 +1,28 @@
+# One caller of the gateway, with its keys in a Secret.
+#
+# Adding a tenant is this object plus a Secret - no helm release, no values file. Rotating a
+# key is adding a second value to the Secret, waiting for the caller to move over, then
+# removing the old one: every value in the Secret is accepted, so there is no window where
+# neither key works.
+#
+#   kubectl -n llm-route create secret generic tenant-a-keys --from-literal=current=sk-xxxx
+#   kubectl apply -f apiconsumer-tenant-a.yaml
+#   kubectl -n llm-route get apiconsumer          # Programmed=True once the gateway has it
+#
+# A fleet then lets this consumer in by name:
+#
+#   spec.gateway.authConsumers: [tenant-a]
+#
+# ⚠ The keys end up in plain text inside the key-auth WasmPlugin: its config is a blob pushed
+# to the data plane over ECDS and the plugin cannot read a Secret itself. This gives one
+# source of truth, online rotation and no release to add a tenant - not secrecy.
+apiVersion: routing.modelsphere.dev/v1alpha1
+kind: APIConsumer
+metadata:
+  name: tenant-a
+  namespace: llm-route
+spec:
+  # consumerName: tenant-a     # defaults to metadata.name; what authConsumers references
+  gateway:
+    namespace: higress-system  # where the key-auth WasmPlugin lives
+  credentialsSecretRef: tenant-a-keys   # a Secret in THIS namespace; every value is a key

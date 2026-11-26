@@ -1,0 +1,218 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.4
+  name: apiconsumers.routing.modelsphere.dev
+spec:
+  group: routing.modelsphere.dev
+  names:
+    kind: APIConsumer
+    listKind: APIConsumerList
+    plural: apiconsumers
+    shortNames:
+    - apicon
+    singular: apiconsumer
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.consumerName
+      name: Consumer
+      type: string
+    - jsonPath: .status.credentials
+      name: Keys
+      type: integer
+    - jsonPath: .status.appliedGatewayNamespace
+      name: Gateway
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Programmed")].status
+      name: Programmed
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          APIConsumer is one caller of the gateway: a name and a set of API keys.
+
+          It exists so that adding, rotating or removing a key is an object write rather than a helm
+          release. Today consumers and their keys are rendered into key-auth's defaultConfig by the
+          gateway chart, which means every new tenant is a change to a values file and a deploy.
+
+          Why a separate kind rather than a field on ModelFleet: key-auth's `allow` (who may call
+          THIS route) is per route and belongs to the fleet, but `consumers` (who exists at all, and
+          with which keys) is one list for the whole gateway. Putting it on ModelFleet would have N
+          fleets writing one field — the matchRules problem again, and worse, because defaultConfig
+          is an opaque blob with no per-entry ownership under Server-Side Apply.
+
+          ⚠ What this does NOT give you: secrecy. key-auth's config is a blob pushed to the data
+          plane over ECDS, and the plugin cannot read a Secret itself, so the keys still end up in
+          plain text inside the WasmPlugin object. Anyone who can read WasmPlugins in the gateway
+          namespace can read every key. What it gives you is one source of truth, online rotation,
+          and no release to add a tenant.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: APIConsumerSpec names one caller of the gateway and where
+              its credentials live.
+            properties:
+              consumerName:
+                description: |-
+                  ConsumerName is what a route's ModelFleet names in gateway.authConsumers, and what
+                  appears in the gateway's access log as x-mse-consumer. Defaults to metadata.name.
+
+                  Separate from the object's name because consumer names are a gateway-wide namespace
+                  shared with whatever the chart still renders, while object names are per Kubernetes
+                  namespace: two teams could otherwise collide without either of them being able to see
+                  it. The reconciler refuses a duplicate rather than letting one silently win.
+                maxLength: 63
+                type: string
+              credentialsSecretRef:
+                description: |-
+                  CredentialsSecretRef: a Secret in this object's namespace holding this consumer's API
+                  keys — EVERY value in it becomes an accepted credential, so a rotation is "add the new
+                  key, let both work, remove the old one" with no window where neither does.
+
+                  Only the fleet's own namespace, and only a Secret: the controller holds a cluster-wide
+                  `secrets: get`, so a ref that could name any namespace would turn "can write an
+                  APIConsumer here" into "can read every Secret in the cluster".
+                maxLength: 253
+                minLength: 1
+                type: string
+              gateway:
+                description: 'Gateway: which gateway''s consumer list this belongs
+                  in.'
+                properties:
+                  namespace:
+                    description: |-
+                      Namespace holding the gateway's key-auth WasmPlugin. Defaults to higress-system, and
+                      must be the namespace the gateway chart installs into — the same field, with the same
+                      meaning, as ModelFleet's gateway.namespace.
+
+                      It is also the grouping key: every APIConsumer naming one namespace is rendered into
+                      that one plugin's consumer list, in one write.
+                    minLength: 1
+                    type: string
+                type: object
+            required:
+            - credentialsSecretRef
+            type: object
+          status:
+            description: APIConsumerStatus is what the console reads to answer "is
+              this key live yet".
+            properties:
+              appliedGatewayNamespace:
+                description: |-
+                  AppliedGatewayNamespace: the gateway this consumer was last programmed into. Moving
+                  spec.gateway.namespace otherwise leaves the old gateway accepting these credentials
+                  forever, with nothing in the object pointing at it.
+                type: string
+              conditions:
+                description: 'Conditions: Programmed (the gateway carries this consumer''s
+                  credentials).'
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              consumerName:
+                description: ConsumerName actually programmed, with the default expanded.
+                type: string
+              credentials:
+                description: |-
+                  Credentials: how many keys this consumer currently has. The keys themselves are never
+                  copied here — status is world-readable to anyone who can read the CR, and the point of
+                  the Secret is that the key lives in one place. Two during a rotation, one otherwise.
+                format: int32
+                type: integer
+              lastSyncTime:
+                description: |-
+                  LastSyncTime: when this object was last reconciled, including rounds that wrote
+                  nothing. "Is the controller still looking at this", not "when did the gateway change".
+                format: date-time
+                type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration: equal to metadata.generation once this consumer is programmed into
+                  the gateway. Only advanced on a successful write, so it never claims a key is live
+                  while the plugin still carries the old list.
+                format: int64
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

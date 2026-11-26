@@ -1,0 +1,416 @@
+package controller
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	routingv1 "autoconfig/api/v1alpha1"
+)
+
+func consumerFixture(name, secret string) *routingv1.APIConsumer {
+	return &routingv1.APIConsumer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "llm-route", Generation: 1,
+			Finalizers: []string{consumerFinalizer},
+		},
+		Spec: routingv1.APIConsumerSpec{
+			Gateway:              routingv1.ConsumerGateway{Namespace: "higress-system"},
+			CredentialsSecretRef: secret,
+		},
+	}
+}
+
+func credSecret(name string, keys map[string]string) *corev1.Secret {
+	data := map[string][]byte{}
+	for k, v := range keys {
+		data[k] = []byte(v)
+	}
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "llm-route"},
+		Data:       data,
+	}
+}
+
+// keyAuthWith builds the gateway's key-auth plugin with an existing consumer list, the way
+// the chart leaves it.
+func keyAuthWith(consumers ...map[string]any) *unstructured.Unstructured {
+	o := wasmPlugin("key-auth")
+	list := make([]any, 0, len(consumers))
+	for _, c := range consumers {
+		list = append(list, c)
+	}
+	_ = unstructured.SetNestedSlice(o.Object, list, "spec", "defaultConfig", "consumers")
+	_ = unstructured.SetNestedField(o.Object, false, "spec", "defaultConfig", "global_auth")
+	_ = unstructured.SetNestedStringSlice(o.Object, []string{"x-higress-dummy-key"}, "spec", "defaultConfig", "keys")
+	return o
+}
+
+func liveConsumer(name string, creds ...string) map[string]any {
+	cs := make([]any, 0, len(creds))
+	for _, c := range creds {
+		cs = append(cs, c)
+	}
+	return map[string]any{
+		"name": name, "credentials": cs, "keys": []any{"Authorization"},
+		"in_header": true, "in_query": false,
+	}
+}
+
+func newConsumerReconciler(t *testing.T, objs ...client.Object) (*APIConsumerReconciler, client.Client) {
+	t.Helper()
+	s := fleetScheme(t)
+	c := ctrlfake.NewClientBuilder().WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&routingv1.APIConsumer{}).
+		Build()
+	return &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}, c
+}
+
+func reconcileConsumer(t *testing.T, r *APIConsumerReconciler, name string) error {
+	t.Helper()
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "llm-route", Name: name},
+	})
+	return err
+}
+
+func gatewayConsumers(t *testing.T, c client.Client, ns string) []any {
+	t.Helper()
+	o := &unstructured.Unstructured{}
+	o.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "key-auth"}, o); err != nil {
+		t.Fatalf("get key-auth in %s: %v", ns, err)
+	}
+	list, _, _ := unstructured.NestedSlice(o.Object, "spec", "defaultConfig", "consumers")
+	return list
+}
+
+func consumerNames(list []any) []string {
+	var out []string
+	for _, c := range list {
+		n, _, _ := unstructured.NestedString(c.(map[string]any), "name")
+		out = append(out, n)
+	}
+	return out
+}
+
+// The ordinary case: a consumer with a Secret is programmed into the gateway, in the shape
+// key-auth reads, and status says how many keys it has without ever carrying one.
+func TestConsumerIsProgrammedIntoTheGateway(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-tenant-a"}),
+		keyAuthWith(),
+	)
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	list := gatewayConsumers(t, c, "higress-system")
+	if len(list) != 1 {
+		t.Fatalf("consumers = %v, want one", consumerNames(list))
+	}
+	got := list[0].(map[string]any)
+	if n, _, _ := unstructured.NestedString(got, "name"); n != "tenant-a" {
+		t.Fatalf("name = %q", n)
+	}
+	creds, _, _ := unstructured.NestedStringSlice(got, "credentials")
+	if len(creds) != 1 || creds[0] != "sk-tenant-a" {
+		t.Fatalf("credentials = %v", creds)
+	}
+	// The extraction config the plugin needs, which nothing else in Go checks.
+	keys, _, _ := unstructured.NestedStringSlice(got, "keys")
+	inHeader, _, _ := unstructured.NestedBool(got, "in_header")
+	inQuery, _, _ := unstructured.NestedBool(got, "in_query")
+	if len(keys) != 1 || keys[0] != "Authorization" || !inHeader || inQuery {
+		t.Fatalf("extraction config = keys:%v in_header:%v in_query:%v", keys, inHeader, inQuery)
+	}
+
+	var con routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}, &con)
+	if !condTrue(con.Status.Conditions, condProgrammed) {
+		t.Fatalf("not programmed: %+v", con.Status.Conditions)
+	}
+	if con.Status.Credentials != 1 || con.Status.ConsumerName != "tenant-a" {
+		t.Fatalf("status = %+v", con.Status)
+	}
+	if con.Status.ObservedGeneration != con.Generation {
+		t.Fatalf("observedGeneration = %d, want %d", con.Status.ObservedGeneration, con.Generation)
+	}
+	// The key itself must not be anywhere in status: the whole point of the Secret is that it
+	// lives in one place, and status is readable by anyone who can read the CR.
+	if strings.Contains(strings.ToLower(con.Status.ConsumerName+con.Status.AppliedGatewayNamespace), "sk-") {
+		t.Fatal("a credential leaked into status")
+	}
+}
+
+// Every value in the Secret is accepted, which is what makes a rotation possible: add the new
+// key, let both work, remove the old one. No window where neither does.
+func TestConsumerAcceptsEveryKeyInTheSecret(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("ops", "ops-keys"),
+		credSecret("ops-keys", map[string]string{"current": "sk-new", "previous": "sk-old"}),
+		keyAuthWith(),
+	)
+	if err := reconcileConsumer(t, r, "ops"); err != nil {
+		t.Fatal(err)
+	}
+	creds, _, _ := unstructured.NestedStringSlice(gatewayConsumers(t, c, "higress-system")[0].(map[string]any), "credentials")
+	if len(creds) != 2 || creds[0] != "sk-new" || creds[1] != "sk-old" {
+		t.Fatalf("credentials = %v, want both keys, sorted", creds)
+	}
+}
+
+// THE guard. An unreadable Secret must not quietly drop that consumer from the list: a
+// consumer missing from key-auth is a caller that gets 401 on its next request. The gateway
+// keeps its last good list and the failure is reported.
+func TestConsumerUnreadableSecretDoesNotRevokeAnyone(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		consumerFixture("tenant-b", "missing-secret"), // Secret does not exist
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-tenant-a"}),
+		keyAuthWith(liveConsumer("tenant-a", "sk-tenant-a"), liveConsumer("tenant-b", "sk-tenant-b")),
+	)
+	// Reconciling the healthy one must not publish a list that drops the broken one. The
+	// round reports the failure on the object and requeues rather than returning an error -
+	// returning one would hot-loop on a Secret that may be minutes from existing.
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var healthy routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}, &healthy)
+	if condTrue(healthy.Status.Conditions, condProgrammed) {
+		t.Fatal("the round reported success although one consumer could not be resolved")
+	}
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if len(names) != 2 {
+		t.Fatalf("the live consumer list was rewritten to %v - someone's key just stopped working", names)
+	}
+}
+
+// The single most dangerous write this controller can make: an empty consumer list means
+// every caller is refused on every route. It can only come from a bug or a half-finished
+// migration, never from intent.
+func TestConsumerRefusesToEmptyTheGateway(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		keyAuthWith(liveConsumer("tenant-a", "sk-a"), liveConsumer("ops", "sk-ops")),
+	)
+	err := r.programGateway(context.Background(), "higress-system", nil)
+	if err == nil {
+		t.Fatal("an empty consumer list was written over a live gateway")
+	}
+	if !strings.Contains(err.Error(), "deny every caller") {
+		t.Fatalf("the error does not say what would have happened: %v", err)
+	}
+	if n := len(gatewayConsumers(t, c, "higress-system")); n != 2 {
+		t.Fatalf("live consumers = %d, want both still there", n)
+	}
+}
+
+// Deleting an APIConsumer has to actually revoke the key, and that happens while the object
+// still exists - under its finalizer - because afterwards nothing remembers the credential
+// was ever accepted.
+func TestConsumerDeleteRevokesTheKey(t *testing.T) {
+	now := metav1.Now()
+	doomed := consumerFixture("tenant-b", "tenant-b-keys")
+	doomed.DeletionTimestamp = &now
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		doomed,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		credSecret("tenant-b-keys", map[string]string{"key": "sk-b"}),
+		keyAuthWith(liveConsumer("tenant-a", "sk-a"), liveConsumer("tenant-b", "sk-b")),
+	)
+	if err := reconcileConsumer(t, r, "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if len(names) != 1 || names[0] != "tenant-a" {
+		t.Fatalf("consumers = %v, want only tenant-a", names)
+	}
+	var con routingv1.APIConsumer
+	err := c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-b"}, &con)
+	if err == nil && len(con.Finalizers) > 0 {
+		t.Fatalf("finalizer still on the deleted object: %v", con.Finalizers)
+	}
+}
+
+// Every write here is an ECDS push of key-auth to the whole data plane, and the console calls
+// this on every key edit. An unchanged list must produce no write at all.
+func TestConsumerUnchangedListIsNotRewritten(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		keyAuthWith(),
+	)
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	before := resourceVersionOf(t, c, "key-auth")
+	for i := 0; i < 3; i++ {
+		if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := resourceVersionOf(t, c, "key-auth"); after != before {
+		t.Fatalf("key-auth rewritten with nothing changed: %s -> %s (an ECDS push per resync)", before, after)
+	}
+}
+
+// Two objects claiming one consumer name would each render an entry and the plugin would take
+// one of them, with no way to tell which. Both names are reported rather than one silently
+// winning.
+func TestConsumerDuplicateNameIsRefused(t *testing.T) {
+	a := consumerFixture("team-a", "a-keys")
+	a.Spec.ConsumerName = "shared"
+	b := consumerFixture("team-b", "b-keys")
+	b.Spec.ConsumerName = "shared"
+	r, c := newConsumerReconciler(t, a, b,
+		credSecret("a-keys", map[string]string{"key": "sk-a"}),
+		credSecret("b-keys", map[string]string{"key": "sk-b"}),
+		keyAuthWith(),
+	)
+	if err := reconcileConsumer(t, r, "team-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var first routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "team-a"}, &first)
+	if condTrue(first.Status.Conditions, condProgrammed) {
+		t.Fatal("two objects were allowed to claim one consumer name")
+	}
+	if !strings.Contains(condMessage(first.Status.Conditions, condProgrammed), "team-b") {
+		t.Fatalf("the other claimant is not named: %q", condMessage(first.Status.Conditions, condProgrammed))
+	}
+	if n := len(gatewayConsumers(t, c, "higress-system")); n != 0 {
+		t.Fatalf("something was written anyway: %d consumers", n)
+	}
+}
+
+// credentialsSecretRef is a bare name on purpose: this controller holds a cluster-wide
+// `secrets: get`, so a ref that could name another namespace would turn "can write an
+// APIConsumer here" into "can read every Secret in the cluster".
+func TestConsumerSecretRefCannotLeaveTheNamespace(t *testing.T) {
+	bad := consumerFixture("tenant-a", "kube-system/stolen")
+	r, c := newConsumerReconciler(t, bad,
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "stolen", Namespace: "kube-system"},
+			Data: map[string][]byte{"key": []byte("sk-not-yours")}},
+		keyAuthWith(),
+	)
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var con routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}, &con)
+	if condTrue(con.Status.Conditions, condProgrammed) {
+		t.Fatal("a cross-namespace Secret ref was accepted")
+	}
+	for _, item := range gatewayConsumers(t, c, "higress-system") {
+		if strings.Contains(strings.ToLower(strings.Join(consumerNames([]any{item}), "")), "tenant-a") {
+			t.Fatal("the consumer was programmed from a Secret in another namespace")
+		}
+	}
+}
+
+// A Secret with no usable value is an error, not an entry with an empty credentials list: an
+// empty list is accepted by the plugin and then matches nothing, so that tenant gets 401 on
+// every request while the CR reports success.
+func TestConsumerEmptySecretIsAnError(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "empty-keys"),
+		credSecret("empty-keys", map[string]string{"key": "   "}),
+		keyAuthWith(),
+	)
+	_ = reconcileConsumer(t, r, "tenant-a")
+	var con routingv1.APIConsumer
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}, &con)
+	if condTrue(con.Status.Conditions, condProgrammed) {
+		t.Fatal("a consumer with no usable credential was reported as programmed")
+	}
+	if n := len(gatewayConsumers(t, c, "higress-system")); n != 0 {
+		t.Fatalf("an entry was written anyway: %d", n)
+	}
+}
+
+// Moving gateway.namespace has to take the credentials out of the gateway they used to be in,
+// or that gateway keeps accepting them forever with nothing in the object pointing at it.
+func TestConsumerMovingGatewayWithdrawsFromTheOldOne(t *testing.T) {
+	con := consumerFixture("tenant-a", "tenant-a-keys")
+	con.Status.AppliedGatewayNamespace = "higress-old"
+	r, c := newConsumerReconciler(t, con,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		keyAuthWith(),
+		keyAuthInNamespace("higress-old", liveConsumer("tenant-a", "sk-a")),
+	)
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(gatewayConsumers(t, c, "higress-system")); n != 1 {
+		t.Fatalf("new gateway has %d consumers, want 1", n)
+	}
+	if n := len(gatewayConsumers(t, c, "higress-old")); n != 0 {
+		t.Fatalf("the old gateway still accepts %d consumer(s)", n)
+	}
+}
+
+// A failed list must never be read as "there are no consumers": that renders an empty list,
+// and an empty list locks every caller out of every route.
+func TestConsumerListFailureWritesNothing(t *testing.T) {
+	s := fleetScheme(t)
+	c := ctrlfake.NewClientBuilder().WithScheme(s).
+		WithObjects(consumerFixture("tenant-a", "tenant-a-keys"),
+			credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+			keyAuthWith(liveConsumer("tenant-a", "sk-a"))).
+		WithStatusSubresource(&routingv1.APIConsumer{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*routingv1.APIConsumerList); ok {
+					return context.DeadlineExceeded
+				}
+				return cl.List(ctx, list, opts...)
+			},
+		}).Build()
+	r := &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}
+
+	err := r.programGateway(context.Background(), "higress-system", nil)
+	if err == nil {
+		t.Fatal("a failed list was treated as an empty consumer set")
+	}
+	// It has to fail AS a list failure. The empty-list guard would also stop this write, so
+	// an error alone proves nothing about the path taken - and that guard does not apply once
+	// this controller owns the gateway's list, which is the state every migrated cluster is
+	// in. Then only this check stands between a transient API error and a wiped consumer list.
+	if !strings.Contains(err.Error(), "list APIConsumers") {
+		t.Fatalf("the write was stopped by something other than the failed list: %v", err)
+	}
+	if n := len(gatewayConsumers(t, c, "higress-system")); n != 1 {
+		t.Fatalf("live consumers = %d, want the list untouched", n)
+	}
+}
+
+// keyAuthInNamespace: a second gateway, for the "moved to another namespace" case.
+func keyAuthInNamespace(ns string, consumers ...map[string]any) *unstructured.Unstructured {
+	o := keyAuthWith(consumers...)
+	o.SetNamespace(ns)
+	return o
+}
+
+// condMessage: a condition's message, for tests that check the failure NAMES what went wrong
+// rather than just that something did.
+func condMessage(conds []metav1.Condition, typ string) string {
+	for i := range conds {
+		if conds[i].Type == typ {
+			return conds[i].Message
+		}
+	}
+	return ""
+}
