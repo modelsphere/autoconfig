@@ -493,10 +493,15 @@ spec:
                 type: string
               lastSyncTime:
                 description: |-
-                  LastSyncTime: when this fleet was last reconciled — set on every pass, including the
-                  ones that failed before writing anything. It answers "is the controller still looking
-                  at this object", not "when did the gateway last change"; observedGeneration and
-                  GatewaySynced answer the latter.
+                  LastSyncTime: when this fleet's status was last written — on every pass that changed
+                  something, including the ones that failed before writing anything to the gateway, and
+                  otherwise once per resync interval as a heartbeat. It is NOT stamped on every pass:
+                  that write is an update event on this object, which the controller watches, so an
+                  unconditional stamp made each round trigger the next one.
+
+                  So a value a little older than the resync interval means "settled, nothing to say",
+                  not "stalled". It answers "is the controller still looking at this object", not "when
+                  did the gateway last change"; observedGeneration and GatewaySynced answer the latter.
                 format: date-time
                 type: string
               memberCount:

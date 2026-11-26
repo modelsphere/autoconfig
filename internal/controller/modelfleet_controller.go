@@ -1166,15 +1166,13 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 			return err
 		}
 		st := &fleet.Status
+		prev := st.DeepCopy()
 		if syncStatus == metav1.ConditionTrue {
 			// Only on success. observedGeneration == generation is THE convergence signal
 			// console and decision-gen poll; advancing it on a failed reconcile tells them
 			// the new split is live while nothing was written and the table is frozen.
 			st.ObservedGeneration = fleet.Generation
 		}
-		now := metav1.Now()
-		st.LastSyncTime = &now
-
 		if rend != nil {
 			st.ModelName = rend.modelName
 			st.DefaultMember = rend.defaultMember
@@ -1217,6 +1215,16 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 
 		ready, readyReason, readyMsg := fleetReadiness(st, syncStatus)
 		setCond(st, condReady, ready, readyReason, readyMsg, fleet.Generation)
+
+		// A settled fleet is not rewritten. The status write is an update event on the
+		// fleet, which this controller watches with no predicate, so stamping lastSyncTime
+		// unconditionally made every round enqueue the next one - measured on the test
+		// cluster as a status write about every 10s against a 30s resync.
+		if statusSettled(prev, st, fleetResyncEvery, prev.LastSyncTime) {
+			return nil
+		}
+		now := metav1.Now()
+		st.LastSyncTime = &now
 		return r.Status().Update(ctx, &fleet)
 	})
 	if err != nil && !apierrors.IsNotFound(err) {

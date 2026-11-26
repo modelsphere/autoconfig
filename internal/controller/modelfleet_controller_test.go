@@ -2523,3 +2523,63 @@ func TestFleetCapacityUnderCartUsesTheCartCeiling(t *testing.T) {
 		t.Fatalf("capacity = %d, want 0 (unknown) for a route with two backend ceilings", got)
 	}
 }
+
+// A settled fleet must not be rewritten on every pass. The status write is an update event on
+// the fleet, and this controller watches ModelFleet with no predicate, so stamping
+// lastSyncTime unconditionally made each round enqueue the next one - on the test cluster, a
+// status write about every 10s against a 30s resync.
+func TestFleetSettledStatusIsNotRewritten(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"))
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	version := func() string {
+		var f routingv1.ModelFleet
+		if err := c.Get(context.Background(), nn, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f.ResourceVersion
+	}
+	reconcileFleet(t, r)
+	settled := version()
+	for i := 0; i < 3; i++ {
+		reconcileFleet(t, r)
+	}
+	if v := version(); v != settled {
+		t.Fatalf("the fleet was rewritten with nothing to say (resourceVersion %s -> %s)", settled, v)
+	}
+
+	// A real change is still written...
+	var f routingv1.ModelFleet
+	if err := c.Get(context.Background(), nn, &f); err != nil {
+		t.Fatal(err)
+	}
+	f.Spec.Members[1].Disabled = true
+	f.Generation = 2
+	if err := c.Update(context.Background(), &f); err != nil {
+		t.Fatal(err)
+	}
+	before := version()
+	reconcileFleet(t, r)
+	if version() == before {
+		t.Fatal("a changed fleet did not update its status")
+	}
+
+	// ...and so is a stale heartbeat, so lastSyncTime does not freeze and read as a dead
+	// controller.
+	if err := c.Get(context.Background(), nn, &f); err != nil {
+		t.Fatal(err)
+	}
+	stale := metav1.NewTime(time.Now().Add(-2 * fleetResyncEvery))
+	f.Status.LastSyncTime = &stale
+	if err := c.Status().Update(context.Background(), &f); err != nil {
+		t.Fatal(err)
+	}
+	before = version()
+	reconcileFleet(t, r)
+	if version() == before {
+		t.Fatal("lastSyncTime was left stale")
+	}
+}
