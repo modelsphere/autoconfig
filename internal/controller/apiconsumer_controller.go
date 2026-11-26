@@ -78,14 +78,29 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// reconciler only ever sees the objects that exist, so after the finalizer is
 			// gone nothing would remember that this credential is still accepted. Deleting
 			// an APIConsumer has to actually revoke the key.
-			// Not trusting status.appliedGatewayNamespace alone to decide there is nothing
-			// to revoke, tempting as it is for an object that was never programmed: a round
-			// that wrote the credential and then failed to write its own status leaves the
-			// key live with no record of it, and skipping the withdrawal would strand that
-			// key in key-auth for good. The two cases this would have saved are already
-			// covered - a misspelled gateway namespace has no key-auth to Get, which is the
-			// absent sentinel and releases at once, and anything else gives up at the
-			// deadline.
+			// Is there anything to revoke at all? status.appliedGatewayNamespace alone is
+			// not enough to say no - a round that wrote the credential and then failed to
+			// write its own status leaves the key live with no record of it, and skipping
+			// the withdrawal would strand that key for good. But status says nothing AND
+			// the live list holds no entry under this consumer's name is conclusive: there
+			// is no credential of ours in that gateway, so there is nothing to take out.
+			//
+			// Without this, the first APIConsumer on a not-yet-migrated gateway - created
+			// with a typo'd secret ref, so never programmed - sat in Terminating for the
+			// full revoke deadline when someone deleted it to try again: the round renders
+			// zero consumers over a non-empty chart-rendered list, which the empty-list
+			// guard refuses every time, reporting that a key could not be withdrawn when
+			// none was ever granted.
+			if consumer.Status.AppliedGatewayNamespace == "" {
+				if absent, err := r.hasNoLiveEntry(ctx, gwNS, consumerName(&consumer)); err == nil && absent {
+					log.V(1).Info("nothing to revoke: never programmed and no entry in the gateway",
+						"gateway", gwNS, "consumer", consumerName(&consumer))
+					if err := r.patchConsumerFinalizer(ctx, &consumer, false); err != nil {
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{}, nil
+				}
+			}
 			for _, ns := range distinctNamespaces(gwNS, consumer.Status.AppliedGatewayNamespace) {
 				err := r.programGateway(ctx, ns, &consumer)
 				// A gateway that is GONE needs no rewrite, and neither does one whose CRD
@@ -104,7 +119,7 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "RevokeError",
 						fmt.Sprintf("could not take this consumer out of gateway %q: %v "+
 							"(still retrying; the object is held until this succeeds or "+
-							"%s has passed)", ns, err, consumerRevokeDeadline), 0, "")
+							"%s has passed)", ns, err, consumerRevokeDeadline), 0, "", "")
 					return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 				}
 				log.Error(err, "giving up on revoking a consumer; releasing the object anyway",
@@ -131,13 +146,13 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// reaches its NEW gateway - the one failure mode worse than a stale entry.
 		if err := r.programGateway(ctx, old, nil); err != nil && !errors.Is(err, errGatewayAbsent) {
 			r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "WithdrawError",
-				fmt.Sprintf("could not take this consumer out of its previous gateway %q: %v", old, err), 0, "")
+				fmt.Sprintf("could not take this consumer out of its previous gateway %q: %v", old, err), 0, "", "")
 			return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 		}
 	}
 
 	if err := r.programGateway(ctx, gwNS, nil); err != nil {
-		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "ProgramError", err.Error(), 0, "")
+		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "ProgramError", err.Error(), 0, "", "")
 		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 	}
 
@@ -146,13 +161,13 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		// Cannot happen: programGateway just read the same Secret successfully. Reported
 		// rather than ignored, because "cannot happen" and "is not checked" are different.
-		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "SecretError", err.Error(), 0, name)
+		r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionFalse, "SecretError", err.Error(), 0, name, "")
 		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 	}
 	log.V(1).Info("consumer programmed", "consumer", name, "gateway", gwNS, "credentials", len(creds))
 	r.setConsumerStatus(ctx, req.NamespacedName, metav1.ConditionTrue, "Programmed",
 		fmt.Sprintf("%d credential(s) accepted by the gateway in %s", len(creds), gwNS),
-		int32(len(creds)), name)
+		int32(len(creds)), name, gwNS)
 	return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
 }
 
@@ -179,10 +194,22 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	// still belongs to the chart". Both look like "zero objects want this gateway", and only
 	// one of them may empty a live list.
 	ownedBefore := false
+	// A second source of attribution, independent of the annotation on key-auth: the names
+	// APIConsumers themselves report having programmed into this gateway. The annotation is
+	// the only record for an object that is already gone, but it lives on an object we do
+	// not own - recreate or kubectl replace that WasmPlugin and it is lost. With only the
+	// annotation, deleting an APIConsumer after that would classify its own entry as
+	// somebody else's, carry it over, release the object without an error, and leave the
+	// revoked tenant's key working. Statuses cover every object that still exists, including
+	// the one being deleted.
+	claimed := map[string]bool{}
 	for i := range list.Items {
-		if list.Items[i].Status.AppliedGatewayNamespace == gwNS {
+		c := &list.Items[i]
+		if c.Status.AppliedGatewayNamespace == gwNS {
 			ownedBefore = true
-			break
+			if c.Status.ConsumerName != "" {
+				claimed[c.Status.ConsumerName] = true
+			}
 		}
 	}
 
@@ -219,12 +246,13 @@ func (r *APIConsumerReconciler) programGateway(ctx context.Context, gwNS string,
 	if err != nil {
 		return err
 	}
-	return r.writeConsumers(ctx, gwNS, consumers, ownedBefore)
+	return r.writeConsumers(ctx, gwNS, consumers, ownedBefore, claimed)
 }
 
 // writeConsumers replaces defaultConfig.consumers in the gateway's key-auth plugin, leaving
 // every other key in that config alone.
-func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string, consumers []sink.KeyAuthConsumer, ownedBefore bool) error {
+func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
+	consumers []sink.KeyAuthConsumer, ownedBefore bool, claimed map[string]bool) error {
 	log := logf.FromContext(ctx)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
@@ -325,13 +353,28 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 				return fmt.Errorf("%s/key-auth: a live consumer has no name; refusing to "+
 					"rewrite a list this controller cannot account for", gwNS)
 			}
-			if mine[name] || managed[name] {
+			if mine[name] || managed[name] || claimed[name] {
 				continue
 			}
 			foreign = append(foreign, name)
 			next = append(next, lc)
 		}
 		sortConsumerList(next)
+
+		// The duplicate-credential check has to run over the FINAL list, not only over the
+		// APIConsumers. sink.RenderConsumers refuses two APIConsumers sharing a key, but a
+		// carried-over entry is copied in verbatim and was never compared against ours - and
+		// key-auth does not care where a duplicate came from: it logs `duplicate consumer
+		// credential`, fails to parse the whole defaultConfig, and the plugin is FAIL_CLOSE,
+		// so every route on the gateway denies every caller.
+		//
+		// It is reachable on the documented migration path, not in theory: a chart entry
+		// whose name cannot be adopted (consumerName is pinned to a DNS label, and the
+		// chart's might not be one) gets a new APIConsumer carrying the SAME key, because
+		// the point is not to make the caller change anything. Both entries then exist.
+		if err := refuseDuplicateCredentials(gwNS, next); err != nil {
+			return err
+		}
 		// Unchanged AND already attributed: do not write. Every write here is an ECDS push
 		// of key-auth to the whole data plane, and the console calls this on every key edit.
 		//
@@ -412,8 +455,16 @@ func (r *APIConsumerReconciler) patchConsumerFinalizer(ctx context.Context, c *r
 	return r.Patch(ctx, c, client.MergeFrom(before))
 }
 
+// setConsumerStatus records the outcome of one round. appliedGateway is the namespace this
+// round actually programmed, passed in rather than re-read from the spec: the object is
+// re-Get here, and a spec edit that lands between the write and this status update would
+// otherwise record a gateway that was never programmed. The next round then compares
+// status.appliedGatewayNamespace against the new spec, finds them equal, and never withdraws
+// the credential from the gateway that really has it - the one failure this field exists to
+// prevent. Empty means "no gateway was programmed in this round", which leaves the recorded
+// one alone.
 func (r *APIConsumerReconciler) setConsumerStatus(ctx context.Context, nn types.NamespacedName,
-	status metav1.ConditionStatus, reason, msg string, creds int32, name string) {
+	status metav1.ConditionStatus, reason, msg string, creds int32, name, appliedGateway string) {
 	log := logf.FromContext(ctx)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var c routingv1.APIConsumer
@@ -427,7 +478,9 @@ func (r *APIConsumerReconciler) setConsumerStatus(ctx context.Context, nn types.
 			// live yet", and advancing it on a failed round says yes while the gateway still
 			// carries the old list.
 			st.ObservedGeneration = c.Generation
-			st.AppliedGatewayNamespace = consumerGatewayNamespace(&c)
+			if appliedGateway != "" {
+				st.AppliedGatewayNamespace = appliedGateway
+			}
 			st.ConsumerName = name
 			st.Credentials = creds
 		}
@@ -607,4 +660,66 @@ func sameNames(a, b map[string]bool) bool {
 		}
 	}
 	return true
+}
+
+// refuseDuplicateCredentials rejects a list in which one credential appears under two
+// consumers. Never written rather than written and hoped about: key-auth treats it as a parse
+// error for the entire defaultConfig, and FAIL_CLOSE turns that into "no caller gets through
+// on any route of this gateway".
+//
+// The message names the two consumers and never the credential: it lands on a CR, in the
+// controller log, and in whatever ships those.
+func refuseDuplicateCredentials(gwNS string, list []any) error {
+	owner := map[string]string{}
+	for _, entry := range list {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue // already refused above; keep this function total
+		}
+		name, _ := m["name"].(string)
+		creds, _ := m["credentials"].([]any)
+		for i, c := range creds {
+			key, ok := c.(string)
+			if !ok {
+				return fmt.Errorf("%s/key-auth: consumer %q has a non-string credential at "+
+					"position %d; refusing to write a list key-auth would reject", gwNS, name, i+1)
+			}
+			if prev, dup := owner[key]; dup {
+				return fmt.Errorf("%s/key-auth: consumers %q and %q share credential #%d. "+
+					"key-auth refuses a duplicate credential and fails to parse its whole "+
+					"configuration, which denies every caller on every route of this gateway, "+
+					"so nothing was written. If %q is an entry this controller does not manage "+
+					"(the gateway chart still renders it), give the APIConsumer its own key, or "+
+					"adopt that entry by naming the APIConsumer after it",
+					gwNS, prev, name, i+1, prev)
+			}
+			owner[key] = name
+		}
+	}
+	return nil
+}
+
+// hasNoLiveEntry: does this gateway's key-auth hold no consumer under this name? Used only to
+// decide that a deletion has nothing to revoke, so an error or a missing gateway answers
+// "cannot say" and the caller falls back to withdrawing properly.
+func (r *APIConsumerReconciler) hasNoLiveEntry(ctx context.Context, gwNS, name string) (bool, error) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(wasmPluginGVK)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+		return false, err
+	}
+	live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
+	if err != nil {
+		return false, err
+	}
+	for _, lc := range live {
+		m, ok := lc.(map[string]any)
+		if !ok {
+			return false, fmt.Errorf("unreadable consumer entry")
+		}
+		if n, _ := m["name"].(string); n == name {
+			return false, nil
+		}
+	}
+	return true, nil
 }
