@@ -2613,3 +2613,192 @@ func TestFleetCapacityUsesTheSharedPeerRule(t *testing.T) {
 		t.Fatalf("capacity = %d, want 100 (the cart cap follows the backends)", got)
 	}
 }
+
+// streamGuardPlugin: the ai-stream-guard object as the gateway chart ships it - with
+// detectors configured. Without them the controller refuses to write its rule, which has its
+// own test; every other case needs a plugin a rule can actually be written for.
+func streamGuardPlugin() *unstructured.Unstructured {
+	o := wasmPlugin("ai-stream-guard")
+	_ = unstructured.SetNestedSlice(o.Object, []any{
+		map[string]any{"type": "repetition", "name": "rep"},
+	}, "spec", "defaultConfig", "detectors")
+	return o
+}
+
+// The guard is on for a fleet that never mentions it. That is the whole reason it is a plugin
+// of this controller's rather than something each fleet passes through extraPlugins: a
+// protection somebody has to remember to switch on is missing from the next fleet built by
+// copying an older one, silently.
+func TestFleetStreamGuardIsOnByDefault(t *testing.T) {
+	f := fleetFixture() // says nothing about streamGuard
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), streamGuardPlugin(),
+	)
+	reconcileFleet(t, r)
+
+	rules := getPlugin(t, c, "ai-stream-guard")
+	if len(rules) != 1 {
+		t.Fatalf("ai-stream-guard has %d rule(s), want 1: a fleet that says nothing must be guarded", len(rules))
+	}
+	rule := rules[0].(map[string]any)
+	// The rule carries a COPY of the plugin's defaultConfig. An empty rule would be the
+	// tidier design and it does not work: with defaultConfigDisable true the Higress
+	// controller never sends defaultConfig to the gateway, so the plugin would inherit an
+	// empty global and refuse the config - measured on the test cluster after this shipped
+	// the other way.
+	cfg, _ := rule["config"].(map[string]any)
+	dets, _ := cfg["detectors"].([]any)
+	if len(dets) != 1 {
+		t.Fatalf("the rule's config is %v, want the chart's detectors copied into it", cfg)
+	}
+	if first, _ := dets[0].(map[string]any); first["type"] != "repetition" {
+		t.Fatalf("the copied detector is %v, want the one the chart configured", dets[0])
+	}
+	if d, _ := rule["configDisable"].(bool); d {
+		t.Fatal("configDisable is true: the rule turns the plugin OFF for this route")
+	}
+
+	// ...and turning it off withdraws the rule rather than writing a different config.
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	if err := c.Get(context.Background(), nn, &fleet); err != nil {
+		t.Fatal(err)
+	}
+	fleet.Spec.Gateway.StreamGuard = &routingv1.StreamGuard{Disabled: true}
+	fleet.Generation = 2
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("ai-stream-guard still has %d rule(s) after the fleet turned it off", n)
+	}
+}
+
+// A gateway whose chart predates this plugin must keep publishing fleets. The guard's absence
+// costs the guard and nothing else - no 401, no route down, no missing metrics - so unlike
+// ai-backend-router and key-auth it must not fail the sync.
+func TestFleetStreamGuardMissingPluginIsTolerated(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+		// no ai-stream-guard object at all
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the fleet refused to publish over a missing guard: %s",
+			condMessage(fleet.Status.Conditions, condGatewaySynced))
+	}
+	if !condTrue(fleet.Status.Conditions, condReady) {
+		t.Fatal("Ready=False although only the guard is missing")
+	}
+}
+
+// The dangerous middle case tolerateMissing does not cover: the ai-stream-guard object EXISTS
+// but its defaultConfig carries no detectors. Our rule is empty by design and inherits that
+// config, and the plugin refuses a config with no detectors - so writing the rule would make
+// the plugin fail to load, and a plugin that fails to load stalls the config push for EVERY
+// plugin on that gateway. Upgrading this controller without the matching gateway chart would
+// take the whole gateway's config plane down, for every fleet route.
+func TestFleetStreamGuardNotWrittenWithoutDetectors(t *testing.T) {
+	guard := wasmPlugin("ai-stream-guard") // exists, with no defaultConfig at all
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), guard,
+	)
+	reconcileFleet(t, r)
+
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("wrote %d rule(s) the plugin cannot load: the config push for every plugin "+
+			"on this gateway would stall", n)
+	}
+	// The fleet still publishes - the alternative is refusing to serve a model because a
+	// guard is unconfigured - and the condition says what is not running.
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the fleet refused to publish: %s", condMessage(fleet.Status.Conditions, condGatewaySynced))
+	}
+	msg := condMessage(fleet.Status.Conditions, condGatewaySynced)
+	for _, want := range []string{"ai-stream-guard", "detectors", "not written"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the condition does not say the guard is off (%s missing): %q", want, msg)
+		}
+	}
+
+	// ...and once the chart configures detectors, the rule appears.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "ai-stream-guard"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedSlice(ka.Object, []any{
+		map[string]any{"type": "repetition", "name": "rep"},
+	}, "spec", "defaultConfig", "detectors"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(context.Background(), &ka); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 1 {
+		t.Fatalf("rules = %d after detectors were configured, want 1", n)
+	}
+}
+
+// Clearing the chart's detectors must WITHDRAW the rule, not just stop writing a new one.
+// Skipping the write alone left the previous rule in place: the chart had no detectors any
+// more, the fleet reported "not written", and the gateway went on cutting streams at a
+// threshold that existed nowhere but in that stale rule. The condition said one thing and the
+// gateway did another - found by the cluster probe, which is where that asymmetry shows.
+func TestFleetStreamGuardRuleIsWithdrawnWhenDetectorsGoAway(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), streamGuardPlugin(),
+	)
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 1 {
+		t.Fatalf("rules = %d before the change, want 1", n)
+	}
+
+	// The chart drops its detectors.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "ai-stream-guard"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedSlice(ka.Object, []any{}, "spec", "defaultConfig", "detectors"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(context.Background(), &ka); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("rules = %d: the old rule survived, so the gateway keeps cutting at a "+
+			"threshold that exists nowhere else", n)
+	}
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("the fleet stopped publishing over an unconfigured guard")
+	}
+	if msg := condMessage(fleet.Status.Conditions, condGatewaySynced); !strings.Contains(msg, "not written") {
+		t.Fatalf("the condition does not mention the withdrawn rule: %q", msg)
+	}
+}

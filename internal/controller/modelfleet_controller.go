@@ -11,6 +11,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -93,6 +94,27 @@ type fleetPlugin struct {
 	// it verbatim while the Secret-derived one was never programmed, with a healthy sync.
 	// There is no CEL rule to fall back on (see the field's doc), so this is the only guard.
 	overridable bool
+	// copyDefaultConfig: write this plugin's own spec.defaultConfig as the rule's config.
+	//
+	// Needed because of a layer above the plugin: with defaultConfigDisable true, the Higress
+	// controller does not send defaultConfig to the gateway at all - only `_rules_` - so a
+	// rule that counted on the plugin merging it over the global config gets an EMPTY global
+	// and fails to parse. Measured on the test cluster, after this controller had already
+	// shipped empty rules on the strength of reading the plugin's own parseRuleConfig, which
+	// is correct about the plugin and silent about what reaches it.
+	//
+	// So the thresholds still live in one place - the chart's defaultConfig - and this copies
+	// them per route rather than restating them.
+	copyDefaultConfig bool
+	// unusable: may this plugin's own global config make our rule unwritable? Returns a
+	// reason, or "" when the rule is safe to write.
+	//
+	// It covers the gap tolerateMissing does not: the plugin object EXISTS but its
+	// defaultConfig cannot support the rule we were about to add. Writing it anyway is worse
+	// than not writing it - a plugin that fails to load stalls the config push for EVERY
+	// plugin on that gateway, so one fleet's rule takes down key-auth, the backend router and
+	// everything else on it.
+	unusable func(obj *unstructured.Unstructured) string
 	// config renders this plugin's per-route config; returning nil means "no rule for this
 	// fleet", which removes any rule we previously wrote.
 	config func(*fleetRender) (any, error)
@@ -138,6 +160,10 @@ type fleetRender struct {
 	defaultMember string
 	// allDisabled: every member is disabled, i.e. the model was deliberately taken offline.
 	allDisabled bool
+	// skippedPlugins: rules this round did not write because the plugin's own global config
+	// could not support them. Surfaced on the fleet, because the alternative to writing them
+	// was silence about a protection that is not running.
+	skippedPlugins []string
 	// gatewayNS: which gateway namespace to write to. Empty means the one the spec names;
 	// it is set explicitly only when withdrawing rules from a namespace the spec no longer
 	// points at.
@@ -253,7 +279,14 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	log.V(1).Info("fleet synced", "model", rend.modelName, "members", len(rend.members))
-	r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue, "Synced", "gateway objects written")
+	// Synced, but say what was left out. A rule this round refused to write - because the
+	// plugin's own config could not support it - means a protection is not running on this
+	// route, and the one thing worse than that is nobody knowing.
+	syncMsg := "gateway objects written"
+	if len(rend.skippedPlugins) > 0 {
+		syncMsg += "; not written: " + strings.Join(rend.skippedPlugins, "; ")
+	}
+	r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue, "Synced", syncMsg)
 	return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 }
 
@@ -850,6 +883,52 @@ func fleetPlugins() []fleetPlugin {
 		// different accounting attributes may simply say so.
 		overridable: true,
 		config:      func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
+	}, {
+		// The repetition guard. Default ON: a rule is written for every fleet that has not
+		// said otherwise, which is why this is a plugin of its own rather than something each
+		// fleet passes through extraPlugins - a protection somebody has to remember to switch
+		// on is missing from the next fleet built by copying an older one.
+		name: "ai-stream-guard",
+		// Its absence costs the guard and nothing else: no 401, no route down, no missing
+		// metrics. A cluster whose gateway chart predates this plugin must not stop
+		// publishing fleets over it.
+		tolerateMissing: func(*fleetRender) bool { return true },
+		// The middle case, which is the dangerous one and which tolerateMissing does not
+		// cover: the object exists and its defaultConfig has no `detectors`. Our rule is
+		// empty by design and inherits that config, and the plugin refuses a config with no
+		// detectors - so the rule would be written, the plugin would fail to load, and the
+		// config push for EVERY plugin on that gateway would stall. Upgrading this
+		// controller without the matching gateway chart would take the whole gateway's
+		// config plane down, for every fleet route.
+		//
+		// So the rule is not written, the fleet publishes without the guard, and the reason
+		// is on the fleet rather than in a gateway that has stopped accepting config.
+		unusable: func(obj *unstructured.Unstructured) string {
+			dets, found, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "detectors")
+			if err != nil || !found || len(dets) == 0 {
+				return "its defaultConfig has no `detectors`, and this controller writes an " +
+					"empty rule that inherits it - the plugin refuses a config with none, and " +
+					"a plugin that fails to load stalls the config push for every plugin on " +
+					"this gateway. Configure detectors in the gateway chart to enable the guard"
+			}
+			return ""
+		},
+		// Overridable, so a fleet that wants different thresholds can say so through
+		// extraPlugins - the same escape hatch ai-statistics has.
+		overridable: true,
+		// The rule carries a copy of the chart's defaultConfig: an empty rule would reach
+		// the gateway with no global config to inherit (see copyDefaultConfig) and the
+		// plugin would refuse it.
+		copyDefaultConfig: true,
+		config: func(f *fleetRender) (any, error) {
+			if g := f.fleet.Spec.Gateway.StreamGuard; g != nil && g.Disabled {
+				return nil, nil // no rule: the guard does not run on this route
+			}
+			// A marker: the actual config is the plugin's own defaultConfig, substituted
+			// where the object is read (copyDefaultConfig). Returning non-nil here is what
+			// says "this route wants the guard".
+			return sink.RenderStreamGuard(), nil
+		},
 	}}
 }
 
@@ -870,6 +949,9 @@ func renderedPlugins() map[string]bool {
 
 func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleetRender) error {
 	var errs []string
+	// Rules deliberately not written because the plugin's own config could not support them.
+	// Reported, not fatal - see the handling in the loop below.
+	var skipped []string
 	if err := r.withdrawFromOldGatewayNamespace(ctx, rend); err != nil {
 		// Not fatal: the new namespace still gets its rules, and the stale ones are retried
 		// every resync. Reported, because a rule nobody can see is the thing to avoid.
@@ -907,6 +989,15 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 		if err := r.upsertMatchRule(ctx, rend, p, raw); err != nil {
 			if isAbsent(err) && (raw == nil ||
 				(p.tolerateMissing != nil && p.tolerateMissing(rend))) {
+				continue
+			}
+			// A rule the plugin's own config cannot support was deliberately not written.
+			// It is reported on the fleet - loudly enough to act on - but it does not fail
+			// the sync, for the same reason tolerateMissing exists: the alternative is a
+			// gateway that has stopped accepting config for every route on it.
+			var unusable *pluginUnusableError
+			if errors.As(err, &unusable) {
+				skipped = append(skipped, unusable.Error())
 				continue
 			}
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
@@ -1004,6 +1095,7 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 	}
 	sort.Strings(rend.appliedExtras) // listType=set on the status field, and a stable order means no needless writes
 
+	rend.skippedPlugins = skipped
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
@@ -1032,11 +1124,54 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 	if ns == "" {
 		ns = gatewayNamespace(rend.fleet)
 	}
+	// Outside the closure: cfg is mutated inside it (an unusable config becomes a
+	// withdrawal), so on a conflict retry the second attempt would re-enter with cfg already
+	// nil, never consult p.unusable again, and return nil - the rule withdrawn and the fleet
+	// reporting a clean "gateway objects written", which is the silence this reason exists to
+	// break.
+	unusableWhy := ""
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(wasmPluginGVK)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: p.name}, obj); err != nil {
 			return err
+		}
+		// Would our rule be unwritable given this plugin's own global config? Asked after the
+		// Get, because the answer is on the object. A rule that cannot load is worse than no
+		// rule: it stalls the config push for every plugin on this gateway.
+		// An unusable plugin config does not just stop us writing - it WITHDRAWS the rule we
+		// wrote before. Skipping the write alone left the previous rule in place: the chart
+		// had no detectors any more, the fleet reported "not written", and the gateway went
+		// on cutting streams at a threshold that existed nowhere but in that stale rule.
+		// Caught by the cluster probe, which is also where the asymmetry is obvious - the
+		// condition says one thing and the gateway does another.
+		if cfg != nil && p.unusable != nil {
+			if unusableWhy = p.unusable(obj); unusableWhy != "" {
+				cfg = nil // fall through to the withdrawal path below
+			}
+		}
+		// Substitute the plugin's own defaultConfig for the marker config. The gateway never
+		// receives defaultConfig while defaultConfigDisable is true, so the rule has to carry
+		// it; the thresholds still exist in exactly one place, the chart.
+		if cfg != nil && p.copyDefaultConfig {
+			def, found, err := unstructured.NestedMap(obj.Object, "spec", "defaultConfig")
+			if err != nil {
+				return fmt.Errorf("read %s defaultConfig: %w", p.name, err)
+			}
+			if !found || len(def) == 0 {
+				// Withdraw, like the p.unusable path above, rather than returning here: a
+				// bare return leaves the rule already on the gateway in place while the
+				// fleet reports "not written" - the same asymmetry that path was changed to
+				// avoid. Unreachable for ai-stream-guard today, because its unusable hook
+				// rejects a missing defaultConfig first, but a trap for the next plugin
+				// given copyDefaultConfig without one.
+				unusableWhy = "its defaultConfig is empty, and this controller copies it " +
+					"into the rule because the gateway never receives defaultConfig while " +
+					"defaultConfigDisable is true"
+				cfg = nil
+			} else {
+				cfg = def
+			}
 		}
 		rules, _, err := unstructured.NestedSlice(obj.Object, "spec", "matchRules")
 		if err != nil {
@@ -1078,13 +1213,27 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 			// Nothing changed: do not write. Every write here is a config push to the
 			// gateway, and a controller that rewrites an identical object on each resync
 			// turns a 30s resync into a 30s config churn across the data plane.
-			return nil
+			return unusableErr(p.name, unusableWhy)
 		}
 		if err := unstructured.SetNestedSlice(obj.Object, kept, "spec", "matchRules"); err != nil {
 			return err
 		}
-		return r.Update(ctx, obj)
+		if err := r.Update(ctx, obj); err != nil {
+			return err
+		}
+		// Written (or withdrawn). If the withdrawal was because the plugin's own config
+		// cannot support a rule, say so now - the rule is gone, which is what the message
+		// claims, and the caller reports it on the fleet without failing the sync.
+		return unusableErr(p.name, unusableWhy)
 	})
+}
+
+// unusableErr: nil unless there is a reason, so the write paths can return it unconditionally.
+func unusableErr(plugin, why string) error {
+	if why == "" {
+		return nil
+	}
+	return &pluginUnusableError{plugin: plugin, why: why}
 }
 
 // cleanupPluginRules withdraws every rule this fleet put into the gateway plugins.
@@ -1481,4 +1630,16 @@ func (r *ModelFleetReconciler) fleetsForModelRoute(ctx context.Context, obj clie
 		}
 	}
 	return out
+}
+
+// pluginUnusableError: our rule was not written because the plugin's own global config cannot
+// support it. Its own type so the caller can tell it from a failure to write - this one is a
+// deliberate skip, and a fleet that only hits this still publishes.
+type pluginUnusableError struct {
+	plugin string
+	why    string
+}
+
+func (e *pluginUnusableError) Error() string {
+	return fmt.Sprintf("%s: rule not written: %s", e.plugin, e.why)
 }

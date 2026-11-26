@@ -440,10 +440,133 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
   路由没声明上限时报 0 —— openresty 那边走 route 的 `default_max`,这里编一个数只会在
   console 上显示一个没人执行的值。
 
+⚠️ **升级既有 release 时必须先 apply CRD 再重启 controller,顺序不能省**:`crds/` 不被
+`helm upgrade` 更新,而「APIConsumer 这个 kind 服务不服务」是**启动时判定一次**的。漏了的话
+reconciler 和网关巡检**都被跳过**、没人写 key-auth 的 `defaultConfig.consumers` —— 配上不再渲染
+该字段的网关 chart,就是 `parsePluginConfig` 失败 + FAIL_CLOSE,**整个网关所有路由拒绝一切请求**。
+补装 CRD 本身不会自愈(判定已经做过了),所以 controller 里有个看门狗:CRD 事后出现时它会退出,
+靠重启把判定重做一次。
+同一个机制还有一个更安静的版本:**CRD 没升级时 `spec.gateway.streamGuard` 会被 API server
+静默裁掉** —— `disabled: true` 写进去被接受、然后被忽略,防护照旧开着。这个没法在代码里兜。
+
 **CRD 装在 chart 的 `crds/` 目录,而 `helm upgrade` 不会更新它** —— 以后给 ModelFleet 加字段,
 升级 autoconfig 不生效,必须单独 `kubectl apply --server-side -f` 那份 CRD。
 
 端到端验证脚本(测试集群 k8s-cpu-16)见 `tools/modelfleet/e2e_cpu16.sh`(在 vllm 仓)。
+
+## APIConsumer CRD
+
+「谁能调这个网关、用什么 key」。`ModelFleet.gateway.authConsumers` 只写**名字**(这条路由放谁进来),
+而**有哪些调用方、各自的密钥是什么**是整个网关一份 —— 它在 key-auth 的 `defaultConfig.consumers` 里,
+以前由网关 chart 渲染,**加一个租户 = 改 values + 发版**。`APIConsumer` 把它变成一个对象:
+
+```yaml
+apiVersion: routing.modelsphere.dev/v1alpha1
+kind: APIConsumer
+metadata: {name: tenant-a, namespace: llm-route}
+spec:
+  gateway: {namespace: higress-system}  # key-auth 所在 ns,也是聚合的分组键
+  credentialsSecretRef: tenant-a-keys   # 本 ns 的 Secret;【每个 value 都是一把可用的 key】
+```
+
+reconciler 把同一个网关下所有 `APIConsumer` 聚合、按名字排序,一次写进那个 `key-auth` 的
+`defaultConfig.consumers`。**一个对象一个写入方、一个字段一个写入方**,和 ModelFleet 同一套模型。
+
+**轮换**就是「Secret 里加第二个 value → 等调用方换过去 → 删掉旧的」,中间没有两把 key 都不好使的窗口。
+加 key 最慢一个 resync(60s)生效;改 `APIConsumer` 对象本身是立即的。**没有**对 Secret 的 watch:
+那会给全集群 Secret 开 informer,正是这个 controller 刻意避开的(它只有 `secrets: get`、且不走缓存读)。
+
+⚠️ **撤销(从 Secret 里删掉一个 value)也是同一个 60s 口径** —— 这件事比"加 key 慢一分钟"要紧:
+key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。**要立刻生效就动对象本身**
+(改一个 annotation 即可,如 `kubectl annotate apiconsumer <名字> rotated-at=$(date +%s) --overwrite`),
+下一秒就会 reconcile。
+⚠️ 注意 annotation 改动**不会推进 `metadata.generation`**(带 status 子资源的 CR 只在 spec 变化时推进),
+所以 `status.observedGeneration` 不会动 —— 也就是说**这条路子没法用 observedGeneration 来确认已生效**,
+得看 `status.lastSyncTime` 或直接去网关上核 consumer 列表。要确认收敛的紧急场景,改 spec 里的字段
+(或直接 `kubectl delete apiconsumer`)比改 annotation 更合适。更彻底的是直接 `kubectl delete apiconsumer <名字>`:
+删除走 finalizer,key 在对象消失之前就已经从网关名单里撤掉了。
+
+渲染出的 credential 带 `Bearer ` 前缀(Secret 里存裸 key 即可):key-auth 比较的是
+**整个 Authorization header 原值**,不剥前缀、不 trim,配裸 key 的话标准客户端全部 401。
+⚠️ **同一个 key 不能给两个 consumer 用** —— key-auth 遇到重复 credential 会
+`return false` 整份配置解析失败,而插件是 `FAIL_CLOSE`,后果是**整个网关所有路由全部拒绝**,
+不是"其中一个不生效"。渲染层会拒掉这种配置(报错只给 consumer 名和下标,不带 key 值)。
+
+**ai-stream-guard(重复检测截断)默认对每条 fleet 路由开启**,`gateway.streamGuard.disabled: true`
+是显式退出。它**不走 `extraPlugins`**,理由是层级:`extraPlugins` 由建 fleet 的人逐个填,
+而「默认都该有的防护」一旦要人记得写,照抄老 YAML 建的新模型就静默没有保护。默认值归 controller,
+`extraPlugins` 归「这一个 fleet 要的不一样」。
+autoconfig 把插件 `defaultConfig` 的内容**复制**进每条路由的规则,所以阈值只存在于 chart 一处、
+改了最慢一个 resync(30s)传到所有路由。**不是写空规则让插件继承** —— `defaultConfigDisable: true` 时
+Higress controller 根本不下发 `defaultConfig`,空规则到达插件时全局是空的、会被拒(集群实测,
+而我最初按插件自己的 `parseRuleConfig` 推断写了空规则:那个推断对插件成立、对「什么东西到达了插件」沉默)。
+关掉是**撤掉规则**,不是写另一份配置;chart 没配 detectors 时**也撤掉规则**并在 `GatewaySynced` 上说明。
+⚠️ **chart 的 `defaultConfig` 必须有非空 `detectors`**:插件拒绝 detectors 为空的配置(包括从全局继承到的空),
+而**一个插件加载失败会卡住该网关上所有插件的配置推送**。
+插件对象不存在时**容忍**(只是少了防护,不像 key-auth 那样是 401),同步照常成功。
+
+**与网关 chart 的契约**(`modelsphere/helm-charts` 的 `charts/higress-llm`,双方都依赖,改一边会坏另一边):
+
+- **chart 不再渲染 `defaultConfig.consumers`,这个字段整个归 autoconfig。** 它继续渲染
+  `keys` 和 `global_auth`,那两个仍归 helm —— `defaultConfig` 是**字段级**跟踪的(实测:
+  managedFields 里 `f:defaultConfig` 下面是 `f:consumers`/`f:keys`/`f:global_auth` 三条独立路径),
+  不是一个原子块,所以两边各写各的层级不会互相覆盖。
+- **key-auth 没有 `consumers` 这个键 = 整个网关拒绝一切请求。** `key_auth` 的
+  `parsePluginConfig` 在 `consumers` 和 `credentials` 都不存在时 `return false`,而那个插件是
+  `FAIL_CLOSE`。所以这个 controller **必须**保证该键存在,哪怕是空列表 —— 这就是
+  `KeyAuthReconciler` watch key-auth 本身的原因:全新安装时集群里**一个 APIConsumer 都没有**,
+  只 watch APIConsumer 的话零对象就是零 reconcile,那个键永远不会被写。
+  ⚠️ 同理:**新 chart 不能部署到还没升级 autoconfig 的集群**(旧版既不被触发、也不补写该键 →
+  网关 FAIL_CLOSE 且不自愈)。helmfile 侧已用 `semverCompare` 门禁 + `needs` 保证顺序。
+- **autoconfig 只写「自己的」网关**,三种判据取其一:① key-auth 上带
+  `routing.modelsphere.dev/consumers: autoconfig` 标签(**chart 打的**,这是给「装在
+  higress-system 以外、且还没有任何 fleet/consumer」的首装场景用的);② 有 APIConsumer 或
+  ModelFleet 把该 namespace 指为自己的 gateway;③ 默认 namespace `higress-system`。
+  ③ 是过渡兜底 —— 没有标签的 chart 版本在首装时会让网关 FAIL_CLOSE,那比「往
+  higress-system 里一个没人指名的 key-auth 写东西」更糟;**等带标签的 chart 发布后应当去掉 ③**。
+  不限制范围的话,就等于给别人团队自己 namespace 里的 Higress 加 `consumers` 并夺走那个字段。
+- **绝不往带顶层 `credentials` 的 key-auth 里写 `consumers`**:`key_auth` 接受 `consumers`
+  **或**顶层 `credentials`,两者并存会拒绝整份配置 —— 那种网关按定义不是 autoconfig 建的,
+  写进去会把它打死。有我们的东西要写时报错说明,没有时直接放手。
+- **一个 key 只能属于一个 consumer。** `key_auth` 遇到重复 credential 会 `return false`、
+  整份配置解析失败 —— 加上 FAIL_CLOSE,后果是**整个网关所有路由全部拒绝**,不是「其中一个不生效」。
+  渲染层会拒,但别指望它兜住所有写法。
+- **凭据渲染成带 `Bearer ` 前缀**(Secret 里存裸 key 即可):`key_auth` 比较的是**整个
+  Authorization header 原值**,不剥前缀、不 trim。配裸 key 的话标准客户端全部 401。
+
+**适配已有条目**(迁移时用):建一个 `APIConsumer`,名字与 live 里那个 consumer 相同,Secret 里放
+**它现在用的那把 key**。要求「携带现有全部凭据」不是形式主义 —— 它是这个名字的归属证明:
+`consumerName` 是自由字段、对象可以建在任意 namespace,没有这道证明,任何人写
+`consumerName: tenant-a` + 自己的 key 就继承了 `tenant-a` 被允许的所有路由。适配完成后再换 key,
+那是「轮换」,此时条目已归自己、不需要再证明。
+名字被两个新对象同时争用时,**谁都拿不到** —— 让先到的胜出等于按列表顺序仲裁「谁是 tenant-a」。
+
+**两条写入安全规则**(这个改动最危险的地方,都是「宁可不写」):
+
+- **一个坏对象不连累别人,但绝不因此摘掉任何活 key**。名单里少一个 consumer,就是那个调用方下一个
+  请求 401 —— 所以某个 `APIConsumer` 的 Secret 读不到时,**它在网关里的那条已有条目原样留着**
+  (key 继续有效),其余人的增删改照常进行,失败报在那个对象自己的 `Programmed` 上。
+  **「原样留着」只对能证明属于它的条目成立** —— 判据是 annotation `routing.modelsphere.dev/managed-consumers`
+  (我们写网关的那一次就把名字记进去了,所以 status 没写成功也不影响),**不是「名字对得上」**:
+  否则谁都能用「指向 chart 渲染的 consumer 名 + 一个不存在的 secretRef」把别人的条目认领走。
+  同理,**一个对象的问题一律只让它自己付代价**:撞名、与结转条目撞 key、证明不了的认领,
+  都是把它剔出这一轮并把原因写在它自己身上,而不是拒绝整轮(拒绝整轮就等于谁都不能轮换或**吊销**
+  key,包括吊销一个已泄漏的 —— 这一类错在这个 PR 里反复出现过,每次都是「一个对象的问题变成全网关的问题」)。
+- **不能把名单写空**,除非这个网关的名单**本来就是我们写的**(有 `APIConsumer` 的
+  `status.appliedGatewayNamespace` 指着它)。「删掉最后一个 consumer」和「还没迁移、名单还是 chart 渲染的」
+  从期望态看一模一样(都是零个对象),而后者写空 = 全站所有路由对所有人 403。
+
+⚠ **不要给租户 `apiconsumers/status` 的写权限**:归属判定看 `status.appliedGatewayNamespace`
++ `status.consumerName`,能改 status 就能让自己变成某个名字的「在位者」从而跳过持有证明。
+`spec` 可以给(那是自助改 key 的入口),`status` 只能 controller 写。
+
+⚠ **它给的是「源头唯一、可在线轮换、不用发版」,不是「密钥不可见」**:key-auth 的配置是经 ECDS 推下去的
+一段 blob,插件没有读 Secret 的能力,所以密钥最终仍然明文躺在 `WasmPlugin` 对象里 ——
+能读网关 ns 下 WasmPlugin 的人就能读到所有 key。要真正隐藏得换插件能力,是另一件事。
+
+**迁移要和网关 chart 一起做**:chart 摘掉 `consumers` 的渲染(保留 `keys` 占位与 `global_auth`),
+和这次摘 `matchRules` 同一种拆法。在 chart 还在渲染、而 `APIConsumer` 一个都没建的中间状态下,
+上面第二条规则保证这个 controller 不会去动那份名单。
 
 ## 消费方接入
 

@@ -334,3 +334,19 @@ func RenderAIStatistics() *AIStatistics {
 		ApplyToLog:  true,
 	}}}
 }
+
+// StreamGuardRule is the match rule written for the repetition guard.
+//
+// It is the marker the controller substitutes the plugin's own spec.defaultConfig for, NOT
+// the config that reaches the gateway - an empty rule was the first design and does not work:
+// with defaultConfigDisable true the Higress controller never sends defaultConfig, so an
+// empty rule arrives at a plugin whose global config is empty and is refused.
+//
+// The plugin's parseRuleConfig starts from the global config and only replaces what the rule
+// names, so an empty object means "the parameters the gateway chart configured apply to this
+// route too". Writing them again here would put the detector thresholds in two places, and
+// this controller has no opinion about them.
+type StreamGuardRule struct{}
+
+// RenderStreamGuard: the rule that turns the guard on for a route.
+func RenderStreamGuard() *StreamGuardRule { return &StreamGuardRule{} }
