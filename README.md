@@ -445,6 +445,57 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
 
 端到端验证脚本(测试集群 k8s-cpu-16)见 `tools/modelfleet/e2e_cpu16.sh`(在 vllm 仓)。
 
+## APIConsumer CRD
+
+「谁能调这个网关、用什么 key」。`ModelFleet.gateway.authConsumers` 只写**名字**(这条路由放谁进来),
+而**有哪些调用方、各自的密钥是什么**是整个网关一份 —— 它在 key-auth 的 `defaultConfig.consumers` 里,
+以前由网关 chart 渲染,**加一个租户 = 改 values + 发版**。`APIConsumer` 把它变成一个对象:
+
+```yaml
+apiVersion: routing.modelsphere.dev/v1alpha1
+kind: APIConsumer
+metadata: {name: tenant-a, namespace: llm-route}
+spec:
+  gateway: {namespace: higress-system}  # key-auth 所在 ns,也是聚合的分组键
+  credentialsSecretRef: tenant-a-keys   # 本 ns 的 Secret;【每个 value 都是一把可用的 key】
+```
+
+reconciler 把同一个网关下所有 `APIConsumer` 聚合、按名字排序,一次写进那个 `key-auth` 的
+`defaultConfig.consumers`。**一个对象一个写入方、一个字段一个写入方**,和 ModelFleet 同一套模型。
+
+**轮换**就是「Secret 里加第二个 value → 等调用方换过去 → 删掉旧的」,中间没有两把 key 都不好使的窗口。
+加 key 最慢一个 resync(60s)生效;改 `APIConsumer` 对象本身是立即的。**没有**对 Secret 的 watch:
+那会给全集群 Secret 开 informer,正是这个 controller 刻意避开的(它只有 `secrets: get`、且不走缓存读)。
+
+⚠️ **撤销(从 Secret 里删掉一个 value)也是同一个 60s 口径** —— 这件事比"加 key 慢一分钟"要紧:
+key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。**要立刻生效就动对象本身**
+(改一个 annotation 即可,如 `kubectl annotate apiconsumer <名字> rotated-at=$(date +%s) --overwrite`),
+那是 generation 变化、下一秒就 reconcile。更彻底的是直接 `kubectl delete apiconsumer <名字>`:
+删除走 finalizer,key 在对象消失之前就已经从网关名单里撤掉了。
+
+渲染出的 credential 带 `Bearer ` 前缀(Secret 里存裸 key 即可):key-auth 比较的是
+**整个 Authorization header 原值**,不剥前缀、不 trim,配裸 key 的话标准客户端全部 401。
+⚠️ **同一个 key 不能给两个 consumer 用** —— key-auth 遇到重复 credential 会
+`return false` 整份配置解析失败,而插件是 `FAIL_CLOSE`,后果是**整个网关所有路由全部拒绝**,
+不是"其中一个不生效"。渲染层会拒掉这种配置(报错只给 consumer 名和下标,不带 key 值)。
+
+**两条写入安全规则**(这个改动最危险的地方,都是「宁可不写」):
+
+- **坏一个,全不写**。某个 `APIConsumer` 的 Secret 读不到时,**不会**把它从名单里摘掉再写剩下的 ——
+  名单里少一个 consumer,就是那个调用方下一个请求 401。这一轮整个不写,网关保持上一份好名单,
+  失败报在那个对象的 `Programmed` 上。
+- **不能把名单写空**,除非这个网关的名单**本来就是我们写的**(有 `APIConsumer` 的
+  `status.appliedGatewayNamespace` 指着它)。「删掉最后一个 consumer」和「还没迁移、名单还是 chart 渲染的」
+  从期望态看一模一样(都是零个对象),而后者写空 = 全站所有路由对所有人 403。
+
+⚠ **它给的是「源头唯一、可在线轮换、不用发版」,不是「密钥不可见」**:key-auth 的配置是经 ECDS 推下去的
+一段 blob,插件没有读 Secret 的能力,所以密钥最终仍然明文躺在 `WasmPlugin` 对象里 ——
+能读网关 ns 下 WasmPlugin 的人就能读到所有 key。要真正隐藏得换插件能力,是另一件事。
+
+**迁移要和网关 chart 一起做**:chart 摘掉 `consumers` 的渲染(保留 `keys` 占位与 `global_auth`),
+和这次摘 `matchRules` 同一种拆法。在 chart 还在渲染、而 `APIConsumer` 一个都没建的中间状态下,
+上面第二条规则保证这个 controller 不会去动那份名单。
+
 ## 消费方接入
 
 autoconfig 只负责把配置**写进已有的 ConfigMap**(不创建 chart、不创建 ConfigMap);消费方各自 chart 建初始

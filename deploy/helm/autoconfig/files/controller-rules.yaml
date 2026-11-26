@@ -92,6 +92,34 @@
 - apiGroups:
   - routing.modelsphere.dev
   resources:
+  - apiconsumers
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - routing.modelsphere.dev
+  resources:
+  - apiconsumers/finalizers
+  - modelfleets/finalizers
+  - modelroutes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - routing.modelsphere.dev
+  resources:
+  - apiconsumers/status
+  - modelfleets/status
+  - modelroutes/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - routing.modelsphere.dev
+  resources:
   - modelfleets
   - modelroutes
   verbs:
@@ -102,19 +130,3 @@
   - patch
   - update
   - watch
-- apiGroups:
-  - routing.modelsphere.dev
-  resources:
-  - modelfleets/finalizers
-  - modelroutes/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - routing.modelsphere.dev
-  resources:
-  - modelfleets/status
-  - modelroutes/status
-  verbs:
-  - get
-  - patch
-  - update

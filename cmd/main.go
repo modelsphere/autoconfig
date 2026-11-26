@@ -93,11 +93,11 @@ func runController(leaderElect bool) error {
 	// leaves the type missing - and watching a type that does not exist fails the manager,
 	// which would take ModelRoute down with it. A cluster that never asked for ModelFleet
 	// must not lose openresty peers, CART workers and monitor.conf over it.
-	has, err := hasModelFleetCRD(cs)
+	served, err := servedKinds(cs)
 	if err != nil {
 		return err
 	}
-	if has {
+	if served["ModelFleet"] {
 		if err := (&controller.ModelFleetReconciler{
 			Client:    mgr.GetClient(),
 			APIReader: mgr.GetAPIReader(),
@@ -109,6 +109,21 @@ func runController(leaderElect bool) error {
 		log.Print("ModelFleet CRD not installed: skipping that reconciler " +
 			"(apply deploy/helm/autoconfig/crds/ and restart to enable it)")
 	}
+	// APIConsumer: who may call the gateway, and with which keys. Gated on its own CRD for
+	// the same reason - a cluster that only uses ModelRoute must not lose openresty peers
+	// over a type it never asked for.
+	if served["APIConsumer"] {
+		if err := (&controller.APIConsumerReconciler{
+			Client:    mgr.GetClient(),
+			APIReader: mgr.GetAPIReader(),
+			Scheme:    mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			return err
+		}
+	} else {
+		log.Print("APIConsumer CRD not installed: skipping that reconciler " +
+			"(apply deploy/helm/autoconfig/crds/ and restart to enable it)")
+	}
 	// controller-runtime 自带的 ping 检查:进程存活即通过。
 	// 注意它【不能】发现 reconcile 卡死 —— 要那个得看 metrics 的 workqueue_depth。
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -118,28 +133,32 @@ func runController(leaderElect bool) error {
 		return err
 	}
 
-	log.Printf("controller start: ModelRoute%s (routing.modelsphere.dev/v1alpha1)",
-		map[bool]string{true: " + ModelFleet"}[has])
+	extra := ""
+	for _, k := range []string{"ModelFleet", "APIConsumer"} {
+		if served[k] {
+			extra += " + " + k
+		}
+	}
+	log.Printf("controller start: ModelRoute%s (routing.modelsphere.dev/v1alpha1)", extra)
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
-// hasModelFleetCRD asks the API server whether the type exists. Discovery rather than a
-// Get on the CRD object: it needs no apiextensions permission, and "is this kind served"
-// is exactly the question.
-func hasModelFleetCRD(cs kubernetes.Interface) (bool, error) {
+// servedKinds asks the API server which kinds of our group it serves. Discovery rather than
+// a Get on each CRD object: it needs no apiextensions permission, and "is this kind served"
+// is exactly the question. One call for every optional reconciler.
+func servedKinds(cs kubernetes.Interface) (map[string]bool, error) {
+	out := map[string]bool{}
 	list, err := cs.Discovery().ServerResourcesForGroupVersion(routingv1.GroupVersion.String())
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil // the whole group is absent: ModelRoute's CRD is missing too
+			return out, nil // the whole group is absent: ModelRoute's CRD is missing too
 		}
-		return false, fmt.Errorf("discover %s: %w", routingv1.GroupVersion, err)
+		return nil, fmt.Errorf("discover %s: %w", routingv1.GroupVersion, err)
 	}
 	for _, r := range list.APIResources {
-		if r.Kind == "ModelFleet" {
-			return true, nil
-		}
+		out[r.Kind] = true
 	}
-	return false, nil
+	return out, nil
 }
 
 func envOr(k, def string) string {
