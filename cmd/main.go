@@ -19,6 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	slov1 "autoconfig/api/inference/v1alpha1"
@@ -139,11 +140,18 @@ func runController(leaderElect bool) error {
 		// taking ModelRoute - openresty peers, CART workers, monitor.conf - with it. Most
 		// clusters are in exactly that state: enabled.higress is false by default, while
 		// this release ships the APIConsumer CRD to all of them.
+		// The sweep runs whatever discovery said. It is what makes the "autoconfig creates
+		// the consumers key" contract hold on a cluster where the watch could not be
+		// registered - a fresh install, where Higress's CRDs arrive after this process
+		// started - and it needs no informer, so a missing kind costs one failed List.
+		if err := mgr.Add(manager.RunnableFunc(consumers.StartGatewaySweep)); err != nil {
+			return err
+		}
 		switch {
 		case !keyAuthWatchWanted(higressServed):
-			log.Print("Higress WasmPlugin CRD not installed: skipping the key-auth watch. " +
-				"Install Higress and restart to enable it - until then nothing creates " +
-				"key-auth's defaultConfig.consumers, which the gateway chart relies on")
+			log.Print("Higress WasmPlugin CRD not installed: skipping the key-auth watch " +
+				"(the periodic gateway sweep still runs, so a Higress installed later is " +
+				"picked up within one resync without restarting this pod)")
 		default:
 			if err := (&controller.KeyAuthReconciler{APIConsumerReconciler: consumers}).
 				SetupWithManager(mgr); err != nil {

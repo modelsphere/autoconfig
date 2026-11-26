@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -1468,4 +1469,52 @@ func TestConsumerUnprovenAdoptionDoesNotFreezeTheGateway(t *testing.T) {
 	if got := creds0Of(t, c, "higress-system", "orphan"); strings.Join(got, ",") != "Bearer sk-orphan" {
 		t.Fatalf("orphan credentials = %v, want them untouched", got)
 	}
+}
+
+// The case the gate on its own leaves broken: autoconfig starts in a cluster with no
+// WasmPlugin kind (Higress's CRDs come from the higress CORE release, and the helmfile
+// deploys autoconfig before higress-llm, which needs it), so the watch is correctly skipped -
+// and then nothing would ever write key-auth's consumers key. The gateway would be FAIL_CLOSE
+// and stay that way until somebody restarted autoconfig, which is worse than the crash-loop
+// the gate prevents, because nothing announces it.
+//
+// The sweep closes it: no informer, so it runs whether or not the kind exists, and a Higress
+// installed later is picked up on the next round.
+func TestGatewaySweepWritesTheKeyWithoutAWatch(t *testing.T) {
+	r, c := newConsumerReconciler(t, keyAuthWithoutConsumers()) // zero APIConsumers
+	r.ensureGateways(context.Background())
+
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	live, found, err := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the sweep did not create the consumers key: on a cluster where the watch " +
+			"could not be registered, the gateway would stay FAIL_CLOSE until a restart")
+	}
+	if len(live) != 0 {
+		t.Fatalf("consumers = %v, want an empty list", live)
+	}
+}
+
+// A cluster with no Higress at all: the sweep must be a no-op, not an error and not a log
+// line every minute. isAbsent covers both a missing CRD and a missing object.
+func TestGatewaySweepIsQuietWithoutHigress(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := routingv1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	// A client whose scheme has no WasmPlugin kind stands in for a cluster without Higress.
+	c := ctrlfake.NewClientBuilder().WithScheme(s).Build()
+	r := &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}
+	r.ensureGateways(context.Background()) // must not panic, must not block
 }

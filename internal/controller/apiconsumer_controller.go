@@ -1236,3 +1236,64 @@ func dropUnprovenAdoptions(views []sink.ConsumerView, liveEntries map[string][]s
 	}
 	return kept
 }
+
+// ensureGateways runs one gateway round for every key-auth WasmPlugin in the cluster. It is
+// what the periodic sweep below calls, and it exists separately from the watch for one
+// reason: the watch cannot be registered at all where the WasmPlugin kind is not served yet,
+// and that is the normal state on a fresh install.
+//
+// Higress's CRDs come from the higress CORE release, while the helmfile deploys autoconfig
+// BEFORE higress-llm (which needs it). So autoconfig can start in a cluster that has no
+// WasmPlugin kind, skip the watch - correctly, or the manager would exit - and then nothing
+// would ever write key-auth's consumers key. The gateway would be FAIL_CLOSE and stay that
+// way until somebody restarted autoconfig, which is a worse failure than the crash-loop the
+// gate prevents, because nothing announces it.
+//
+// Uncached List, through APIReader: a cached one would build an informer for a kind that may
+// not exist, which is the problem this is here to avoid. A missing kind is just a failed List
+// and the next sweep tries again, so a Higress installed later is picked up on its own.
+func (r *APIConsumerReconciler) ensureGateways(ctx context.Context) {
+	log := logf.FromContext(ctx)
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(wasmPluginGVK.GroupVersion().WithKind("WasmPluginList"))
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if err := reader.List(ctx, list); err != nil {
+		if isAbsent(err) {
+			return // no Higress (yet): nothing to do, and nothing to complain about
+		}
+		log.V(1).Info("could not list WasmPlugins for the gateway sweep", "err", err.Error())
+		return
+	}
+	for i := range list.Items {
+		o := &list.Items[i]
+		if o.GetName() != "key-auth" {
+			continue
+		}
+		if _, err := r.programGateway(ctx, o.GetNamespace(), nil); err != nil &&
+			!errors.Is(err, errGatewayAbsent) {
+			log.V(1).Info("gateway sweep did not program this gateway",
+				"gateway", o.GetNamespace(), "err", err.Error())
+		}
+	}
+}
+
+// StartGatewaySweep is a manager Runnable: it keeps the consumers key present even on a
+// cluster where the watch could not be registered, and picks up a Higress installed after
+// this process started. One round per interval over every key-auth; each round writes only
+// when something differs, so a settled cluster costs a List and a few cached reads.
+func (r *APIConsumerReconciler) StartGatewaySweep(ctx context.Context) error {
+	t := time.NewTicker(consumerResyncTime)
+	defer t.Stop()
+	r.ensureGateways(ctx) // once at startup, so a fresh install does not wait an interval
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			r.ensureGateways(ctx)
+		}
+	}
+}
