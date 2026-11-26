@@ -492,6 +492,16 @@ key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。*
   只 watch APIConsumer 的话零对象就是零 reconcile,那个键永远不会被写。
   ⚠️ 同理:**新 chart 不能部署到还没升级 autoconfig 的集群**(旧版既不被触发、也不补写该键 →
   网关 FAIL_CLOSE 且不自愈)。helmfile 侧已用 `semverCompare` 门禁 + `needs` 保证顺序。
+- **autoconfig 只写「自己的」网关**,三种判据取其一:① key-auth 上带
+  `routing.modelsphere.dev/consumers: autoconfig` 标签(**chart 打的**,这是给「装在
+  higress-system 以外、且还没有任何 fleet/consumer」的首装场景用的);② 有 APIConsumer 或
+  ModelFleet 把该 namespace 指为自己的 gateway;③ 默认 namespace `higress-system`。
+  ③ 是过渡兜底 —— 没有标签的 chart 版本在首装时会让网关 FAIL_CLOSE,那比「往
+  higress-system 里一个没人指名的 key-auth 写东西」更糟;**等带标签的 chart 发布后应当去掉 ③**。
+  不限制范围的话,就等于给别人团队自己 namespace 里的 Higress 加 `consumers` 并夺走那个字段。
+- **绝不往带顶层 `credentials` 的 key-auth 里写 `consumers`**:`key_auth` 接受 `consumers`
+  **或**顶层 `credentials`,两者并存会拒绝整份配置 —— 那种网关按定义不是 autoconfig 建的,
+  写进去会把它打死。有我们的东西要写时报错说明,没有时直接放手。
 - **一个 key 只能属于一个 consumer。** `key_auth` 遇到重复 credential 会 `return false`、
   整份配置解析失败 —— 加上 FAIL_CLOSE,后果是**整个网关所有路由全部拒绝**,不是「其中一个不生效」。
   渲染层会拒,但别指望它兜住所有写法。

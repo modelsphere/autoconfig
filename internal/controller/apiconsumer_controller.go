@@ -1328,13 +1328,26 @@ func (r *APIConsumerReconciler) ensureGateways(ctx context.Context) {
 		if o.GetName() != "key-auth" {
 			continue
 		}
-		// Only gateways something in this cluster points at. Writing to every key-auth
-		// anywhere would mean adding `consumers: []` to a Higress that another team runs in
-		// their own namespace, and taking SSA ownership of that field on it - acting on an
-		// object nobody pointed this controller at. A namespace no APIConsumer and no
-		// ModelFleet names has no routes from us either, so there is nothing of ours to keep
-		// working there.
-		if !wanted[o.GetNamespace()] {
+		// Only gateways that are ours to write. Writing to every key-auth anywhere would
+		// mean adding `consumers: []` to a Higress another team runs in their own
+		// namespace, and taking SSA ownership of that field on it - acting on an object
+		// nobody pointed this controller at.
+		//
+		// Three ways to be ours, in order of how explicit they are:
+		//
+		//   1. the label the gateway chart puts on the key-auth it installs. This is the one
+		//      that works for a chart installed in any namespace before any fleet or
+		//      consumer exists, which is the fresh-install case and the whole reason the
+		//      sweep exists (agreed with the chart in modelsphere/helm-charts#122);
+		//   2. an APIConsumer or a ModelFleet naming that namespace as its gateway;
+		//   3. the default gateway namespace.
+		//
+		// 3 is kept although 1 subsumes it for any chart that carries the label, because a
+		// chart release without the label would otherwise leave a fresh install's gateway
+		// FAIL_CLOSE - and that is the failure worth one release of a narrower intrusion:
+		// writing to an unlabelled key-auth in higress-system that nothing names. It should
+		// go once the labelled chart has shipped.
+		if !ourGateway(o, wanted) {
 			continue
 		}
 		if _, err := r.programGateway(ctx, o.GetNamespace(), nil); err != nil &&
@@ -1391,13 +1404,26 @@ func (r *APIConsumerReconciler) gatewayNamespacesInUse(ctx context.Context) (map
 			out[ns] = true
 		}
 	}
-	// The default gateway namespace, always. It is where the gateway chart installs, and on
-	// a fresh install nothing names it yet - no APIConsumer, no fleet - while key-auth's
-	// defaultConfig is already active (defaultConfigDisable is false) and therefore already
-	// has to parse. That is the case the sweep exists for, and restricting the sweep to
-	// named namespaces without this killed it: both sweep tests went red, which is how I
-	// found out rather than by reasoning.
-	out[defaultGatewayNamespace] = true
 	delete(out, "")
 	return out, nil
+}
+
+// consumersLabel: the gateway chart puts this on the key-auth WasmPlugin it installs, to say
+// that its consumer list belongs to autoconfig. Agreed with that chart rather than invented
+// here, so changing it is a change to both.
+//
+// It names the FIELD, not just the manager, which is the point: keys and global_auth on the
+// same object stay with the chart.
+const consumersLabel = "routing.modelsphere.dev/consumers"
+
+// ourGateway: may this controller write the consumer list of this key-auth? See the call site
+// for why there are three answers and not one.
+func ourGateway(o *unstructured.Unstructured, named map[string]bool) bool {
+	if o.GetLabels()[consumersLabel] == "autoconfig" {
+		return true
+	}
+	if named[o.GetNamespace()] {
+		return true
+	}
+	return o.GetNamespace() == defaultGatewayNamespace
 }

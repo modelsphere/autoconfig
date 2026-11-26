@@ -1658,3 +1658,41 @@ func TestConsumerRefusesAKeyAuthUsingTopLevelCredentials(t *testing.T) {
 		t.Fatal("consumers was added anyway")
 	}
 }
+
+// The label is what makes a gateway chart installed OUTSIDE the default namespace work before
+// any fleet or consumer exists - the fresh-install case the sweep exists for. Without it such
+// a gateway would sit FAIL_CLOSE until somebody created the first object.
+func TestGatewaySweepWritesToALabelledGatewayAnywhere(t *testing.T) {
+	ka := keyAuthWithoutConsumers()
+	ka.SetNamespace("gateway-elsewhere")
+	ka.SetLabels(map[string]string{consumersLabel: "autoconfig"})
+	r, c := newConsumerReconciler(t, ka) // no APIConsumer, no fleet, not the default namespace
+	r.ensureGateways(context.Background())
+
+	var got unstructured.Unstructured
+	got.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "gateway-elsewhere", Name: "key-auth"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedSlice(got.Object, "spec", "defaultConfig", "consumers"); !found {
+		t.Fatal("the labelled gateway did not get its consumers key: a chart installed outside " +
+			"higress-system would stay FAIL_CLOSE until the first APIConsumer or fleet")
+	}
+
+	// ...and the label has to say autoconfig. Somebody else's label value is not consent.
+	other := keyAuthWithoutConsumers()
+	other.SetNamespace("gateway-other")
+	other.SetLabels(map[string]string{consumersLabel: "somebody-else"})
+	if err := c.Create(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	r.ensureGateways(context.Background())
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "gateway-other", Name: "key-auth"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedSlice(got.Object, "spec", "defaultConfig", "consumers"); found {
+		t.Fatal("wrote to a gateway whose label names a different manager")
+	}
+}
