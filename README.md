@@ -275,6 +275,156 @@ spec:
 ② `nginx.peers` 用了 `cart` 必须配 `spec.cart`;③ `cart` 用 `maxConcurrencyFromBackend` 必须给
 `backend` 组配 `maxConcurrency>0`。
 
+## ModelFleet CRD
+
+**一个模型跑在多类算力上,对外只有一个模型名和一个地址。** `ModelRoute` 的粒度天生是
+「一个模型 + 一桶同质后端」—— 一类硬件一条。`ModelFleet` 是它之上的聚合层:把若干条
+`ModelRoute` 聚成一个对外模型,在**网关**上做统一入口与按权重/优先级分流。
+openresty、CART、引擎都不动,swiss 的创建流程也不变。
+
+```yaml
+apiVersion: routing.modelsphere.dev/v1alpha1
+kind: ModelFleet
+metadata: {name: glm-5.3, namespace: llm-route}
+spec:
+  modelName: glm-5.3            # 客户端 body.model
+  defaultMember: h100           # 没有成员可选时的落点(插件必填)
+  gateway:
+    namespace: higress-system   # WasmPlugin 所在 ns
+    service: openresty:8080     # Ingress 的后端;成员靠【路径】区分
+    externalURL: http://<gw>:31080        # 发布成 status.endpoint + /v1
+    authConsumers: [ops]                  # key-auth 本路由的 allow 名单
+    # upstreamAuthSecretRef 省略 = openresty-api-keys:keys(那把 key 本来就在那儿);
+    # 只在要指向别的 Secret 时写,openresty 不要 key 时写 "none"
+  members:                      # 成员【引用】ModelRoute,不重抄地址
+  - name: h100                  # = 决策表 backend id = 网关指标标签,改名等于删了重建
+    hardware: {vendor: nvidia, model: H100, replicas: 2}
+    backend: {modelRouteRef: glm-53-h100}           # 路径前缀从 ModelRoute 的 nginx.route 读
+    capabilities: {maxContextTokens: 131072, maxConcurrency: 16}
+  - name: ascend
+    hardware: {vendor: huawei, model: 910B4, replicas: 1}
+    backend: {modelRouteRef: glm-53-ascend}
+  trafficPolicy:                # decision-gen 写这一段;整段省略 = 成员间平均分
+    revision: 42                # 仅审计标签;收敛判定用 generation/observedGeneration
+    members:                    # tier 小的优先;weight 同 tier 内相对值,0 = 摘掉
+    - {name: h100,   tier: 0, weight: 8000}
+    - {name: ascend, tier: 0, weight: 2000}
+```
+
+**三方写同一个对象,各占一棵互不相交的子树**,靠 Server-Side Apply + 各自的 fieldManager:
+
+| 字段 | 写入方 | 读取方 |
+|---|---|---|
+| `modelName` / `gateway` / `defaultMember` / `members[]` | console | reconciler、decision-gen |
+| `trafficPolicy` | decision-gen | reconciler、console(展示意图值) |
+| `status.*` | 本 controller(status 子资源) | console、decision-gen |
+
+⚠️ **必须 `kubectl apply --server-side --field-manager=<你自己的名字>`**。
+client-side apply、helm upgrade、拿自己构造的整对象 `Update`,三种都会把对方的字段整段抹掉
+且不报错(helm 把 CART 的 live 调优写回底稿就是这么丢的)。
+
+**reconciler 在网关上改这四个对象**(每个 fleet 一条规则,绑在自己那条 Ingress 上):
+
+| 网关对象 | 写什么 | 漏了会怎样 |
+|---|---|---|
+| `Ingress`(每 fleet 一条) | 匹配 model-router 写的 `x-higress-llm-model` 头;**不配 rewrite-path** | 路由不生效 / 所有成员被钉死在同一路径 |
+| `ai-backend-router` | `trafficPolicy` → 决策表(backend id、path、tier、weight) | 没有后端表,无法分流 |
+| `key-auth` | 本路由的 allow 名单(**key 不经本 CR**,consumer 定义仍在网关 chart);空名单 = `allow: []` = 403 | **路由变成开放的**(网关 `global_auth: false`,没有规则 = 插件不跑,不是 403) |
+| `ai-proxy` | 网关给 openresty 的 key(从 Secret 读) | 401 |
+| `ai-statistics` | 把本路由加进列表 | 没有 token 指标 |
+
+**先写插件规则,最后建 Ingress**。Ingress 是「路由可达」的那一步,守它的东西必须先就位 ——
+反过来写,插件中途失败就会留下一条**已经可达、但 key-auth 规则没写进去**的路由:不带 key 也返 200,
+而现场只有 CR 上一个 `GatewaySynced=False`。规则里引用一条还不存在的 Ingress 是惰性的,所以这个顺序自己不开窗口。
+
+**不填 `authConsumers` = 谁都不许调**,渲染成 `allow: []`,插件读作「nobody is allowed」回 403。
+这和「不写规则」是两件不同的事,而不是同一件事的两种值:网关跑在 `global_auth: false` 下,
+一条**没有 key-auth 规则**的路由不是被拒而是**开放的**(插件对它根本不跑)。所以漏填一个字段
+绝不能成为公开路由的来路 —— 要公开就显式写 `authConsumers: ["*"]`,只有它不写规则。
+
+**`authConsumers` 的名字在发布前对着 key-auth 的 `defaultConfig.consumers` 校验**。
+名字写错插件不会报错,只会对所有调用方回 403,而 CR 显示同步正常 —— 以前这是网关 chart 在渲染时拦下的,
+现在 allow 名单归我们写,校验也跟着搬过来。同理,`upstreamAuthSecretRef` 的值不能同时是某个 consumer 的
+credential:那是网关递给 openresty 的凭证,一旦它也能当调用方凭证用,泄露一次等于开两道门。
+
+**接新插件不用改 autoconfig**:`spec.gateway.extraPlugins` 是个 map,key 是 WasmPlugin 对象名,
+value 原样下发成本路由的 matchRule。限流、上下文准入这类 autoconfig 没有任何需要理解的东西的插件,
+走这条路 —— chart 部署一次插件(镜像/phase/priority/failStrategy 本来就是 chart 的事),
+CRD 和 controller 零改动。
+
+```yaml
+gateway:
+  extraPlugins:
+    cluster-key-rate-limit:
+      rule_name: glm-53
+      limit_by_header: x-mse-consumer
+      limit_keys: [{key: tenant-a, query_per_minute: 600}]
+```
+
+**哪些插件必须类型化、不能透传**:配置依赖「写入方看不见的东西」时 ——
+`ai-backend-router` 的表是算出来的(路径来自 ModelRoute、权重按就绪成员归一,都是集群实时状态);
+`ai-proxy` 的内容是密钥(透传等于把明文写进 CR);`key-auth` 的 allow 要对着网关的 consumers 交叉校验,
+而且「谁能用这个模型」是 console 要当一等字段读写的策略。这三个写进 `extraPlugins` 会被 reconciler 拒掉
+(`GatewaySynced=False`,什么都不写)。**这里没有 CEL 这一道**:API server 会把「value 带
+`x-kubernetes-preserve-unknown-fields` 的 map」整个排除在 CEL 的类型系统之外,给这个字段写规则会让
+整个 CRD 装不上去 —— 原样透传和 API server 侧校验,在同一个字段上只能要一个。`ai-statistics` 不在此列,
+可以覆盖。
+
+⚠️ **透传的内容不校验**。插件的校验在网关侧,写错了 apply 照样成功,要到网关加载插件时才炸,
+而一个插件出问题会连带卡住所有插件的配置下发。用它就等同于直接写网关配置。
+
+**插件不存在时的分寸**:有东西要写却写不进去,就是失败 —— `ai-backend-router` 缺了没有分流,
+`key-auth` 缺了而 fleet 配了 `authConsumers` 就是**一条不鉴权的路由**,都置 `GatewaySynced=False`。
+**本来就没东西要写**则跳过,那只是这个集群没用这个插件。两个例外:`ai-statistics` 缺了只丢指标,
+一律跳过;`ai-proxy` 缺了**且凭证是默认来的**(没显式写 `upstreamAuthSecretRef`)也跳过 ——
+一个从没部署过 ai-proxy、也从没指定过 Secret 的集群,就是 openresty 不收 key 的集群,
+不该因为加了默认值就变成「fleet 拒绝发布」。**显式写了 `upstreamAuthSecretRef` 则是指令,照样失败。**
+
+⚠️ 这个例外只在**默认的那个 Secret 存在**时才走到:凭证是先解析的,`openresty-api-keys` 不在
+fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失」那一步。而一个没装 ai-proxy 的集群
+通常也没有那个 Secret —— 那种集群要发布 fleet,得显式写 `upstreamAuthSecretRef: none`。
+
+**`status.observedGeneration` 只在同步成功时推进**。它是 console 和 decision-gen 轮询的收敛信号,
+失败时也推进就等于告诉它们「新的分流已经生效」,而实际上什么都没写、表还冻在上一次好值。
+
+**`status.appliedExtraPlugins` 记下真正写过的透传插件**。从 spec 里删掉一个 key 时,reconciler
+只看得见「现在有什么」,不记就撤不回来 —— 那条限流规则会继续在活路由上生效,而 CR 里已经没有它了。
+这跟 ModelRoute 用 `appliedRouteKey` 处理改名是同一个理由。
+
+**几个容易想当然的点**:
+
+- **没写 `trafficPolicy` = 成员间平均分**,不是「全压给 `defaultMember`」。fleet 是有人把
+  一组都在服务同一个模型的服务放到一个名字后面,所以「还没人决定怎么分」的诚实读法是「都用上」。
+  否则给 fleet 加一块硬件在 console 上什么都不会发生:新成员显示 Ready 却一直闲着,
+  要等 decision-gen 开口。**一旦写了 policy 就完全照写的来**,包括它没列的成员 —— 那时
+  「没列」本身就是决策的一部分。
+- **把权重全设 0 不等于停服**,等于「全压到 `defaultMember`」—— 这是把一个 fleet 排空而不删对象的
+  唯一办法,所以它必须和「没有 policy」区分开,不能被当成「还没决定」而改成平均分。
+- **`status.effectiveWeight` 报的是「实际在生效的占比」,不等于决策表里的 weight**。
+  权重被显式全置 0 时,表里全是 0、靠 `defaultMember` 兜底转发,
+  但那个成员实际吃掉 100% 流量 —— status 这时报 10000,不报 0。报 0 会让 decision-gen
+  拿一个「看起来闲着、实际扛着全部流量」的成员去算下一轮。
+- **权重按 tier 在「真正 ready 的成员」之间重新归一**,用最大余数法,每个 tier 恰好合计 10000。
+  成员挂了它那份要**重新分配**,不能扣进黑洞;decision-gen 必须读 `status.members[].effectiveWeight`
+  而不是自己上次写的值,否则是拿没发生过的流量算下一轮。
+- **不 ready 的成员整条不进表**,而不是进表带 weight 0 —— weight 0 仍是合法的溢出落点,
+  往一个没有后端的成员溢出,会把「降级」变成「故障」。**唯一例外是 `defaultMember`**:
+  插件按 id 在表里解析 `default`,它不在表里就成了网关错误。
+- **`matchRules` 在 WasmPlugin CRD 里是裸数组、没有 listType** → SSA 下是 atomic,
+  apply 会整份替换、把网关 chart 写的规则全抹掉。所以这四个对象走 read-modify-write、
+  按「规则绑的是哪条 Ingress」认自己那条,**内容没变就不写**(每次写都是一次全数据面的配置下发)。
+- **孤儿引用只报不拒**:`trafficPolicy` 里引用了已被 console 删掉的成员,记在 `PolicyApplied`
+  condition 上并忽略该条,不拒收整份策略 —— 拒了就是 console 的删除和 decision-gen 的旧策略互锁。
+- **`stickiness` 在 apply 时直接拒**:ai-backend-router 目前只有 WeightedRandom、没有 hash picker,
+  收下它等于配了个永远不生效的开关。
+- `capabilities` 的两个字段目前都是**保留字段**:并发准入在 openresty 不在网关,
+  按上下文长度准入插件没有落点。只用于展示与 `status.totalCapacity` 求和。
+
+**CRD 装在 chart 的 `crds/` 目录,而 `helm upgrade` 不会更新它** —— 以后给 ModelFleet 加字段,
+升级 autoconfig 不生效,必须单独 `kubectl apply --server-side -f` 那份 CRD。
+
+端到端验证脚本(测试集群 k8s-cpu-16)见 `tools/modelfleet/e2e_cpu16.sh`(在 vllm 仓)。
+
 ## 消费方接入
 
 autoconfig 只负责把配置**写进已有的 ConfigMap**(不创建 chart、不创建 ConfigMap);消费方各自 chart 建初始

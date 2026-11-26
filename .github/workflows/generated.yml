@@ -1,0 +1,46 @@
+name: generated
+
+# The CRDs and the RBAC rules in deploy/ are generated from the Go types by `make manifests`.
+# Nothing else checks that what is committed matches what the types say, and a stale copy is
+# invisible: the Go code compiles, the tests pass, and the drift only surfaces on a cluster —
+# or not at all, when it is a field description that now contradicts the behaviour.
+# A CRD shipped with the wrong schema is worse: `kubectl apply` either rejects it or accepts a
+# field the controller does not read.
+on:
+  pull_request:
+    paths:
+      - 'api/**'
+      - 'config/**'
+      - 'deploy/helm/autoconfig/crds/**'
+      - 'deploy/helm/autoconfig/files/**'
+      - 'Makefile'
+      - '.github/workflows/generated.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Regenerate
+        run: make manifests generate
+
+      - name: Committed manifests match the types
+        run: |
+          if ! git diff --exit-code; then
+            echo
+            echo "::error::generated files are out of date - run 'make manifests generate' and commit the result"
+            exit 1
+          fi

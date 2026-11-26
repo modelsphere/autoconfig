@@ -1,4 +1,4 @@
-// Package v1alpha1 定义 routing.modelsphere.dev/v1alpha1 的 ModelRoute CRD。
+// Package v1alpha1 定义 routing.modelsphere.dev/v1alpha1 的 ModelRoute 与 ModelFleet CRD。
 // +kubebuilder:object:generate=true
 // +groupName=routing.modelsphere.dev
 package v1alpha1
@@ -18,5 +18,5 @@ var (
 )
 
 func init() {
-	SchemeBuilder.Register(&ModelRoute{}, &ModelRouteList{})
+	SchemeBuilder.Register(&ModelRoute{}, &ModelRouteList{}, &ModelFleet{}, &ModelFleetList{})
 }

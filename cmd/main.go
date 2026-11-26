@@ -5,9 +5,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -81,6 +84,31 @@ func runController(leaderElect bool) error {
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}
+	// ModelFleet: aggregates several single-hardware ModelRoutes into one model behind one
+	// gateway address. It only reads ModelRoute status, so the two reconcilers share nothing
+	// but the API group.
+	//
+	// Registered only when its CRD is actually installed. `helm upgrade` does not apply
+	// crds/, so upgrading an existing release without applying the ModelFleet CRD by hand
+	// leaves the type missing - and watching a type that does not exist fails the manager,
+	// which would take ModelRoute down with it. A cluster that never asked for ModelFleet
+	// must not lose openresty peers, CART workers and monitor.conf over it.
+	has, err := hasModelFleetCRD(cs)
+	if err != nil {
+		return err
+	}
+	if has {
+		if err := (&controller.ModelFleetReconciler{
+			Client:    mgr.GetClient(),
+			APIReader: mgr.GetAPIReader(),
+			Scheme:    mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			return err
+		}
+	} else {
+		log.Print("ModelFleet CRD not installed: skipping that reconciler " +
+			"(apply deploy/helm/autoconfig/crds/ and restart to enable it)")
+	}
 	// controller-runtime 自带的 ping 检查:进程存活即通过。
 	// 注意它【不能】发现 reconcile 卡死 —— 要那个得看 metrics 的 workqueue_depth。
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -90,8 +118,28 @@ func runController(leaderElect bool) error {
 		return err
 	}
 
-	log.Print("controller start: ModelRoute (routing.modelsphere.dev/v1alpha1)")
+	log.Printf("controller start: ModelRoute%s (routing.modelsphere.dev/v1alpha1)",
+		map[bool]string{true: " + ModelFleet"}[has])
 	return mgr.Start(ctrl.SetupSignalHandler())
+}
+
+// hasModelFleetCRD asks the API server whether the type exists. Discovery rather than a
+// Get on the CRD object: it needs no apiextensions permission, and "is this kind served"
+// is exactly the question.
+func hasModelFleetCRD(cs kubernetes.Interface) (bool, error) {
+	list, err := cs.Discovery().ServerResourcesForGroupVersion(routingv1.GroupVersion.String())
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil // the whole group is absent: ModelRoute's CRD is missing too
+		}
+		return false, fmt.Errorf("discover %s: %w", routingv1.GroupVersion, err)
+	}
+	for _, r := range list.APIResources {
+		if r.Kind == "ModelFleet" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func envOr(k, def string) string {

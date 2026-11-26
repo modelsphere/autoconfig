@@ -1,0 +1,81 @@
+# ModelFleet: one model served from three kinds of accelerator, behind one address.
+#
+# The three services already exist and are unchanged — swiss created one per hardware type,
+# each with its own ModelRoute, its own CART and its own openresty path. This object only
+# aggregates them at the gateway.
+#
+# Three writers share it, and each must use its own Server-Side Apply field manager
+# (`kubectl apply --server-side --field-manager=...`). A client-side apply or an Update built
+# from a constructed object replaces the whole object and silently wipes the other writers'
+# fields — which is how helm once wiped CART's live tuning.
+#   console      : everything except trafficPolicy
+#   decision-gen : trafficPolicy only
+#   autoconfig   : status only (status subresource)
+apiVersion: routing.modelsphere.dev/v1alpha1
+kind: ModelFleet
+metadata:
+  name: glm-5.3
+  namespace: llm-route
+spec:
+  # ---- written by console ----
+  modelName: glm-5.3            # what the client sends as body.model
+  gateway:
+    class: higress
+    namespace: higress-system   # where the WasmPlugin objects live
+    service: openresty:8080     # the Ingress backend; members are told apart by path
+    externalURL: http://172.28.44.17:31080   # published as status.endpoint + /v1
+    authConsumers: [ops]        # key-auth allow-list for this route (keys stay in the chart)
+    # upstreamAuthSecretRef: omitted = openresty-api-keys:keys, where that key already
+    # lives. Set it only to point elsewhere, or to "none" if openresty needs no key.
+    # extraPlugins: config for plugins this controller has no opinion about, passed through
+    # verbatim as this route's match rule. Adding a plugin to the gateway is a chart change
+    # plus a few lines here - no new CRD field, no new release of the controller.
+    # NOT validated: plugin config is checked at the gateway, so a wrong field applies
+    # cleanly and then fails when the gateway loads the plugin.
+    # extraPlugins:
+    #   cluster-key-rate-limit:
+    #     rule_name: glm-53
+    #     limit_by_header: x-mse-consumer
+    #     limit_keys: [{key: tenant-a, query_per_minute: 600}]
+
+  # Where traffic lands when no member is selectable (all drained, all weights 0, or the
+  # plugin errors). That round does not overflow afterwards.
+  # NOTE: zeroing every weight therefore means "send everything here", not "stop serving".
+  defaultMember: h100
+
+  members:
+  - name: h100                  # = backend id in the decision table and the metric label
+    hardware: {vendor: nvidia, model: H100, replicas: 2}
+    backend: {modelRouteRef: glm-53-h100}     # path prefix is read from the ModelRoute
+    capabilities: {maxContextTokens: 131072, maxConcurrency: 16}
+  - name: ascend
+    hardware: {vendor: huawei, model: 910B4, replicas: 1}
+    backend: {modelRouteRef: glm-53-ascend}
+    capabilities: {maxContextTokens: 131072, maxConcurrency: 8}
+  - name: rtx6000d
+    hardware: {vendor: nvidia, model: RTX6000D, replicas: 1}
+    backend: {modelRouteRef: glm-53-6000d}
+    capabilities: {maxContextTokens: 65536, maxConcurrency: 8}
+
+  # ---- written by decision-gen ----
+  # tier: lower is preferred; a higher tier is only reached when every lower one overflows
+  #       (429/502/503/504). weight: the split inside one tier, relative, 0 = drained.
+  # Here: H100 and ascend share the load 80/20, and the 6000D box is only used once both
+  # of them are full — a split that one number could not express.
+  trafficPolicy:
+    revision: 42                # audit tag only; convergence is generation/observedGeneration
+    reason: "ascend TTFT p95 over threshold, 2000 -> 1000"
+    members:
+    - {name: h100,     tier: 0, weight: 8000}
+    - {name: ascend,   tier: 0, weight: 2000}
+    - {name: rtx6000d, tier: 1, weight: 10000}
+
+# status is written by autoconfig only. Read it, do not set it:
+#   endpoint          the one address to show
+#   observedGeneration== metadata.generation means the gateway has been told
+#   totalCapacity     summed over READY members only
+#   members[].effectiveWeight
+#                     the weight actually in force. It is not spec's weight once a member
+#                     goes unready: the survivors in that tier are renormalised, so the dead
+#                     member's share is redistributed instead of dropped. decision-gen must
+#                     compute from this, never from its own last write.
