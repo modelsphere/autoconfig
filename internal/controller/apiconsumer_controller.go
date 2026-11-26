@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -243,6 +244,33 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		if err != nil {
 			return fmt.Errorf("read defaultConfig.consumers: %w", err)
 		}
+		// Take ownership of the field before writing it, if it is not ours yet.
+		//
+		// Why this cannot be left to the write itself: a non-apply Update only takes
+		// ownership of the fields whose VALUES it changes, and the first thing this
+		// controller does on an already-populated gateway is adopt the live entries
+		// unchanged. Measured on the test cluster, a same-value Update moves nothing, so the
+		// field stays helm's for as long as the rendered list happens to match - and the
+		// gateway chart holds its upgrade back until a non-helm manager owns the field,
+		// which would then never happen.
+		//
+		// A force apply of just this field is enough: it leaves the value alone and makes
+		// autoconfig a CO-OWNER alongside helm (also measured - it does not dispossess
+		// helm), which is what the chart waits for. The chart then stops rendering the
+		// field, helm's claim on it lapses, and this controller is left as the only owner.
+		// `keys` and `global_auth` are untouched and stay helm's: defaultConfig is tracked
+		// field by field, not as one atomic blob.
+		if len(consumers) > 0 && !ownsConsumers(obj) {
+			if err := r.claimConsumers(ctx, gwNS, live); err != nil {
+				return fmt.Errorf("take ownership of %s/key-auth defaultConfig.consumers: %w", gwNS, err)
+			}
+			// Re-read: the apply bumped resourceVersion, and the Update below would be
+			// refused on the stale one.
+			if err := r.Get(ctx, types.NamespacedName{Namespace: gwNS, Name: "key-auth"}, obj); err != nil {
+				return fmt.Errorf("key-auth in namespace %q after taking ownership: %w", gwNS, err)
+			}
+		}
+
 		// THE guard. An empty list where the gateway has entries means every caller is
 		// refused on every route - the whole site's authentication, off, in one write.
 		//
@@ -504,4 +532,57 @@ func sortConsumerList(list []any) {
 		bn, _ := b["name"].(string)
 		return an < bn
 	})
+}
+
+// fieldManagerName is the manager this controller writes under. It is what the gateway chart
+// looks for before it yields defaultConfig.consumers, so it is part of an agreed contract
+// with that chart, not an internal detail - see modelsphere/modelsphere#90.
+const fieldManagerName = "autoconfig"
+
+// ownsConsumers: does this controller already own defaultConfig.consumers? Any entry under
+// its own manager counts, whether recorded by an apply or by an update - the chart yields to
+// any manager that is not helm.
+func ownsConsumers(obj *unstructured.Unstructured) bool {
+	for _, mf := range obj.GetManagedFields() {
+		if mf.Manager != fieldManagerName || mf.FieldsV1 == nil {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(mf.FieldsV1.Raw, &fields); err != nil {
+			continue
+		}
+		spec, _ := fields["f:spec"].(map[string]any)
+		def, _ := spec["f:defaultConfig"].(map[string]any)
+		if _, ok := def["f:consumers"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// claimConsumers applies defaultConfig.consumers with its CURRENT value, which changes
+// nothing and makes this controller an owner of the field. force, because the point is to
+// claim a field somebody else owns; without it the apply is refused with a conflict.
+//
+// Only this one field is sent. defaultConfig's other keys are not named, and an apply does
+// not remove fields it never claimed, so keys and global_auth stay exactly as they are -
+// which matters, since a key-auth without a consumers OR credentials key fails to parse
+// altogether and the plugin is FAIL_CLOSE.
+func (r *APIConsumerReconciler) claimConsumers(ctx context.Context, gwNS string, live []any) error {
+	claim := &unstructured.Unstructured{}
+	claim.SetGroupVersionKind(wasmPluginGVK)
+	claim.SetNamespace(gwNS)
+	claim.SetName("key-auth")
+	value := live
+	if value == nil {
+		// Absent rather than empty: claim it as the empty list, which is also the value a
+		// gateway needs to have at all for its config to parse.
+		value = []any{}
+	}
+	if err := unstructured.SetNestedSlice(claim.Object, value, "spec", "defaultConfig", "consumers"); err != nil {
+		return err
+	}
+	logf.FromContext(ctx).Info("taking ownership of the gateway consumer list",
+		"gateway", gwNS, "entries", len(value))
+	return r.Patch(ctx, claim, client.Apply, client.ForceOwnership, client.FieldOwner(fieldManagerName))
 }

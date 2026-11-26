@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -78,14 +79,57 @@ func liveConsumer(name string, creds ...string) map[string]any {
 	}
 }
 
+// appliedFields records every server-side-apply this controller made, per object. The fake
+// client refuses apply patches outright ("apply patches are not supported in the fake
+// client"), so they are translated into the merge patch that has the same effect on the
+// stored object and counted here. Without the translation the ownership takeover - the one
+// write that MUST be an apply - could not be exercised at all; without the counting, a test
+// could not tell "took ownership once" from "re-applies on every pass", which is an ECDS
+// push of key-auth to the whole data plane each time.
+type appliedFields struct {
+	byObject map[string][]string
+}
+
+func (a *appliedFields) count(name string) int { return len(a.byObject[name]) }
+
 func newConsumerReconciler(t *testing.T, objs ...client.Object) (*APIConsumerReconciler, client.Client) {
+	r, c, _ := newConsumerReconcilerRecording(t, objs...)
+	return r, c
+}
+
+func newConsumerReconcilerRecording(t *testing.T, objs ...client.Object) (
+	*APIConsumerReconciler, client.Client, *appliedFields) {
 	t.Helper()
 	s := fleetScheme(t)
+	applies := &appliedFields{byObject: map[string][]string{}}
 	c := ctrlfake.NewClientBuilder().WithScheme(s).
 		WithObjects(objs...).
 		WithStatusSubresource(&routingv1.APIConsumer{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+				patch client.Patch, opts ...client.PatchOption) error {
+				if patch.Type() != types.ApplyPatchType {
+					return cl.Patch(ctx, obj, patch, opts...)
+				}
+				data, err := patch.Data(obj)
+				if err != nil {
+					return err
+				}
+				key := obj.GetNamespace() + "/" + obj.GetName()
+				applies.byObject[key] = append(applies.byObject[key], string(data))
+				if err := cl.Patch(ctx, obj, client.RawPatch(types.MergePatchType, data),
+					&client.PatchOptions{}); err != nil {
+					return err
+				}
+				// The fake client keeps no managedFields, and the code under test asks
+				// whether it already owns a field before claiming it. Without this, that
+				// question answers "no" forever and the takeover repeats on every pass -
+				// which is exactly what TestConsumerUnchangedListIsNotRewritten caught.
+				return recordApplyOwnership(ctx, cl, obj, data, fieldManagerName)
+			},
+		}).
 		Build()
-	return &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}, c
+	return &APIConsumerReconciler{Client: c, APIReader: c, Scheme: s}, c, applies
 }
 
 func reconcileConsumer(t *testing.T, r *APIConsumerReconciler, name string) error {
@@ -639,5 +683,129 @@ func TestConsumerSettledStatusIsNotRewritten(t *testing.T) {
 	}
 	if version() == before {
 		t.Fatal("lastSyncTime was left stale: nothing would show the controller is still alive")
+	}
+}
+
+// recordApplyOwnership writes the managedFields entry a real API server would have recorded
+// for this apply: the paths the patch names, under the given manager.
+func recordApplyOwnership(ctx context.Context, cl client.Client, obj client.Object,
+	patch []byte, manager string) error {
+	var body map[string]any
+	if err := json.Unmarshal(patch, &body); err != nil {
+		return err
+	}
+	fields := toFieldSet(body)
+	delete(fields, "f:apiVersion")
+	delete(fields, "f:kind")
+	delete(fields, "f:metadata")
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), live); err != nil {
+		return err
+	}
+	mfs := live.GetManagedFields()
+	for i := range mfs {
+		if mfs[i].Manager == manager && mfs[i].Operation == metav1.ManagedFieldsOperationApply {
+			mfs[i].FieldsV1 = &metav1.FieldsV1{Raw: raw}
+			live.SetManagedFields(mfs)
+			return cl.Update(ctx, live)
+		}
+	}
+	live.SetManagedFields(append(mfs, metav1.ManagedFieldsEntry{
+		Manager:    manager,
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: live.GetAPIVersion(),
+		FieldsType: "FieldsV1",
+		FieldsV1:   &metav1.FieldsV1{Raw: raw},
+	}))
+	return cl.Update(ctx, live)
+}
+
+// toFieldSet turns {"spec":{"defaultConfig":{"consumers":[...]}}} into
+// {"f:spec":{"f:defaultConfig":{"f:consumers":{}}}} - the shape managedFields uses, with
+// leaves (including whole lists, which are atomic here) as empty objects.
+func toFieldSet(v map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, val := range v {
+		if child, ok := val.(map[string]any); ok {
+			out["f:"+k] = toFieldSet(child)
+			continue
+		}
+		out["f:"+k] = map[string]any{}
+	}
+	return out
+}
+
+// The takeover. Until a manager other than helm owns defaultConfig.consumers, the gateway
+// chart refuses to stop rendering it (modelsphere/modelsphere#90) - and a non-apply Update
+// only takes ownership of fields whose VALUE it changes, so adopting the live entries
+// unchanged, which is the first thing this controller does on a populated gateway, moves
+// nothing. Hence one force apply of just that field, with its current value.
+func TestConsumerTakesOwnershipOfTheConsumerList(t *testing.T) {
+	r, c, applies := newConsumerReconcilerRecording(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		// The chart's list, owned by helm, with tenant-a already in it: the migration case,
+		// where the rendered list matches live and an Update would therefore change nothing.
+		keyAuthWith(liveConsumer("tenant-a", "Bearer sk-a"), liveConsumer("ops", "Bearer sk-ops")),
+	)
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if n := applies.count("higress-system/key-auth"); n != 1 {
+		t.Fatalf("server-side applies = %d, want exactly 1 (the ownership claim)", n)
+	}
+	// The claim must name ONLY consumers. defaultConfig is tracked field by field, but an
+	// apply that named keys or global_auth would take those from helm too, and one that
+	// dropped them while owning the parent would leave a key-auth that cannot parse at all
+	// - and the plugin is FAIL_CLOSE.
+	// Parsed, not grepped: "keys" also appears INSIDE each consumer entry, where it belongs,
+	// so a substring check reports a problem that is not there (it did).
+	var claim map[string]any
+	if err := json.Unmarshal([]byte(applies.byObject["higress-system/key-auth"][0]), &claim); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := claim["spec"].(map[string]any)
+	def, _ := spec["defaultConfig"].(map[string]any)
+	if len(spec) != 1 || len(def) != 1 {
+		t.Fatalf("the claim names more than defaultConfig.consumers: spec=%v", spec)
+	}
+	if _, ok := def["consumers"]; !ok {
+		t.Fatalf("the claim does not name consumers: %v", def)
+	}
+
+	// Nothing else changed: the claim carries the CURRENT value, so the gateway's list is
+	// not disturbed by taking ownership of it...
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "ops,tenant-a" {
+		t.Fatalf("consumers = %v, want the live list untouched", names)
+	}
+	// ...and keys/global_auth are still there, which is what a FAIL_CLOSE plugin needs.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if keys, found, _ := unstructured.NestedStringSlice(ka.Object, "spec", "defaultConfig", "keys"); !found || len(keys) == 0 {
+		t.Fatal("the claim removed defaultConfig.keys: key-auth can no longer parse its config")
+	}
+	if _, found, _ := unstructured.NestedBool(ka.Object, "spec", "defaultConfig", "global_auth"); !found {
+		t.Fatal("the claim removed defaultConfig.global_auth")
+	}
+
+	// Claimed once, not once per pass: every apply that changes something is an ECDS push of
+	// key-auth to the whole data plane.
+	for i := 0; i < 3; i++ {
+		if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := applies.count("higress-system/key-auth"); n != 1 {
+		t.Fatalf("server-side applies = %d after four passes, want 1: the claim repeats", n)
 	}
 }
