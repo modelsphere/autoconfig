@@ -399,14 +399,6 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
 		return nil, err
 	}
-	for _, m := range fleet.Spec.Members {
-		if ns, _ := splitRef(m.Backend.ModelRouteRef, fleet.Namespace); ns != fleet.Namespace {
-			return nil, fmt.Errorf("member %q: modelRouteRef %q names namespace %q, but this "+
-				"fleet's Ingress can only reach the openresty in its own namespace (%q), which "+
-				"serves only that namespace's routes - the member's path would 404 on a route "+
-				"reported as healthy", m.Name, m.Backend.ModelRouteRef, ns, fleet.Namespace)
-		}
-	}
 
 	policy := map[string]routingv1.PolicyMember{}
 	if p := fleet.Spec.TrafficPolicy; p != nil {
@@ -451,6 +443,24 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		route := mr.Spec.Nginx.Route
 		if route == "" {
 			route = mr.Name
+		}
+		// The member's path is only reachable through the openresty this fleet's Ingress
+		// points at, which is the one in the fleet's namespace. A ModelRoute writes its route
+		// config into whatever ConfigMap it names, and that is routinely in ANOTHER namespace
+		// - on these clusters half a dozen namespaces' routes all land in
+		// llm-route/openresty-conf - so a cross-namespace member is perfectly normal. What is
+		// not normal is a member whose route is served by a DIFFERENT openresty: its path
+		// would 404 on a route the fleet reports as healthy.
+		//
+		// This check replaces an earlier one that simply refused a cross-namespace
+		// modelRouteRef, on the assumption that an openresty serves only its own namespace.
+		// It does not, and that check both forbade a legitimate setup and missed the case
+		// that actually breaks: a same-namespace ModelRoute writing to another openresty.
+		if confNS, _ := splitRef(mr.Spec.Nginx.OutputConfigMap, mr.Namespace); confNS != fleet.Namespace {
+			return nil, fmt.Errorf("member %q: ModelRoute %s/%s writes its route into %q, but "+
+				"this fleet's Ingress sends traffic to the openresty in %q - the member's path "+
+				"would not be served there, and the route would 404 while the fleet reports it "+
+				"healthy", m.Name, ns, name, mr.Spec.Nginx.OutputConfigMap, fleet.Namespace)
 		}
 		view.Path = "/" + route
 		// Readiness is taken from the ModelRoute's own status rather than rediscovered here:

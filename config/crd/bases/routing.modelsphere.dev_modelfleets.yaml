@@ -213,12 +213,14 @@ spec:
                             this hardware type. The gateway path prefix is derived from its spec.nginx.route
                             (falling back to its metadata.name, same rule the ModelRoute itself uses).
 
-                            Same namespace only, and not merely as a convention: the fleet's Ingress sends every
-                            member's path to the openresty in the fleet's namespace (an Ingress backend cannot name
-                            a Service anywhere else), and that openresty serves the routes of its own namespace. A
-                            member whose ModelRoute lives elsewhere would get a path that this openresty does not
-                            serve - a 404 on a route the fleet reports as healthy. An "ns/" prefix naming another
-                            namespace is refused rather than accepted and then silently dead.
+                            "ns/name" to name one in another namespace, which is normal: a ModelRoute writes its
+                            route config into whatever ConfigMap it names, and several namespaces' routes routinely
+                            land in one openresty. What a member cannot do is be served by a DIFFERENT openresty
+                            from the one this fleet's Ingress points at (the one in the fleet's namespace - an
+                            Ingress backend cannot name a Service anywhere else): its path would not be there, and
+                            the request would 404 on a route the fleet reports as healthy. That is what the
+                            reconciler checks, by comparing the ModelRoute's nginx.outputConfigMap against this
+                            fleet's namespace - the member's own namespace says nothing about it either way.
                           minLength: 1
                           type: string
                       required:

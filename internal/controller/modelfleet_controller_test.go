@@ -87,7 +87,10 @@ func modelRoute(name, ns, route string, backends int, ready bool) *routingv1.Mod
 		Spec: routingv1.ModelRouteSpec{
 			Discovery: routingv1.Discovery{Service: name + "-leader", Port: 8050},
 			Nginx: routingv1.NginxSpec{
-				Route: route, OutputConfigMap: ns + "/openresty-conf",
+				// Routes from many namespaces legitimately write into ONE openresty - on the
+				// test cluster half a dozen do - so the helper's default is the fleet's own
+				// openresty rather than its own namespace's.
+				Route: route, OutputConfigMap: "llm-route/openresty-conf",
 				// 8 per instance: the fleet reads its capacity from here, so the helper has
 				// to carry one — a route with no ceiling legitimately reports 0.
 				Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 8}},
@@ -468,6 +471,17 @@ func TestFleetMissingRouterPluginFailsSync(t *testing.T) {
 	if condTrue(fleet.Status.Conditions, condReady) {
 		t.Fatal("fleet Ready with an unprogrammed gateway")
 	}
+}
+
+// condMessage: a condition's message, for tests that check a failure NAMES what went wrong
+// rather than only that something did.
+func condMessage(conds []metav1.Condition, typ string) string {
+	for i := range conds {
+		if conds[i].Type == typ {
+			return conds[i].Message
+		}
+	}
+	return ""
 }
 
 func condTrue(conds []metav1.Condition, t string) bool {
@@ -874,15 +888,45 @@ func TestFleetEmptyAuthConsumersDeniesEveryone(t *testing.T) {
 	}
 }
 
-// modelRouteRef used to advertise "ns/name". The fleet's Ingress can only send traffic to the
-// openresty in its own namespace, and that openresty serves only its own namespace's routes,
-// so a member from elsewhere gets a path that 404s on a route reported as healthy.
-func TestFleetMemberFromAnotherNamespaceIsRefused(t *testing.T) {
+// A member in another namespace is fine — what matters is which openresty serves its path.
+// Routes from several namespaces routinely write into one openresty (on the test cluster,
+// minimax-h3, modelforge-01-glm, pp-strip-test and vllm-mock all write into
+// llm-route/openresty-conf), and a fleet made of those is a legitimate setup. An earlier
+// version of this check refused any cross-namespace ref, on the assumption that an openresty
+// serves only its own namespace's routes. It does not.
+func TestFleetMemberFromAnotherNamespaceIsFineWhenItSharesTheOpenresty(t *testing.T) {
 	f := fleetFixture()
 	f.Spec.Members[1].Backend.ModelRouteRef = "other-ns/glm-53-ascend"
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
-		modelRoute("glm-53-ascend", "other-ns", "glm-53-ascend", 1, true),
+		modelRoute("glm-53-ascend", "other-ns", "glm-53-ascend", 1, true), // writes into llm-route's openresty
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a member sharing this fleet's openresty was refused: %+v", fleet.Status.Conditions)
+	}
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	if len(backends) != 2 {
+		t.Fatalf("backends = %v, want both members", backends)
+	}
+}
+
+// ...and the case that actually breaks: a member whose route is served by a DIFFERENT
+// openresty. Its path is not on the openresty this fleet's Ingress points at, so a request
+// routed there would 404 while the fleet reports the member healthy. The namespace of the
+// ModelRoute says nothing about this — a same-namespace route can write elsewhere, which the
+// old check missed entirely.
+func TestFleetMemberServedByAnotherOpenrestyIsRefused(t *testing.T) {
+	stray := modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true)
+	stray.Spec.Nginx.OutputConfigMap = "other-gw/openresty-conf"
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		stray,
 		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
@@ -890,7 +934,11 @@ func TestFleetMemberFromAnotherNamespaceIsRefused(t *testing.T) {
 	var fleet routingv1.ModelFleet
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
-		t.Fatal("a member in another namespace was accepted")
+		t.Fatal("a member served by a different openresty was accepted")
+	}
+	msg := condMessage(fleet.Status.Conditions, condGatewaySynced)
+	if !strings.Contains(msg, "other-gw/openresty-conf") {
+		t.Fatalf("the message does not name the openresty it would have needed: %q", msg)
 	}
 }
 
