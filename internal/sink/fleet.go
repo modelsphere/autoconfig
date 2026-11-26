@@ -334,3 +334,14 @@ func RenderAIStatistics() *AIStatistics {
 		ApplyToLog:  true,
 	}}}
 }
+
+// StreamGuardRule is the match rule written for the repetition guard: empty on purpose.
+//
+// The plugin's parseRuleConfig starts from the global config and only replaces what the rule
+// names, so an empty object means "the parameters the gateway chart configured apply to this
+// route too". Writing them again here would put the detector thresholds in two places, and
+// this controller has no opinion about them.
+type StreamGuardRule struct{}
+
+// RenderStreamGuard: the rule that turns the guard on for a route.
+func RenderStreamGuard() *StreamGuardRule { return &StreamGuardRule{} }

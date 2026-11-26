@@ -241,6 +241,37 @@ type GatewaySpec struct {
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:XValidation:rule="!self.exists(c, c == '*') || size(self) == 1",message="authConsumers: \"*\" means \"no authentication on this route\" and cannot be combined with consumer names"
 	AuthConsumers []string `json:"authConsumers,omitempty"`
+	// StreamGuard: the repetition guard on this fleet's route. ON for every fleet unless this
+	// says otherwise, which is the whole point of the field existing at all.
+	//
+	// It is not in extraPlugins, although that would have worked without a line of controller
+	// code, because extraPlugins is written per fleet by whoever creates it - and a protection
+	// that each caller has to remember to switch on is missing from the fleet somebody built
+	// by copying an older one, silently, with nothing to say so. A default belongs to the
+	// controller; extraPlugins is for what ONE fleet wants differently.
+	//
+	// The parameters stay in the gateway chart's defaultConfig: this writes an empty rule and
+	// the plugin reads it as "the global config applies here" (its parseRuleConfig starts from
+	// the global one). So a fleet turning it off is a rule withdrawn, not a config rewritten.
+	//
+	// ⚠ The chart's defaultConfig MUST carry a non-empty `detectors`. The plugin refuses a
+	// config with none - including one inherited as empty - and a plugin that fails to load
+	// stalls the config push for EVERY plugin on that gateway, not just this one.
+	// +optional
+	StreamGuard *StreamGuard `json:"streamGuard,omitempty"`
+}
+
+// StreamGuard says whether the repetition guard runs on this route.
+type StreamGuard struct {
+	// Disabled takes the guard off this route. Spelled as the negative so that the safe
+	// behaviour is what an absent field means: a fleet nobody thought about is guarded, and
+	// turning the guard off is a thing somebody wrote down.
+	//
+	// What the guard does when it fires is cut the stream - a terminal chunk carrying
+	// finish_reason, then [DONE] - so switching it off is a real decision for a route whose
+	// callers would rather have a repetitive answer than a truncated one.
+	// +optional
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // ModelFleetSpec aggregates several single-hardware services into one externally visible model.

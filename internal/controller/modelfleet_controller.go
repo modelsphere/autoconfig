@@ -850,6 +850,32 @@ func fleetPlugins() []fleetPlugin {
 		// different accounting attributes may simply say so.
 		overridable: true,
 		config:      func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
+	}, {
+		// The repetition guard. Default ON: a rule is written for every fleet that has not
+		// said otherwise, which is why this is a plugin of its own rather than something each
+		// fleet passes through extraPlugins - a protection somebody has to remember to switch
+		// on is missing from the next fleet built by copying an older one.
+		name: "ai-stream-guard",
+		// Its absence costs the guard and nothing else: no 401, no route down, no missing
+		// metrics. A cluster whose gateway chart predates this plugin must not stop
+		// publishing fleets over it.
+		tolerateMissing: func(*fleetRender) bool { return true },
+		// Overridable, so a fleet that wants different thresholds can say so through
+		// extraPlugins - the same escape hatch ai-statistics has. The default here is an
+		// empty rule, which the plugin reads as "the global config applies".
+		overridable: true,
+		config: func(f *fleetRender) (any, error) {
+			if g := f.fleet.Spec.Gateway.StreamGuard; g != nil && g.Disabled {
+				return nil, nil // no rule: the guard does not run on this route
+			}
+			// Deliberately empty. The plugin's parseRuleConfig starts from the global config,
+			// so an empty rule means "what the chart configured", and this controller never
+			// has to know the detector parameters. ⚠ It does mean the chart's defaultConfig
+			// must carry a non-empty `detectors`: the plugin refuses a config with none, and
+			// a plugin that fails to load stalls the config push for every plugin on the
+			// gateway.
+			return sink.RenderStreamGuard(), nil
+		},
 	}}
 }
 

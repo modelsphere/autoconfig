@@ -2613,3 +2613,73 @@ func TestFleetCapacityUsesTheSharedPeerRule(t *testing.T) {
 		t.Fatalf("capacity = %d, want 100 (the cart cap follows the backends)", got)
 	}
 }
+
+// The guard is on for a fleet that never mentions it. That is the whole reason it is a plugin
+// of this controller's rather than something each fleet passes through extraPlugins: a
+// protection somebody has to remember to switch on is missing from the next fleet built by
+// copying an older one, silently.
+func TestFleetStreamGuardIsOnByDefault(t *testing.T) {
+	f := fleetFixture() // says nothing about streamGuard
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), wasmPlugin("ai-stream-guard"),
+	)
+	reconcileFleet(t, r)
+
+	rules := getPlugin(t, c, "ai-stream-guard")
+	if len(rules) != 1 {
+		t.Fatalf("ai-stream-guard has %d rule(s), want 1: a fleet that says nothing must be guarded", len(rules))
+	}
+	rule := rules[0].(map[string]any)
+	// The rule is EMPTY on purpose: the plugin reads an empty rule as "the global config
+	// applies", so the detector parameters live in the chart and not in two places.
+	cfg, _ := rule["config"].(map[string]any)
+	if len(cfg) != 0 {
+		t.Fatalf("the rule carries config %v, want an empty one so the chart's parameters apply", cfg)
+	}
+	if d, _ := rule["configDisable"].(bool); d {
+		t.Fatal("configDisable is true: the rule turns the plugin OFF for this route")
+	}
+
+	// ...and turning it off withdraws the rule rather than writing a different config.
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	if err := c.Get(context.Background(), nn, &fleet); err != nil {
+		t.Fatal(err)
+	}
+	fleet.Spec.Gateway.StreamGuard = &routingv1.StreamGuard{Disabled: true}
+	fleet.Generation = 2
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("ai-stream-guard still has %d rule(s) after the fleet turned it off", n)
+	}
+}
+
+// A gateway whose chart predates this plugin must keep publishing fleets. The guard's absence
+// costs the guard and nothing else - no 401, no route down, no missing metrics - so unlike
+// ai-backend-router and key-auth it must not fail the sync.
+func TestFleetStreamGuardMissingPluginIsTolerated(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+		// no ai-stream-guard object at all
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the fleet refused to publish over a missing guard: %s",
+			condMessage(fleet.Status.Conditions, condGatewaySynced))
+	}
+	if !condTrue(fleet.Status.Conditions, condReady) {
+		t.Fatal("Ready=False although only the guard is missing")
+	}
+}

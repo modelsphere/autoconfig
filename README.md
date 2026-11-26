@@ -479,6 +479,16 @@ key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。*
 `return false` 整份配置解析失败,而插件是 `FAIL_CLOSE`,后果是**整个网关所有路由全部拒绝**,
 不是"其中一个不生效"。渲染层会拒掉这种配置(报错只给 consumer 名和下标,不带 key 值)。
 
+**ai-stream-guard(重复检测截断)默认对每条 fleet 路由开启**,`gateway.streamGuard.disabled: true`
+是显式退出。它**不走 `extraPlugins`**,理由是层级:`extraPlugins` 由建 fleet 的人逐个填,
+而「默认都该有的防护」一旦要人记得写,照抄老 YAML 建的新模型就静默没有保护。默认值归 controller,
+`extraPlugins` 归「这一个 fleet 要的不一样」。
+autoconfig 写的是一条**空规则** —— 插件的 `parseRuleConfig` 以全局配置为底,空规则即「按 chart 配的参数跑」,
+所以阈值只存在于 chart 一处。关掉是**撤掉规则**,不是写另一份配置。
+⚠️ **chart 的 `defaultConfig` 必须有非空 `detectors`**:插件拒绝 detectors 为空的配置(包括从全局继承到的空),
+而**一个插件加载失败会卡住该网关上所有插件的配置推送**。
+插件对象不存在时**容忍**(只是少了防护,不像 key-auth 那样是 401),同步照常成功。
+
 **与网关 chart 的契约**(`modelsphere/helm-charts` 的 `charts/higress-llm`,双方都依赖,改一边会坏另一边):
 
 - **chart 不再渲染 `defaultConfig.consumers`,这个字段整个归 autoconfig。** 它继续渲染
