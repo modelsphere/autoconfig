@@ -2289,3 +2289,100 @@ func TestFleetDefaultedMemberStaysInTheTableWhenUnready(t *testing.T) {
 			"would reject the whole table and freeze this gateway's config")
 	}
 }
+
+// The manual kill switch, and the whole reason it is a field of its own rather than a zero
+// weight: decision-gen recomputes trafficPolicy from metrics and would put the member back
+// within the minute. A disabled member stays out however generous the policy is.
+func TestFleetDisabledMemberIsOutOfRotationDespiteItsWeight(t *testing.T) {
+	f := fleetFixture() // policy gives h100 8000, ascend 2000
+	f.Spec.Members[1].Disabled = true
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true), // perfectly healthy
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	for _, b := range backends {
+		if id, _, _ := unstructured.NestedString(b.(map[string]any), "id"); id == "ascend" {
+			t.Fatal("a disabled member is still in the decision table - the kill switch did nothing")
+		}
+	}
+	// ...and its share went to the rest of its tier rather than onto the floor.
+	m := backends[0].(map[string]any)
+	if w, _, _ := unstructured.NestedInt64(m, "weight"); w != 10000 {
+		t.Fatalf("surviving member weight = %d, want the disabled member's share redistributed", w)
+	}
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	for _, ms := range fleet.Status.Members {
+		if ms.Name != "ascend" {
+			continue
+		}
+		// Disabled, NOT Degraded: "someone took this out" and "this one is broken" call for
+		// opposite reactions, and the route behind it is healthy.
+		if ms.Phase != routingv1.MemberDisabled {
+			t.Fatalf("phase = %q, want Disabled", ms.Phase)
+		}
+		if ms.EffectiveWeight != 0 {
+			t.Fatalf("a disabled member reports effectiveWeight %d", ms.EffectiveWeight)
+		}
+	}
+	// It must not count towards the capacity the console shows, either.
+	if tc := fleet.Status.TotalCapacity; tc == nil || tc.MaxConcurrency != 16 {
+		t.Fatalf("totalCapacity = %+v, want only the live member's 16", tc)
+	}
+}
+
+// Omitted defaultMember skips disabled members: taking the first member out by hand must not
+// quietly make it the fallback for everything.
+func TestFleetDefaultMemberSkipsDisabledMembers(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.DefaultMember = ""
+	f.Spec.Members[0].Disabled = true // the one members[0] would otherwise pick
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	def, _, _ := unstructured.NestedString(rule, "config", "decisions", "static", "models", "glm-5.3", "default")
+	if def != "ascend" {
+		t.Fatalf("table default = %q, want the first member that is not disabled", def)
+	}
+}
+
+// A disabled member that IS the default stays in the table. The plugin resolves `default` by
+// id and rejects the entire table - every model - when it cannot find it, so dropping it
+// would turn one operator's drain into a gateway-wide config freeze.
+func TestFleetDisabledDefaultMemberStaysInTheTable(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members[0].Disabled = true // h100 is also the stated defaultMember
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	var seen bool
+	for _, b := range backends {
+		m := b.(map[string]any)
+		if id, _, _ := unstructured.NestedString(m, "id"); id == "h100" {
+			seen = true
+			if w, _, _ := unstructured.NestedInt64(m, "weight"); w != 0 {
+				t.Fatalf("the disabled default carries weight %d, want 0", w)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("the disabled default member was dropped - the plugin would reject the whole table")
+	}
+}

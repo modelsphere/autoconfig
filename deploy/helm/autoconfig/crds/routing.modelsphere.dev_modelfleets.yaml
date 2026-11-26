@@ -80,8 +80,12 @@ spec:
                   It makes "set every weight to 0" mean "send everything here", NOT "stop serving" —
                   draining the fleet is removing members or taking the route down, never zeroing weights.
 
-                  Optional: omitted means members[0], which is why a single-hardware fleet never has to
-                  state it. The field itself cannot go away, because the plugin requires `default` to be
+                  Optional: omitted means the first member that is not disabled, which is why a
+                  single-hardware fleet never has to state it. Not the first member with a non-zero
+                  weight: in the one case this field exists for — every weight zero — there is no such
+                  member, and deriving it from weights would let decision-gen move the fallback target
+                  just by rewriting a policy, which is the one thing about failure behaviour that should
+                  stay put. The field itself cannot go away, because the plugin requires `default` to be
                   the id of one of the model's backends and REJECTS THE WHOLE DECISION TABLE otherwise —
                   not that one model, the whole table, and a plugin that fails to load stalls the config
                   push for every plugin on that gateway (ai-backend-router decisions.go: "default: %q is
@@ -226,6 +230,25 @@ spec:
                       required:
                       - modelRouteRef
                       type: object
+                    disabled:
+                      description: |-
+                        Disabled takes this member out of rotation now, whatever the traffic policy says. It is
+                        the manual kill switch: "ascend's TTFT just blew up, get it out" — and it has to
+                        outlive decision-gen's next round, which is why it lives here, in the console's own
+                        subtree, rather than as a zero weight in trafficPolicy (decision-gen would recompute
+                        that from metrics within the minute and quietly put the member back).
+
+                        ⚠ Set it with your OWN Server-Side Apply field manager
+                        (kubectl apply --server-side --field-manager=ops-<who>). Ownership in SSA is per field,
+                        including inside a members[] entry, so a flag owned by someone else survives the
+                        console re-applying the whole list, and the console setting it back to false is refused
+                        with a conflict rather than silently winning. Set it under the console's own field
+                        manager and the console's next routine apply clears it — measured both ways on a test
+                        cluster (tools/modelfleet/ssa_killswitch_cpu16.sh in the vllm repo).
+
+                        A disabled member stays in status, with phase Disabled, so the console can tell "someone
+                        took this out" from "this one is broken".
+                      type: boolean
                     hardware:
                       description: 'Hardware: which accelerator this member runs on
                         (display only).'

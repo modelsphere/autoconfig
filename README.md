@@ -288,7 +288,7 @@ kind: ModelFleet
 metadata: {name: glm-5.3, namespace: llm-route}
 spec:
   modelName: glm-5.3            # 客户端 body.model
-  defaultMember: h100           # 可选,缺省 = members[0];没有成员可选时的落点
+  defaultMember: h100           # 可选,缺省 = 第一个非 disabled 的成员;没有成员可选时的落点
   gateway:
     namespace: higress-system   # WasmPlugin 所在 ns
     service: openresty:8080     # Ingress 的后端;成员靠【路径】区分
@@ -406,6 +406,16 @@ fleet 的 namespace 里就直接失败,根本到不了「容忍 ai-proxy 缺失�
 - **权重按 tier 在「真正 ready 的成员」之间重新归一**,用最大余数法,每个 tier 恰好合计 10000。
   成员挂了它那份要**重新分配**,不能扣进黑洞;decision-gen 必须读 `status.members[].effectiveWeight`
   而不是自己上次写的值,否则是拿没发生过的流量算下一轮。
+- **`members[].disabled` 是人工摘除的开关**,优先于 trafficPolicy:disabled 的成员直接不进决策表,
+  哪怕 decision-gen 刚给它写了 8000 的权重。它放在 `members`(console 的子树)而不是做成
+  「权重写 0」,正因为后者会被 decision-gen 下一轮按指标算回来 —— 一分钟后成员自己就回来了。
+  它的份额和「不 ready」一样在 tier 内重新分配,status 的 `phase` 报 `Disabled` 而不是 `Degraded`
+  (「有人摘掉的」和「自己坏了」要求的反应相反)。
+  ⚠ **摘除时要用自己的 field manager**(`kubectl apply --server-side --field-manager=ops-<谁>`):
+  SSA 的所有权细到 `members[]` 元素内部的单个字段,所以别人拥有的 flag 不会被 console 重写整个
+  列表带走,console 想把它改回 false 会撞 409;而**用 console 自己那个 manager 去摘**,下一次
+  常规 apply 就会静默清掉它。两个方向都在 cpu-16 上实测过
+  (vllm 仓 `tools/modelfleet/ssa_killswitch_cpu16.sh`)。
 - **不 ready 的成员整条不进表**,而不是进表带 weight 0 —— weight 0 仍是合法的溢出落点,
   往一个没有后端的成员溢出,会把「降级」变成「故障」。**唯一例外是 `defaultMember`**:
   插件按 id 在表里解析 `default`,查不到**不是降级,是整份决策表解析失败** ——

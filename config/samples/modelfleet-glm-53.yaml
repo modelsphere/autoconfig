@@ -41,7 +41,7 @@ spec:
   # Where traffic lands when no member is selectable (all drained, all weights 0, or the
   # plugin errors). That round does not overflow afterwards.
   # NOTE: zeroing every weight therefore means "send everything here", not "stop serving".
-  defaultMember: h100           # 可选:省略 = members[0]
+  defaultMember: h100           # 可选:省略 = 第一个非 disabled 的成员
 
   members:
   - name: h100                  # = backend id in the decision table and the metric label
@@ -50,6 +50,9 @@ spec:
   - name: ascend
     hardware: {vendor: huawei, model: 910B4, replicas: 1}
     backend: {modelRouteRef: glm-53-ascend}
+  # disabled: true 是人工摘除开关(优先于 trafficPolicy,decision-gen 算不回来)。
+  # 摘的时候用自己的 field manager:
+  #   kubectl apply --server-side --field-manager=ops-<谁> -f -
   - name: rtx6000d
     hardware: {vendor: nvidia, model: RTX6000D, replicas: 1}
     backend: {modelRouteRef: glm-53-6000d}

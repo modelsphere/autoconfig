@@ -393,8 +393,20 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	// of the backends and rejects the entire decision table otherwise, so there is always one
 	// - but a single-hardware fleet should not have to say which.
 	rend.defaultMember = fleet.Spec.DefaultMember
-	if rend.defaultMember == "" && len(fleet.Spec.Members) > 0 {
-		rend.defaultMember = fleet.Spec.Members[0].Name
+	if rend.defaultMember == "" {
+		for _, m := range fleet.Spec.Members {
+			if !m.Disabled {
+				rend.defaultMember = m.Name
+				break
+			}
+		}
+		// Every member disabled: the plugin still requires `default` to name one of the
+		// backends, so pick the first and let it be the landing spot for a fleet nobody
+		// wants traffic on. Reported below, because "all members disabled" is a state
+		// someone should see rather than discover.
+		if rend.defaultMember == "" && len(fleet.Spec.Members) > 0 {
+			rend.defaultMember = fleet.Spec.Members[0].Name
+		}
 	}
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
 		return nil, err
@@ -422,7 +434,7 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 
 	for _, m := range fleet.Spec.Members {
 		declared[m.Name] = true
-		view := sink.FleetMemberView{Name: m.Name}
+		view := sink.FleetMemberView{Name: m.Name, Disabled: m.Disabled}
 		if pm, ok := policy[m.Name]; ok {
 			view.Tier, view.Weight = pm.Tier, pm.Weight
 		} else if undecided {
@@ -1133,6 +1145,10 @@ func memberStatuses(fleet *routingv1.ModelFleet, rend *fleetRender) []routingv1.
 		v := byName[spec.Name]
 		phase := routingv1.MemberNotFound
 		switch {
+		case spec.Disabled:
+			// Checked first: a disabled member that is also down is still, as far as anyone
+			// reading this is concerned, a member someone took out.
+			phase = routingv1.MemberDisabled
 		case v.Ready:
 			phase = routingv1.MemberReady
 		case v.Path != "":
