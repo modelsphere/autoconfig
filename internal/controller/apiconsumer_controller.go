@@ -21,9 +21,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	routingv1 "autoconfig/api/v1alpha1"
 	"autoconfig/internal/sink"
@@ -294,7 +296,7 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 			}
 			return fmt.Errorf("key-auth in namespace %q: %w", gwNS, err)
 		}
-		live, _, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
+		live, found, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "consumers")
 		if err != nil {
 			return fmt.Errorf("read defaultConfig.consumers: %w", err)
 		}
@@ -460,7 +462,16 @@ func (r *APIConsumerReconciler) writeConsumers(ctx context.Context, gwNS string,
 		// skipped as no-ops. Deleting either of those two would then have left its entry in
 		// place as somebody else's, and the key would have kept working - the one thing
 		// deleting an APIConsumer must never do.
-		if sameRules(live, next) && sameNames(managed, mine) {
+		// `found` first: an ABSENT consumers key is not the same as an empty one. key_auth's
+		// parsePluginConfig returns false when neither consumers nor credentials is present,
+		// and the plugin is FAIL_CLOSE - so a gateway whose key-auth has no consumers key at
+		// all refuses every request on every route. Writing the key, even empty, is what
+		// makes that config parse. Without this the early return fires (sameRules treats
+		// nil and [] as equal) and the key is never created.
+		//
+		// This is the gateway chart's side of the contract: it stopped rendering the field,
+		// so this controller is the only thing that can put it there.
+		if found && sameRules(live, next) && sameNames(managed, mine) {
 			return nil
 		}
 		if err := unstructured.SetNestedSlice(obj.Object, next, "spec", "defaultConfig", "consumers"); err != nil {
@@ -850,3 +861,52 @@ func (r *APIConsumerReconciler) liveConsumerNames(ctx context.Context, gwNS stri
 }
 
 func hasLiveEntry(names map[string]bool, name string) bool { return names[name] }
+
+// KeyAuthReconciler watches each gateway's key-auth WasmPlugin, which is what makes this
+// controller responsible for a field no APIConsumer may exist to trigger.
+//
+// Three things need it, and the APIConsumer watch covers none of them:
+//
+//   - A fresh install. helm creates key-auth WITHOUT a consumers key (the chart stopped
+//     rendering it), and nobody has created an APIConsumer yet. key_auth cannot parse a
+//     defaultConfig with neither consumers nor credentials, and the plugin is FAIL_CLOSE, so
+//     the gateway refuses everything until the key exists. With only an APIConsumer watch,
+//     zero objects means zero reconciles and it never does.
+//   - key-auth being deleted and recreated (uninstall/install, or by hand). Every consumer
+//     entry goes with it. The objects still exist, so their own resync would restore them
+//     within the resync interval, but a watch makes it immediate - and with zero objects the
+//     missing key would again never be written.
+//   - The namespace question. With no APIConsumer there is nothing to say WHICH gateway to
+//     look at. The event answers it: this fires for every key-auth in the cluster, so no
+//     configured default is needed and none is guessed.
+type KeyAuthReconciler struct {
+	*APIConsumerReconciler
+}
+
+func (r *KeyAuthReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	// Same path as an APIConsumer round, deliberately: it renders every APIConsumer for this
+	// gateway AND guarantees the consumers key exists. Re-deriving a smaller "just ensure the
+	// key" write here would be a second way to write one field.
+	if err := r.programGateway(ctx, req.Namespace, nil); err != nil {
+		if errors.Is(err, errGatewayAbsent) {
+			return ctrl.Result{}, nil // deleted again; the next create re-triggers this
+		}
+		log.Error(err, "could not program the gateway from a key-auth event", "gateway", req.Namespace)
+		return ctrl.Result{RequeueAfter: consumerResyncTime}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *KeyAuthReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	keyAuth := &unstructured.Unstructured{}
+	keyAuth.SetGroupVersionKind(wasmPluginGVK)
+	return ctrl.NewControllerManagedBy(mgr).
+		For(keyAuth, builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+			// Only the plugin this controller writes. Every other WasmPlugin on the cluster
+			// would otherwise enqueue a gateway round that has nothing to do.
+			return o.GetName() == "key-auth"
+		}))).
+		Named("keyauth").
+		Complete(r)
+}

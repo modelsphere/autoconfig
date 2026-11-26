@@ -113,11 +113,22 @@ func runController(leaderElect bool) error {
 	// the same reason - a cluster that only uses ModelRoute must not lose openresty peers
 	// over a type it never asked for.
 	if served["APIConsumer"] {
-		if err := (&controller.APIConsumerReconciler{
+		consumers := &controller.APIConsumerReconciler{
 			Client:    mgr.GetClient(),
 			APIReader: mgr.GetAPIReader(),
 			Scheme:    mgr.GetScheme(),
-		}).SetupWithManager(mgr); err != nil {
+		}
+		if err := consumers.SetupWithManager(mgr); err != nil {
+			return err
+		}
+		// ...and a watch on the gateways' key-auth plugin itself. The gateway chart no
+		// longer renders defaultConfig.consumers, so this controller is the only thing that
+		// can create it - and key_auth cannot parse a defaultConfig without it (FAIL_CLOSE:
+		// the gateway refuses everything). A fresh install has zero APIConsumers, so the
+		// APIConsumer watch would never fire; this one does, and the event also says which
+		// namespace, so no default has to be configured or guessed.
+		if err := (&controller.KeyAuthReconciler{APIConsumerReconciler: consumers}).
+			SetupWithManager(mgr); err != nil {
 			return err
 		}
 	} else {

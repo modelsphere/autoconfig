@@ -1184,3 +1184,96 @@ func TestConsumerRevokesTheLastConsumerWithoutAStatus(t *testing.T) {
 		t.Fatalf("still held: %v", con.Finalizers)
 	}
 }
+
+// keyAuthWithoutConsumers: what the gateway chart creates now that it no longer renders the
+// field - a key-auth with keys and global_auth and NO consumers key at all.
+func keyAuthWithoutConsumers() *unstructured.Unstructured {
+	o := wasmPlugin("key-auth")
+	_ = unstructured.SetNestedField(o.Object, false, "spec", "defaultConfig", "global_auth")
+	_ = unstructured.SetNestedStringSlice(o.Object, []string{"x-higress-dummy-key"},
+		"spec", "defaultConfig", "keys")
+	return o
+}
+
+// The gateway chart stopped rendering defaultConfig.consumers, so this controller is the only
+// thing that can create it - and key_auth's parsePluginConfig returns false when neither
+// consumers nor credentials is present, with the plugin FAIL_CLOSE: the gateway refuses every
+// request on every route until the key exists.
+//
+// The hard part is the trigger. A fresh install has ZERO APIConsumers, so the APIConsumer
+// watch never fires; the key-auth watch does, and the event also says which namespace, so
+// nothing has to be configured or guessed.
+func TestKeyAuthWithoutConsumersGetsAnEmptyList(t *testing.T) {
+	r, c := newConsumerReconciler(t, keyAuthWithoutConsumers()) // no APIConsumer anywhere
+	kr := &KeyAuthReconciler{APIConsumerReconciler: r}
+	if _, err := kr.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "higress-system", Name: "key-auth"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "key-auth"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	live, found, err := unstructured.NestedSlice(ka.Object, "spec", "defaultConfig", "consumers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("consumers is still absent: key_auth cannot parse this config and the " +
+			"gateway refuses every request (FAIL_CLOSE)")
+	}
+	if len(live) != 0 {
+		t.Fatalf("consumers = %v, want an empty list", live)
+	}
+	// The rest of defaultConfig is untouched - writing the key must not cost the others.
+	if keys, ok, _ := unstructured.NestedStringSlice(ka.Object, "spec", "defaultConfig", "keys"); !ok || len(keys) != 1 {
+		t.Fatal("defaultConfig.keys was lost")
+	}
+	if _, ok, _ := unstructured.NestedBool(ka.Object, "spec", "defaultConfig", "global_auth"); !ok {
+		t.Fatal("defaultConfig.global_auth was lost")
+	}
+}
+
+// key-auth deleted and recreated takes every consumer entry with it. The objects still exist,
+// so their own resync would restore them within the interval, but the watch makes it the next
+// event instead - and the same path covers it, so there is no second way to write this field.
+func TestKeyAuthRecreatedRestoresTheConsumers(t *testing.T) {
+	existing := consumerFixture("tenant-a", "tenant-a-keys")
+	existing.Status.ConsumerName = "tenant-a"
+	existing.Status.AppliedGatewayNamespace = "higress-system"
+	r, c := newConsumerReconciler(t, existing,
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		keyAuthWithoutConsumers(), // as helm just recreated it: no entries at all
+	)
+	kr := &KeyAuthReconciler{APIConsumerReconciler: r}
+	if _, err := kr.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "higress-system", Name: "key-auth"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	names := consumerNames(gatewayConsumers(t, c, "higress-system"))
+	if strings.Join(names, ",") != "tenant-a" {
+		t.Fatalf("consumers = %v, want tenant-a restored after the recreation", names)
+	}
+	if got := creds0Of(t, c, "higress-system", "tenant-a"); strings.Join(got, ",") != "Bearer sk-a" {
+		t.Fatalf("credentials = %v", got)
+	}
+}
+
+// A key-auth that is gone again between the event and the round is not an error to retry.
+func TestKeyAuthEventForAMissingGatewayIsNotAnError(t *testing.T) {
+	r, _ := newConsumerReconciler(t)
+	kr := &KeyAuthReconciler{APIConsumerReconciler: r}
+	res, err := kr.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "higress-gone", Name: "key-auth"},
+	})
+	if err != nil {
+		t.Fatalf("a deleted gateway was reported as an error: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("requeued after %v for a gateway that does not exist", res.RequeueAfter)
+	}
+}
