@@ -37,6 +37,10 @@ type FleetMemberView struct {
 	// Tier and Weight are the intent from trafficPolicy.
 	Tier   int32
 	Weight int32
+	// Disabled: taken out of rotation by hand (spec.members[].disabled). Kept apart from
+	// Ready because the two are different facts: a disabled member can be perfectly healthy,
+	// and the console has to be able to say which it is.
+	Disabled bool
 	// Ready: the member has at least one ready fleetBackend. An unready member is left out of the
 	// table entirely rather than shipped with weight 0 — a zero-weight entry is still a
 	// legal overflow target for the plugin, and overflowing into a member with no backends
@@ -62,7 +66,9 @@ func EffectiveWeights(members []FleetMemberView) map[string]int32 {
 	byTier := map[int32][]FleetMemberView{}
 	for _, m := range members {
 		out[m.Name] = 0
-		if m.Ready && m.Weight > 0 {
+		// A disabled member takes no share at all, and - like an unready one - its share is
+		// redistributed among the rest of its tier rather than left on the floor.
+		if m.Ready && !m.Disabled && m.Weight > 0 {
 			byTier[m.Tier] = append(byTier[m.Tier], m)
 		}
 	}
@@ -208,8 +214,9 @@ func RenderDecisionTable(modelName, defaultMember string, members []FleetMemberV
 	for _, m := range members {
 		w := eff[m.Name]
 		// The default member is always in the table, even at weight 0, because the plugin
-		// resolves `default` by id against this list.
-		if w == 0 && m.Name != defaultMember {
+		// resolves `default` by id against this list - and a `default` naming a backend that
+		// is not there makes the plugin reject the WHOLE table, every model in it.
+		if (w == 0 || m.Disabled) && m.Name != defaultMember {
 			continue
 		}
 		if m.Path == "" {
@@ -327,3 +334,19 @@ func RenderAIStatistics() *AIStatistics {
 		ApplyToLog:  true,
 	}}}
 }
+
+// StreamGuardRule is the match rule written for the repetition guard.
+//
+// It is the marker the controller substitutes the plugin's own spec.defaultConfig for, NOT
+// the config that reaches the gateway - an empty rule was the first design and does not work:
+// with defaultConfigDisable true the Higress controller never sends defaultConfig, so an
+// empty rule arrives at a plugin whose global config is empty and is refused.
+//
+// The plugin's parseRuleConfig starts from the global config and only replaces what the rule
+// names, so an empty object means "the parameters the gateway chart configured apply to this
+// route too". Writing them again here would put the detector thresholds in two places, and
+// this controller has no opinion about them.
+type StreamGuardRule struct{}
+
+// RenderStreamGuard: the rule that turns the guard on for a route.
+func RenderStreamGuard() *StreamGuardRule { return &StreamGuardRule{} }

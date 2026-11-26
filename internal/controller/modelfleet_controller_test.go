@@ -87,8 +87,13 @@ func modelRoute(name, ns, route string, backends int, ready bool) *routingv1.Mod
 		Spec: routingv1.ModelRouteSpec{
 			Discovery: routingv1.Discovery{Service: name + "-leader", Port: 8050},
 			Nginx: routingv1.NginxSpec{
-				Route: route, OutputConfigMap: ns + "/openresty-conf",
-				Peers: []routingv1.RoutePeer{{Use: "backend"}},
+				// Routes from many namespaces legitimately write into ONE openresty - on the
+				// test cluster half a dozen do - so the helper's default is the fleet's own
+				// openresty rather than its own namespace's.
+				Route: route, OutputConfigMap: "llm-route/openresty-conf",
+				// 8 per instance: the fleet reads its capacity from here, so the helper has
+				// to carry one — a route with no ceiling legitimately reports 0.
+				Peers: []routingv1.RoutePeer{{Use: "backend", MaxConcurrency: 8}},
 			},
 		},
 		Status: routingv1.ModelRouteStatus{Backends: backends, Ready: ready},
@@ -111,11 +116,9 @@ func fleetFixture() *routingv1.ModelFleet {
 			},
 			Members: []routingv1.FleetMember{
 				{Name: "h100", Hardware: routingv1.Hardware{Vendor: "nvidia", Model: "H100", Replicas: 2},
-					Backend:      routingv1.MemberBackend{ModelRouteRef: "glm-53-h100"},
-					Capabilities: &routingv1.Capabilities{MaxConcurrency: 16}},
+					Backend: routingv1.MemberBackend{ModelRouteRef: "glm-53-h100"}},
 				{Name: "ascend", Hardware: routingv1.Hardware{Vendor: "huawei", Model: "910B4", Replicas: 1},
-					Backend:      routingv1.MemberBackend{ModelRouteRef: "glm-53-ascend"},
-					Capabilities: &routingv1.Capabilities{MaxConcurrency: 8}},
+					Backend: routingv1.MemberBackend{ModelRouteRef: "glm-53-ascend"}},
 			},
 			TrafficPolicy: &routingv1.TrafficPolicy{
 				Revision: 42,
@@ -468,6 +471,17 @@ func TestFleetMissingRouterPluginFailsSync(t *testing.T) {
 	if condTrue(fleet.Status.Conditions, condReady) {
 		t.Fatal("fleet Ready with an unprogrammed gateway")
 	}
+}
+
+// condMessage: a condition's message, for tests that check a failure NAMES what went wrong
+// rather than only that something did.
+func condMessage(conds []metav1.Condition, typ string) string {
+	for i := range conds {
+		if conds[i].Type == typ {
+			return conds[i].Message
+		}
+	}
+	return ""
 }
 
 func condTrue(conds []metav1.Condition, t string) bool {
@@ -874,15 +888,45 @@ func TestFleetEmptyAuthConsumersDeniesEveryone(t *testing.T) {
 	}
 }
 
-// modelRouteRef used to advertise "ns/name". The fleet's Ingress can only send traffic to the
-// openresty in its own namespace, and that openresty serves only its own namespace's routes,
-// so a member from elsewhere gets a path that 404s on a route reported as healthy.
-func TestFleetMemberFromAnotherNamespaceIsRefused(t *testing.T) {
+// A member in another namespace is fine — what matters is which openresty serves its path.
+// Routes from several namespaces routinely write into one openresty (on the test cluster,
+// minimax-h3, modelforge-01-glm, pp-strip-test and vllm-mock all write into
+// llm-route/openresty-conf), and a fleet made of those is a legitimate setup. An earlier
+// version of this check refused any cross-namespace ref, on the assumption that an openresty
+// serves only its own namespace's routes. It does not.
+func TestFleetMemberFromAnotherNamespaceIsFineWhenItSharesTheOpenresty(t *testing.T) {
 	f := fleetFixture()
 	f.Spec.Members[1].Backend.ModelRouteRef = "other-ns/glm-53-ascend"
 	r, c := newFleetReconciler(t, f,
 		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
-		modelRoute("glm-53-ascend", "other-ns", "glm-53-ascend", 1, true),
+		modelRoute("glm-53-ascend", "other-ns", "glm-53-ascend", 1, true), // writes into llm-route's openresty
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a member sharing this fleet's openresty was refused: %+v", fleet.Status.Conditions)
+	}
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	if len(backends) != 2 {
+		t.Fatalf("backends = %v, want both members", backends)
+	}
+}
+
+// ...and the case that actually breaks: a member whose route is served by a DIFFERENT
+// openresty. Its path is not on the openresty this fleet's Ingress points at, so a request
+// routed there would 404 while the fleet reports the member healthy. The namespace of the
+// ModelRoute says nothing about this — a same-namespace route can write elsewhere, which the
+// old check missed entirely.
+func TestFleetMemberServedByAnotherOpenrestyIsRefused(t *testing.T) {
+	stray := modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true)
+	stray.Spec.Nginx.OutputConfigMap = "other-gw/openresty-conf"
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		stray,
 		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
 	)
 	reconcileFleet(t, r)
@@ -890,7 +934,11 @@ func TestFleetMemberFromAnotherNamespaceIsRefused(t *testing.T) {
 	var fleet routingv1.ModelFleet
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
-		t.Fatal("a member in another namespace was accepted")
+		t.Fatal("a member served by a different openresty was accepted")
+	}
+	msg := condMessage(fleet.Status.Conditions, condGatewaySynced)
+	if !strings.Contains(msg, "other-gw/openresty-conf") {
+		t.Fatalf("the message does not name the openresty it would have needed: %q", msg)
 	}
 }
 
@@ -1994,7 +2042,7 @@ func TestFleetTotalCapacityCountsReadyMembersOnly(t *testing.T) {
 	if tc == nil {
 		t.Fatal("no totalCapacity")
 	}
-	// The fixture declares 16 for h100 and 8 for ascend, with 2 and 1 replicas.
+	// Read from the routes, not declared: h100 has 2 backends at 8 each, ascend is down.
 	if tc.MaxConcurrency != 16 || tc.ReadyReplicas != 2 {
 		t.Fatalf("totalCapacity = %+v, want only the ready member's 16/2", tc)
 	}
@@ -2107,5 +2155,650 @@ func TestFleetWithOneMemberGetsEverything(t *testing.T) {
 	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
 	if fleet.Status.MemberCount != 1 {
 		t.Fatalf("status.memberCount = %d", fleet.Status.MemberCount)
+	}
+}
+
+// Capacity is READ from each member's ModelRoute, not declared on the fleet: "per-instance
+// ceiling × discovered backends", the same rule the ModelRoute controller uses to size CART's
+// dynamic concurrency. It therefore follows a member scaling with nobody editing a field —
+// which is the whole reason the declared copy was removed.
+func TestFleetCapacityFollowsTheRoute(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	capacity := func() (int32, map[string]int32) {
+		var f routingv1.ModelFleet
+		_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &f)
+		per := map[string]int32{}
+		for _, m := range f.Status.Members {
+			per[m.Name] = m.MaxConcurrency
+		}
+		return f.Status.TotalCapacity.MaxConcurrency, per
+	}
+	total, per := capacity()
+	// 8 per instance in the helper: h100 has 2 backends, ascend 1.
+	if per["h100"] != 16 || per["ascend"] != 8 || total != 24 {
+		t.Fatalf("capacity = %d, per member %v, want 16+8", total, per)
+	}
+
+	// The member scales out. Nothing in the fleet changes, and the capacity has to move.
+	var mr routingv1.ModelRoute
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "glm-53-h100"}, &mr); err != nil {
+		t.Fatal(err)
+	}
+	mr.Status.Backends = 5
+	// A plain Update: only ModelFleet is registered as having a status subresource on this
+	// fake client, so Status().Update on a ModelRoute fails with a confusing NotFound.
+	if err := c.Update(context.Background(), &mr); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	total, per = capacity()
+	if per["h100"] != 40 || total != 48 {
+		t.Fatalf("after scaling to 5 backends: capacity = %d, per member %v, want 40+8", total, per)
+	}
+}
+
+// A route that declares no per-instance ceiling reports 0 rather than a guess: openresty
+// falls back to the route's default_max there, and inventing a number here would put a
+// figure on the console that nothing enforces.
+func TestFleetCapacityIsZeroWhenTheRouteDeclaresNone(t *testing.T) {
+	route := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true)
+	route.Spec.Nginx.Peers = []routingv1.RoutePeer{{Use: "backend"}} // no maxConcurrency
+	f := fleetFixture()
+	f.Spec.Members = f.Spec.Members[:1]
+	f.Spec.TrafficPolicy = nil
+	r, c := newFleetReconciler(t, f, route,
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if got := fleet.Status.TotalCapacity.MaxConcurrency; got != 0 {
+		t.Fatalf("totalCapacity.maxConcurrency = %d, want 0", got)
+	}
+	if got := fleet.Status.Members[0].MaxConcurrency; got != 0 {
+		t.Fatalf("member maxConcurrency = %d, want 0", got)
+	}
+	// ...and the fleet is otherwise perfectly healthy: no ceiling is not an error.
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("a route with no declared ceiling failed the sync: %+v", fleet.Status.Conditions)
+	}
+}
+
+// defaultMember is optional: omitted means members[0]. The field cannot go away — the plugin
+// requires `default` to name one of the model's backends and rejects the WHOLE decision table
+// otherwise (not just that model), which then stalls the config push for every plugin on the
+// gateway — but a single-hardware fleet should not have to state the obvious.
+func TestFleetDefaultMemberDefaultsToTheFirstMember(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.DefaultMember = ""
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	def, found, _ := unstructured.NestedString(rule, "config", "decisions", "static", "models", "glm-5.3", "default")
+	if !found || def != "h100" {
+		t.Fatalf("table default = %q (found=%v), want the first member", def, found)
+	}
+	// ...and the console is told which one it is, rather than having to re-derive it.
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if fleet.Status.DefaultMember != "h100" {
+		t.Fatalf("status.defaultMember = %q", fleet.Status.DefaultMember)
+	}
+}
+
+// The defaulted member is subject to the same rule as a stated one: it stays in the table
+// even when it is unready, because a table whose `default` names a backend that is not there
+// is rejected whole — one member's outage would otherwise freeze the gateway's config.
+func TestFleetDefaultedMemberStaysInTheTableWhenUnready(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.DefaultMember = ""
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 0, false), // the default, down
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	var sawDefault bool
+	for _, b := range backends {
+		m := b.(map[string]any)
+		if id, _, _ := unstructured.NestedString(m, "id"); id == "h100" {
+			sawDefault = true
+			if w, _, _ := unstructured.NestedInt64(m, "weight"); w != 0 {
+				t.Fatalf("the unready default carries weight %d, want 0", w)
+			}
+		}
+	}
+	if !sawDefault {
+		t.Fatal("the defaulted member was dropped from the table while unready - the plugin " +
+			"would reject the whole table and freeze this gateway's config")
+	}
+}
+
+// The manual kill switch, and the whole reason it is a field of its own rather than a zero
+// weight: decision-gen recomputes trafficPolicy from metrics and would put the member back
+// within the minute. A disabled member stays out however generous the policy is.
+func TestFleetDisabledMemberIsOutOfRotationDespiteItsWeight(t *testing.T) {
+	f := fleetFixture() // policy gives h100 8000, ascend 2000
+	f.Spec.Members[1].Disabled = true
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true), // perfectly healthy
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	for _, b := range backends {
+		if id, _, _ := unstructured.NestedString(b.(map[string]any), "id"); id == "ascend" {
+			t.Fatal("a disabled member is still in the decision table - the kill switch did nothing")
+		}
+	}
+	// ...and its share went to the rest of its tier rather than onto the floor.
+	m := backends[0].(map[string]any)
+	if w, _, _ := unstructured.NestedInt64(m, "weight"); w != 10000 {
+		t.Fatalf("surviving member weight = %d, want the disabled member's share redistributed", w)
+	}
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	for _, ms := range fleet.Status.Members {
+		if ms.Name != "ascend" {
+			continue
+		}
+		// Disabled, NOT Degraded: "someone took this out" and "this one is broken" call for
+		// opposite reactions, and the route behind it is healthy.
+		if ms.Phase != routingv1.MemberDisabled {
+			t.Fatalf("phase = %q, want Disabled", ms.Phase)
+		}
+		if ms.EffectiveWeight != 0 {
+			t.Fatalf("a disabled member reports effectiveWeight %d", ms.EffectiveWeight)
+		}
+	}
+	// It must not count towards the capacity the console shows, either.
+	if tc := fleet.Status.TotalCapacity; tc == nil || tc.MaxConcurrency != 16 {
+		t.Fatalf("totalCapacity = %+v, want only the live member's 16", tc)
+	}
+}
+
+// Omitted defaultMember skips disabled members: taking the first member out by hand must not
+// quietly make it the fallback for everything.
+func TestFleetDefaultMemberSkipsDisabledMembers(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.DefaultMember = ""
+	f.Spec.Members[0].Disabled = true // the one members[0] would otherwise pick
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	def, _, _ := unstructured.NestedString(rule, "config", "decisions", "static", "models", "glm-5.3", "default")
+	if def != "ascend" {
+		t.Fatalf("table default = %q, want the first member that is not disabled", def)
+	}
+}
+
+// A disabled member that IS the default stays in the table. The plugin resolves `default` by
+// id and rejects the entire table - every model - when it cannot find it, so dropping it
+// would turn one operator's drain into a gateway-wide config freeze.
+func TestFleetDisabledDefaultMemberStaysInTheTable(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members[0].Disabled = true // h100 is also the stated defaultMember
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+	)
+	reconcileFleet(t, r)
+
+	rule := getPlugin(t, c, "ai-backend-router")[0].(map[string]any)
+	backends, _, _ := unstructured.NestedSlice(rule, "config", "decisions", "static", "models", "glm-5.3", "backends")
+	var seen bool
+	for _, b := range backends {
+		m := b.(map[string]any)
+		if id, _, _ := unstructured.NestedString(m, "id"); id == "h100" {
+			seen = true
+			if w, _, _ := unstructured.NestedInt64(m, "weight"); w != 0 {
+				t.Fatalf("the disabled default carries weight %d, want 0", w)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("the disabled default member was dropped - the plugin would reject the whole table")
+	}
+}
+
+// Disabling every member means "take this model offline", and the only way to mean it is to
+// stop publishing the route. The plugin cannot express "serve nobody": with nothing
+// selectable it routes to `default` unconditionally - not even enabled:false stops it - so a
+// live route would send 100% of traffic to the member that was just drained. On a
+// single-member fleet, which is how every single-hardware model is published, that made the
+// kill switch do nothing at all.
+func TestFleetAllMembersDisabledWithdrawsTheRoute(t *testing.T) {
+	f := fleetFixture()
+	f.Spec.Members[0].Disabled = true
+	f.Spec.Members[1].Disabled = true
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+	)
+	// First pass deletes the Ingress and requeues; second withdraws the rules.
+	reconcileFleet(t, r)
+	reconcileFleet(t, r)
+
+	var ing networkingv1.Ingress
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err == nil {
+		t.Fatal("the route is still published although every member is disabled")
+	}
+	for _, p := range []string{"ai-backend-router", "key-auth", "ai-statistics"} {
+		if n := len(getPlugin(t, c, p)); n != 0 {
+			t.Fatalf("%s still carries %d rule(s) for a withdrawn route", p, n)
+		}
+	}
+
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	_ = c.Get(context.Background(), nn, &fleet)
+	// Synced is True - the gateway matches what the object asks for - but Ready says why it
+	// is not serving, and says it was on purpose.
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("GatewaySynced=False for a fleet that is exactly as asked: %+v", fleet.Status.Conditions)
+	}
+	if condTrue(fleet.Status.Conditions, condReady) {
+		t.Fatal("Ready=True for a model whose route was withdrawn")
+	}
+	var readyCond *metav1.Condition
+	for i := range fleet.Status.Conditions {
+		if fleet.Status.Conditions[i].Type == condReady {
+			readyCond = &fleet.Status.Conditions[i]
+		}
+	}
+	// NoReadyMember would send someone hunting for a fault that is not there.
+	if readyCond == nil || readyCond.Reason != "AllMembersDisabled" {
+		t.Fatalf("Ready reason = %v, want AllMembersDisabled", readyCond)
+	}
+
+	// ...and re-enabling one brings the route back.
+	_ = c.Get(context.Background(), nn, &fleet)
+	fleet.Spec.Members[0].Disabled = false
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "llm-route", Name: "llm-fleet-glm-5.3"}, &ing); err != nil {
+		t.Fatalf("re-enabling a member did not bring the route back: %v", err)
+	}
+}
+
+// Two members whose routes land in different ConfigMaps are served by two different
+// openrestys, and the Ingress can only point at one of them. Whichever members it does not
+// reach 404 on a fleet that reports them healthy. A namespace-only comparison waved this
+// through whenever both ConfigMaps happened to live in the fleet's namespace, which is what
+// two openresty releases in one namespace look like.
+func TestFleetMembersServedByTwoOpenrestysAreRefused(t *testing.T) {
+	f := fleetFixture()
+	h100 := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true)
+	h100.Spec.Nginx.OutputConfigMap = "openresty-conf"
+	ascend := modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true)
+	ascend.Spec.Nginx.OutputConfigMap = "rel-b-openresty-conf" // same namespace, other openresty
+	r, c := newFleetReconciler(t, f, h100, ascend,
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"))
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("accepted a fleet whose members are served by two different openrestys")
+	}
+	var msg string
+	for _, c := range fleet.Status.Conditions {
+		if c.Type == condGatewaySynced {
+			msg = c.Message
+		}
+	}
+	if !strings.Contains(msg, "rel-b-openresty-conf") || !strings.Contains(msg, "one openresty") {
+		t.Fatalf("the message does not say what is wrong: %q", msg)
+	}
+	if n := len(getPlugin(t, c, "ai-backend-router")); n != 0 {
+		t.Fatalf("wrote %d rule(s) for a fleet it refused", n)
+	}
+}
+
+// A route fronted by CART with a fixed ceiling admits that many requests however many
+// backends sit behind it, so multiplying the backends out reports capacity openresty will
+// refuse to use. With maxConcurrencyFromBackend the cart peer's limit IS the backend sum, so
+// there the backends answer.
+func TestFleetCapacityUnderCartUsesTheCartCeiling(t *testing.T) {
+	mr := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 4, true)
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "cart", MaxConcurrency: 48},
+		{Use: "backend", MaxConcurrency: 25},
+	}
+	if got := routeMaxConcurrency(mr); got != 48 {
+		t.Fatalf("capacity = %d, want the cart ceiling 48 (not 4 backends x 25)", got)
+	}
+	// ...and the other direction, which taking the cart ceiling alone got wrong: a CART that
+	// accepts more than the engines behind it can serve does not make the route bigger, it
+	// queues the surplus inside CART.
+	mr.Spec.Nginx.Peers[0].MaxConcurrency = 200
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 4 x 25 = 100: the engines bind, not CART's 200", got)
+	}
+	mr.Spec.Nginx.Peers[0].MaxConcurrency = 48
+	mr.Spec.Nginx.Peers[0].MaxConcurrencyFromBackend = true
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 4 backends x 25 = 100 when the cart limit follows them", got)
+	}
+	// Two backend groups are two ceilings and no single answer; reporting one of them would
+	// be a number nobody can trace back.
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "backend", MaxConcurrency: 25},
+		{Use: "backend", MaxConcurrency: 40},
+	}
+	if got := routeMaxConcurrency(mr); got != 0 {
+		t.Fatalf("capacity = %d, want 0 (unknown) for a route with two backend ceilings", got)
+	}
+}
+
+// A settled fleet must not be rewritten on every pass. The status write is an update event on
+// the fleet, and this controller watches ModelFleet with no predicate, so stamping
+// lastSyncTime unconditionally made each round enqueue the next one - on the test cluster, a
+// status write about every 10s against a 30s resync.
+func TestFleetSettledStatusIsNotRewritten(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"))
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	version := func() string {
+		var f routingv1.ModelFleet
+		if err := c.Get(context.Background(), nn, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f.ResourceVersion
+	}
+	reconcileFleet(t, r)
+	settled := version()
+	for i := 0; i < 3; i++ {
+		reconcileFleet(t, r)
+	}
+	if v := version(); v != settled {
+		t.Fatalf("the fleet was rewritten with nothing to say (resourceVersion %s -> %s)", settled, v)
+	}
+
+	// A real change is still written...
+	var f routingv1.ModelFleet
+	if err := c.Get(context.Background(), nn, &f); err != nil {
+		t.Fatal(err)
+	}
+	f.Spec.Members[1].Disabled = true
+	f.Generation = 2
+	if err := c.Update(context.Background(), &f); err != nil {
+		t.Fatal(err)
+	}
+	before := version()
+	reconcileFleet(t, r)
+	if version() == before {
+		t.Fatal("a changed fleet did not update its status")
+	}
+
+	// ...and so is a stale heartbeat, so lastSyncTime does not freeze and read as a dead
+	// controller.
+	if err := c.Get(context.Background(), nn, &f); err != nil {
+		t.Fatal(err)
+	}
+	stale := metav1.NewTime(time.Now().Add(-2 * fleetResyncEvery))
+	f.Status.LastSyncTime = &stale
+	if err := c.Status().Update(context.Background(), &f); err != nil {
+		t.Fatal(err)
+	}
+	before = version()
+	reconcileFleet(t, r)
+	if version() == before {
+		t.Fatal("lastSyncTime was left stale")
+	}
+}
+
+// A route's capacity comes from the same function the ModelRoute controller uses to write the
+// peers table, so the two cannot disagree about what a tier admits. This covers the tier that
+// made the point: backend-svc gained a derived cap in PR #10 while this file was restating the
+// rules, and a restatement is a copy that goes stale.
+func TestFleetCapacityUsesTheSharedPeerRule(t *testing.T) {
+	mr := modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 4, true)
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "backend", MaxConcurrency: 25},
+		// Lowest-priority fallback over the SAME backends: it adds nothing, and its own cap
+		// gates only the fallback path. A route is not smaller because its fallback is.
+		{Use: "backend-svc"},
+	}
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 4 x 25 = 100: backend-svc must not change it", got)
+	}
+	mr.Spec.Nginx.Peers[1].MaxConcurrency = 20
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d: a fallback tier's own cap must not shrink the route", got)
+	}
+	// And the derived CART cap arrives through peerMaxConcurrency, not through a second copy
+	// of the maxConcurrencyFromBackend rule.
+	mr.Spec.Nginx.Peers = []routingv1.RoutePeer{
+		{Use: "cart", MaxConcurrencyFromBackend: true},
+		{Use: "backend", MaxConcurrency: 25},
+	}
+	if got := routeMaxConcurrency(mr); got != 100 {
+		t.Fatalf("capacity = %d, want 100 (the cart cap follows the backends)", got)
+	}
+}
+
+// streamGuardPlugin: the ai-stream-guard object as the gateway chart ships it - with
+// detectors configured. Without them the controller refuses to write its rule, which has its
+// own test; every other case needs a plugin a rule can actually be written for.
+func streamGuardPlugin() *unstructured.Unstructured {
+	o := wasmPlugin("ai-stream-guard")
+	_ = unstructured.SetNestedSlice(o.Object, []any{
+		map[string]any{"type": "repetition", "name": "rep"},
+	}, "spec", "defaultConfig", "detectors")
+	return o
+}
+
+// The guard is on for a fleet that never mentions it. That is the whole reason it is a plugin
+// of this controller's rather than something each fleet passes through extraPlugins: a
+// protection somebody has to remember to switch on is missing from the next fleet built by
+// copying an older one, silently.
+func TestFleetStreamGuardIsOnByDefault(t *testing.T) {
+	f := fleetFixture() // says nothing about streamGuard
+	r, c := newFleetReconciler(t, f,
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), streamGuardPlugin(),
+	)
+	reconcileFleet(t, r)
+
+	rules := getPlugin(t, c, "ai-stream-guard")
+	if len(rules) != 1 {
+		t.Fatalf("ai-stream-guard has %d rule(s), want 1: a fleet that says nothing must be guarded", len(rules))
+	}
+	rule := rules[0].(map[string]any)
+	// The rule carries a COPY of the plugin's defaultConfig. An empty rule would be the
+	// tidier design and it does not work: with defaultConfigDisable true the Higress
+	// controller never sends defaultConfig to the gateway, so the plugin would inherit an
+	// empty global and refuse the config - measured on the test cluster after this shipped
+	// the other way.
+	cfg, _ := rule["config"].(map[string]any)
+	dets, _ := cfg["detectors"].([]any)
+	if len(dets) != 1 {
+		t.Fatalf("the rule's config is %v, want the chart's detectors copied into it", cfg)
+	}
+	if first, _ := dets[0].(map[string]any); first["type"] != "repetition" {
+		t.Fatalf("the copied detector is %v, want the one the chart configured", dets[0])
+	}
+	if d, _ := rule["configDisable"].(bool); d {
+		t.Fatal("configDisable is true: the rule turns the plugin OFF for this route")
+	}
+
+	// ...and turning it off withdraws the rule rather than writing a different config.
+	var fleet routingv1.ModelFleet
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}
+	if err := c.Get(context.Background(), nn, &fleet); err != nil {
+		t.Fatal(err)
+	}
+	fleet.Spec.Gateway.StreamGuard = &routingv1.StreamGuard{Disabled: true}
+	fleet.Generation = 2
+	if err := c.Update(context.Background(), &fleet); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("ai-stream-guard still has %d rule(s) after the fleet turned it off", n)
+	}
+}
+
+// A gateway whose chart predates this plugin must keep publishing fleets. The guard's absence
+// costs the guard and nothing else - no 401, no route down, no missing metrics - so unlike
+// ai-backend-router and key-auth it must not fail the sync.
+func TestFleetStreamGuardMissingPluginIsTolerated(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"),
+		// no ai-stream-guard object at all
+	)
+	reconcileFleet(t, r)
+
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the fleet refused to publish over a missing guard: %s",
+			condMessage(fleet.Status.Conditions, condGatewaySynced))
+	}
+	if !condTrue(fleet.Status.Conditions, condReady) {
+		t.Fatal("Ready=False although only the guard is missing")
+	}
+}
+
+// The dangerous middle case tolerateMissing does not cover: the ai-stream-guard object EXISTS
+// but its defaultConfig carries no detectors. Our rule is empty by design and inherits that
+// config, and the plugin refuses a config with no detectors - so writing the rule would make
+// the plugin fail to load, and a plugin that fails to load stalls the config push for EVERY
+// plugin on that gateway. Upgrading this controller without the matching gateway chart would
+// take the whole gateway's config plane down, for every fleet route.
+func TestFleetStreamGuardNotWrittenWithoutDetectors(t *testing.T) {
+	guard := wasmPlugin("ai-stream-guard") // exists, with no defaultConfig at all
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), guard,
+	)
+	reconcileFleet(t, r)
+
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("wrote %d rule(s) the plugin cannot load: the config push for every plugin "+
+			"on this gateway would stall", n)
+	}
+	// The fleet still publishes - the alternative is refusing to serve a model because a
+	// guard is unconfigured - and the condition says what is not running.
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatalf("the fleet refused to publish: %s", condMessage(fleet.Status.Conditions, condGatewaySynced))
+	}
+	msg := condMessage(fleet.Status.Conditions, condGatewaySynced)
+	for _, want := range []string{"ai-stream-guard", "detectors", "not written"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the condition does not say the guard is off (%s missing): %q", want, msg)
+		}
+	}
+
+	// ...and once the chart configures detectors, the rule appears.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "ai-stream-guard"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedSlice(ka.Object, []any{
+		map[string]any{"type": "repetition", "name": "rep"},
+	}, "spec", "defaultConfig", "detectors"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(context.Background(), &ka); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 1 {
+		t.Fatalf("rules = %d after detectors were configured, want 1", n)
+	}
+}
+
+// Clearing the chart's detectors must WITHDRAW the rule, not just stop writing a new one.
+// Skipping the write alone left the previous rule in place: the chart had no detectors any
+// more, the fleet reported "not written", and the gateway went on cutting streams at a
+// threshold that existed nowhere but in that stale rule. The condition said one thing and the
+// gateway did another - found by the cluster probe, which is where that asymmetry shows.
+func TestFleetStreamGuardRuleIsWithdrawnWhenDetectorsGoAway(t *testing.T) {
+	r, c := newFleetReconciler(t, fleetFixture(),
+		modelRoute("glm-53-h100", "llm-route", "glm-53-h100", 2, true),
+		modelRoute("glm-53-ascend", "llm-route", "glm-53-ascend", 1, true),
+		wasmPlugin("ai-backend-router"), keyAuthPlugin(map[string]string{"ops": "sk-ops"}),
+		wasmPlugin("ai-statistics"), streamGuardPlugin(),
+	)
+	reconcileFleet(t, r)
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 1 {
+		t.Fatalf("rules = %d before the change, want 1", n)
+	}
+
+	// The chart drops its detectors.
+	var ka unstructured.Unstructured
+	ka.SetGroupVersionKind(wasmPluginGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: "higress-system", Name: "ai-stream-guard"}, &ka); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedSlice(ka.Object, []any{}, "spec", "defaultConfig", "detectors"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(context.Background(), &ka); err != nil {
+		t.Fatal(err)
+	}
+	reconcileFleet(t, r)
+
+	if n := len(getPlugin(t, c, "ai-stream-guard")); n != 0 {
+		t.Fatalf("rules = %d: the old rule survived, so the gateway keeps cutting at a "+
+			"threshold that exists nowhere else", n)
+	}
+	var fleet routingv1.ModelFleet
+	_ = c.Get(context.Background(), types.NamespacedName{Namespace: "llm-route", Name: "glm-5.3"}, &fleet)
+	if !condTrue(fleet.Status.Conditions, condGatewaySynced) {
+		t.Fatal("the fleet stopped publishing over an unconfigured guard")
+	}
+	if msg := condMessage(fleet.Status.Conditions, condGatewaySynced); !strings.Contains(msg, "not written") {
+		t.Fatalf("the condition does not mention the withdrawn rule: %q", msg)
 	}
 }

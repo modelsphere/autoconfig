@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -19,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	slov1 "autoconfig/api/inference/v1alpha1"
@@ -93,11 +95,23 @@ func runController(leaderElect bool) error {
 	// leaves the type missing - and watching a type that does not exist fails the manager,
 	// which would take ModelRoute down with it. A cluster that never asked for ModelFleet
 	// must not lose openresty peers, CART workers and monitor.conf over it.
-	has, err := hasModelFleetCRD(cs)
+	served, err := servedKinds(cs)
 	if err != nil {
 		return err
 	}
-	if has {
+	// A discovery failure for a group this project does not own must not stop this binary.
+	// Returning the error aborted runController, so one flaky call crash-looped the pod and
+	// took ModelRoute - openresty peers, CART workers, monitor.conf - down with it: the exact
+	// outcome the gate and its test exist to prevent, reintroduced by the gate's own plumbing.
+	// Failing closed means no watch, and the periodic sweep picks Higress up anyway.
+	higressServed, err := kindServed(cs, wasmPluginGroupVersion, "WasmPlugin")
+	if err != nil {
+		log.Printf("could not ask whether %s is served (%v): skipping the key-auth watch. "+
+			"The periodic gateway sweep still runs, so this self-corrects without a restart",
+			wasmPluginGroupVersion, err)
+		higressServed = false
+	}
+	if served["ModelFleet"] {
 		if err := (&controller.ModelFleetReconciler{
 			Client:    mgr.GetClient(),
 			APIReader: mgr.GetAPIReader(),
@@ -109,6 +123,85 @@ func runController(leaderElect bool) error {
 		log.Print("ModelFleet CRD not installed: skipping that reconciler " +
 			"(apply deploy/helm/autoconfig/crds/ and restart to enable it)")
 	}
+	// APIConsumer: who may call the gateway, and with which keys. Gated on its own CRD for
+	// the same reason - a cluster that only uses ModelRoute must not lose openresty peers
+	// over a type it never asked for.
+	if served["APIConsumer"] {
+		consumers := &controller.APIConsumerReconciler{
+			Client:    mgr.GetClient(),
+			APIReader: mgr.GetAPIReader(),
+			Scheme:    mgr.GetScheme(),
+		}
+		if err := consumers.SetupWithManager(mgr); err != nil {
+			return err
+		}
+		// ...and a watch on the gateways' key-auth plugin itself. The gateway chart no
+		// longer renders defaultConfig.consumers, so this controller is the only thing that
+		// can create it - and key_auth cannot parse a defaultConfig without it (FAIL_CLOSE:
+		// the gateway refuses everything). A fresh install has zero APIConsumers, so the
+		// APIConsumer watch would never fire; this one does, and the event also says which
+		// namespace, so no default has to be configured or guessed.
+		//
+		// Gated on the WasmPlugin kind being served, for the reason spelled out above for
+		// ModelFleet and with a worse blast radius: a For() watch builds its informer at
+		// startup and blocks on the cache syncing, so on a cluster without Higress the
+		// manager would exit when CacheSyncTimeout ran out and the pod would crash-loop,
+		// taking ModelRoute - openresty peers, CART workers, monitor.conf - with it. Most
+		// clusters are in exactly that state: enabled.higress is false by default, while
+		// this release ships the APIConsumer CRD to all of them.
+		// The sweep runs whatever discovery said. It is what makes the "autoconfig creates
+		// the consumers key" contract hold on a cluster where the watch could not be
+		// registered - a fresh install, where Higress's CRDs arrive after this process
+		// started - and it needs no informer, so a missing kind costs one failed List.
+		if err := mgr.Add(manager.RunnableFunc(consumers.StartGatewaySweep)); err != nil {
+			return err
+		}
+		switch {
+		case !keyAuthWatchWanted(higressServed):
+			log.Print("Higress WasmPlugin CRD not installed: skipping the key-auth watch " +
+				"(the periodic gateway sweep still runs, so a Higress installed later is " +
+				"picked up within one resync without restarting this pod)")
+		default:
+			if err := (&controller.KeyAuthReconciler{APIConsumerReconciler: consumers}).
+				SetupWithManager(mgr); err != nil {
+				return err
+			}
+		}
+		// ...and nothing else to add.
+	} else {
+		// Skipped - and this one does NOT self-correct, which is why it gets a watchdog.
+		//
+		// The CRDs ship in the chart's crds/ directory, which `helm upgrade` does not touch,
+		// so upgrading an existing release leaves APIConsumer unserved: this reconciler AND
+		// the gateway sweep are both skipped, and nothing writes key-auth's
+		// defaultConfig.consumers. Paired with the gateway chart that no longer renders that
+		// field, parsePluginConfig fails and FAIL_CLOSE denies every caller on every route of
+		// that gateway. Applying the CRD afterwards fixes nothing by itself, because this
+		// decision was taken once at startup.
+		//
+		// So: watch for the kind appearing and exit when it does. Exiting is how a
+		// leader-elected controller restarts, and a restart is what picks the CRD up.
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-t.C:
+					if served, err := servedKinds(cs); err == nil && served["APIConsumer"] {
+						log.Print("APIConsumer CRD has appeared: exiting so the restart picks " +
+							"it up (nothing writes key-auth's consumers until it does)")
+						return fmt.Errorf("APIConsumer CRD installed after startup: restarting")
+					}
+				}
+			}
+		})); err != nil {
+			return err
+		}
+		log.Print("APIConsumer CRD not installed: skipping that reconciler " +
+			"(apply deploy/helm/autoconfig/crds/ and restart to enable it)")
+	}
 	// controller-runtime 自带的 ping 检查:进程存活即通过。
 	// 注意它【不能】发现 reconcile 卡死 —— 要那个得看 metrics 的 workqueue_depth。
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -118,29 +211,61 @@ func runController(leaderElect bool) error {
 		return err
 	}
 
-	log.Printf("controller start: ModelRoute%s (routing.modelsphere.dev/v1alpha1)",
-		map[bool]string{true: " + ModelFleet"}[has])
+	extra := ""
+	for _, k := range []string{"ModelFleet", "APIConsumer"} {
+		if served[k] {
+			extra += " + " + k
+		}
+	}
+	log.Printf("controller start: ModelRoute%s (routing.modelsphere.dev/v1alpha1)", extra)
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
-// hasModelFleetCRD asks the API server whether the type exists. Discovery rather than a
-// Get on the CRD object: it needs no apiextensions permission, and "is this kind served"
-// is exactly the question.
-func hasModelFleetCRD(cs kubernetes.Interface) (bool, error) {
+// servedKinds asks the API server which kinds of our group it serves. Discovery rather than
+// a Get on each CRD object: it needs no apiextensions permission, and "is this kind served"
+// is exactly the question. One call for every optional reconciler.
+func servedKinds(cs kubernetes.Interface) (map[string]bool, error) {
+	out := map[string]bool{}
 	list, err := cs.Discovery().ServerResourcesForGroupVersion(routingv1.GroupVersion.String())
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil // the whole group is absent: ModelRoute's CRD is missing too
+			return out, nil // the whole group is absent: ModelRoute's CRD is missing too
 		}
-		return false, fmt.Errorf("discover %s: %w", routingv1.GroupVersion, err)
+		return nil, fmt.Errorf("discover %s: %w", routingv1.GroupVersion, err)
 	}
 	for _, r := range list.APIResources {
-		if r.Kind == "ModelFleet" {
+		out[r.Kind] = true
+	}
+	return out, nil
+}
+
+// keyAuthWatchWanted: may the key-auth watch be registered? Its own function because the
+// consequence of getting it wrong is not local: that watch is a For(), so controller-runtime
+// builds its informer at startup and waits for the cache to sync, and where the kind is not
+// served the manager exits when CacheSyncTimeout runs out. The pod then crash-loops and takes
+// ModelRoute with it on a cluster that only ever wanted ModelRoute.
+func keyAuthWatchWanted(higressServed bool) bool { return higressServed }
+
+// kindServed: is one kind of some OTHER group served? Same question as servedKinds, asked of
+// a group this project does not own, so a missing group is an answer rather than an error.
+func kindServed(cs kubernetes.Interface, groupVersion, kind string) (bool, error) {
+	list, err := cs.Discovery().ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("discover %s: %w", groupVersion, err)
+	}
+	for _, r := range list.APIResources {
+		if r.Kind == kind {
 			return true, nil
 		}
 	}
 	return false, nil
 }
+
+// wasmPluginGroupVersion is Higress's, not ours.
+const wasmPluginGroupVersion = "extensions.higress.io/v1alpha1"
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {

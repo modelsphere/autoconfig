@@ -32,33 +32,16 @@ type MemberBackend struct {
 	// this hardware type. The gateway path prefix is derived from its spec.nginx.route
 	// (falling back to its metadata.name, same rule the ModelRoute itself uses).
 	//
-	// Same namespace only, and not merely as a convention: the fleet's Ingress sends every
-	// member's path to the openresty in the fleet's namespace (an Ingress backend cannot name
-	// a Service anywhere else), and that openresty serves the routes of its own namespace. A
-	// member whose ModelRoute lives elsewhere would get a path that this openresty does not
-	// serve - a 404 on a route the fleet reports as healthy. An "ns/" prefix naming another
-	// namespace is refused rather than accepted and then silently dead.
+	// "ns/name" to name one in another namespace, which is normal: a ModelRoute writes its
+	// route config into whatever ConfigMap it names, and several namespaces' routes routinely
+	// land in one openresty. What a member cannot do is be served by a DIFFERENT openresty
+	// from the one this fleet's Ingress points at (the one in the fleet's namespace - an
+	// Ingress backend cannot name a Service anywhere else): its path would not be there, and
+	// the request would 404 on a route the fleet reports as healthy. That is what the
+	// reconciler checks, by comparing the ModelRoute's nginx.outputConfigMap against this
+	// fleet's namespace - the member's own namespace says nothing about it either way.
 	// +kubebuilder:validation:MinLength=1
 	ModelRouteRef string `json:"modelRouteRef"`
-}
-
-// Capabilities are the member's declared limits. They are NOT enforced at the gateway today:
-// admission by concurrency lives in openresty, and the router plugin has no landing place for
-// a per-member context-length check. They are carried so the console can show them and so the
-// policy writer can reason about them; see the status note on MaxConcurrency.
-type Capabilities struct {
-	// MaxContextTokens: the longest request this member can serve. Reserved: routing does not
-	// consult it yet (the plugin cannot admit by context length), so a request longer than this
-	// can still be routed here and will fail at the engine. Tracked as a plugin feature request.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxContextTokens int32 `json:"maxContextTokens,omitempty"`
-	// MaxConcurrency: in-flight requests this member can take. Reserved for the same reason —
-	// concurrency admission is openresty's job (per-route max_concurrency), not the gateway's.
-	// The reconciler only sums it into status.totalCapacity for display.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
 }
 
 // FleetMember is one hardware type's service inside the fleet. Written by the console.
@@ -71,11 +54,26 @@ type FleetMember struct {
 	Name string `json:"name"`
 	// Hardware: which accelerator this member runs on (display only).
 	Hardware Hardware `json:"hardware"`
+	// Disabled takes this member out of rotation now, whatever the traffic policy says. It is
+	// the manual kill switch: "ascend's TTFT just blew up, get it out" — and it has to
+	// outlive decision-gen's next round, which is why it lives here, in the console's own
+	// subtree, rather than as a zero weight in trafficPolicy (decision-gen would recompute
+	// that from metrics within the minute and quietly put the member back).
+	//
+	// ⚠ Set it with your OWN Server-Side Apply field manager
+	// (kubectl apply --server-side --field-manager=ops-<who>). Ownership in SSA is per field,
+	// including inside a members[] entry, so a flag owned by someone else survives the
+	// console re-applying the whole list, and the console setting it back to false is refused
+	// with a conflict rather than silently winning. Set it under the console's own field
+	// manager and the console's next routine apply clears it — measured both ways on a test
+	// cluster (tools/modelfleet/ssa_killswitch_cpu16.sh in the vllm repo).
+	//
+	// A disabled member stays in status, with phase Disabled, so the console can tell "someone
+	// took this out" from "this one is broken".
+	// +optional
+	Disabled bool `json:"disabled,omitempty"`
 	// Backend: the ModelRoute that already serves this member.
 	Backend MemberBackend `json:"backend"`
-	// Capabilities: declared limits, reserved (see the type's note).
-	// +optional
-	Capabilities *Capabilities `json:"capabilities,omitempty"`
 }
 
 // StickinessKey says what identifies a session.
@@ -243,6 +241,45 @@ type GatewaySpec struct {
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:XValidation:rule="!self.exists(c, c == '*') || size(self) == 1",message="authConsumers: \"*\" means \"no authentication on this route\" and cannot be combined with consumer names"
 	AuthConsumers []string `json:"authConsumers,omitempty"`
+	// StreamGuard: the repetition guard on this fleet's route. ON for every fleet unless this
+	// says otherwise, which is the whole point of the field existing at all.
+	//
+	// It is not in extraPlugins, although that would have worked without a line of controller
+	// code, because extraPlugins is written per fleet by whoever creates it - and a protection
+	// that each caller has to remember to switch on is missing from the fleet somebody built
+	// by copying an older one, silently, with nothing to say so. A default belongs to the
+	// controller; extraPlugins is for what ONE fleet wants differently.
+	//
+	// The parameters stay in the gateway chart's defaultConfig, and this controller COPIES
+	// them into each route's rule. Not an empty rule inheriting them: with
+	// defaultConfigDisable true the Higress controller never sends defaultConfig to the
+	// gateway at all, so an empty rule reaches a plugin whose global config is empty and is
+	// refused. Measured on a cluster, after the empty-rule version had been written on the
+	// strength of the plugin's own parseRuleConfig - which is right about the plugin and
+	// silent about what reaches it.
+	//
+	// So a fleet turning the guard off is a rule withdrawn, and a chart that changes the
+	// thresholds is picked up by every route within one resync.
+	//
+	// ⚠ The chart's defaultConfig MUST carry a non-empty `detectors`. The plugin refuses a
+	// config with none, and a plugin that fails to load stalls the config push for EVERY
+	// plugin on that gateway, not just this one. With none configured no rule is written at
+	// all, and the fleet's GatewaySynced says so.
+	// +optional
+	StreamGuard *StreamGuard `json:"streamGuard,omitempty"`
+}
+
+// StreamGuard says whether the repetition guard runs on this route.
+type StreamGuard struct {
+	// Disabled takes the guard off this route. Spelled as the negative so that the safe
+	// behaviour is what an absent field means: a fleet nobody thought about is guarded, and
+	// turning the guard off is a thing somebody wrote down.
+	//
+	// What the guard does when it fires is cut the stream - a terminal chunk carrying
+	// finish_reason, then [DONE] - so switching it off is a real decision for a route whose
+	// callers would rather have a repetitive answer than a truncated one.
+	// +optional
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // ModelFleetSpec aggregates several single-hardware services into one externally visible model.
@@ -252,9 +289,10 @@ type GatewaySpec struct {
 // Server-Side Apply with a per-writer fieldManager — a client-side apply or a constructed-object
 // Update will silently wipe the other writer's fields.
 //
-// defaultMember must name a real member: it is where the plugin lands when every member is
-// unusable, so a dangling name is a hole in the one path that is supposed to have no holes.
-// +kubebuilder:validation:XValidation:rule="self.members.exists(m, m.name == self.defaultMember)",message="defaultMember must name one of spec.members"
+// defaultMember, when stated, must name a real member: it is where the plugin lands when
+// every member is unusable, so a dangling name is a hole in the one path that is supposed to
+// have no holes. Leaving it out is fine — the controller takes members[0].
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultMember) || self.defaultMember == \"\" || self.members.exists(m, m.name == self.defaultMember)",message="defaultMember must name one of spec.members"
 // Stickiness has no landing place in ai-backend-router yet. Refuse it instead of accepting a
 // setting that will never take effect.
 // +kubebuilder:validation:XValidation:rule="!has(self.trafficPolicy) || !has(self.trafficPolicy.stickiness)",message="trafficPolicy.stickiness is not supported by ai-backend-router yet; it would be silently ignored, so it is refused here"
@@ -273,8 +311,24 @@ type ModelFleetSpec struct {
 	//
 	// It makes "set every weight to 0" mean "send everything here", NOT "stop serving" —
 	// draining the fleet is removing members or taking the route down, never zeroing weights.
-	// +kubebuilder:validation:MinLength=1
-	DefaultMember string `json:"defaultMember"`
+	//
+	// Optional: omitted means the first member that is not disabled, which is why a
+	// single-hardware fleet never has to state it. Not the first member with a non-zero
+	// weight: in the one case this field exists for — every weight zero — there is no such
+	// member, and deriving it from weights would let decision-gen move the fallback target
+	// just by rewriting a policy, which is the one thing about failure behaviour that should
+	// stay put. The field itself cannot go away, because the plugin requires `default` to be
+	// the id of one of the model's backends and REJECTS THE WHOLE DECISION TABLE otherwise —
+	// not that one model, the whole table, and a plugin that fails to load stalls the config
+	// push for every plugin on that gateway (ai-backend-router decisions.go: "default: %q is
+	// not one of the model's backends"). That is also why the chosen member stays in the
+	// rendered table even when it is unready, at weight 0: dropping it would turn one
+	// member's outage into a gateway-wide config freeze.
+	//
+	// The effective value is reported as status.defaultMember.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	DefaultMember string `json:"defaultMember,omitempty"`
 	// Members: one entry per hardware type, each pointing at the service swiss already created.
 	// +listType=map
 	// +listMapKey=name
@@ -298,7 +352,7 @@ type TotalCapacity struct {
 }
 
 // MemberPhase is a member's routing state.
-// +kubebuilder:validation:Enum=Ready;Degraded;NotFound
+// +kubebuilder:validation:Enum=Ready;Degraded;NotFound;Disabled
 type MemberPhase string
 
 const (
@@ -308,6 +362,11 @@ const (
 	MemberDegraded MemberPhase = "Degraded"
 	// MemberNotFound: modelRouteRef points at nothing.
 	MemberNotFound MemberPhase = "NotFound"
+	// MemberDisabled: taken out of rotation by spec.members[].disabled. Reported separately
+	// from Degraded because "someone took this out" and "this one is broken" call for
+	// opposite reactions, and a console that shows them the same way sends people looking
+	// for a fault that is not there.
+	MemberDisabled MemberPhase = "Disabled"
 )
 
 // MemberStatus is one member as observed, and is the only place the console should read from.
@@ -332,6 +391,14 @@ type MemberStatus struct {
 	EffectiveWeight int32 `json:"effectiveWeight"`
 	// Tier the member was placed in.
 	Tier int32 `json:"tier"`
+	// MaxConcurrency: in-flight requests this member can take, derived from its ModelRoute as
+	// "per-instance ceiling × discovered backends" — the same rule that controller uses to
+	// size CART's dynamic concurrency, so the two cannot disagree. It is read rather than
+	// declared: the authoritative value is spec.nginx.peers[].maxConcurrency on the
+	// ModelRoute, and a copy of it here would be a second source of truth that goes stale
+	// exactly when a member scales.
+	// +optional
+	MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
 }
 
 // ModelFleetStatus is written only by this controller, through the status subresource.
@@ -347,6 +414,10 @@ type ModelFleetStatus struct {
 	// ModelName actually programmed into the gateway.
 	// +optional
 	ModelName string `json:"modelName,omitempty"`
+	// DefaultMember actually in force, with the default expanded, so the console can show
+	// which member catches a request when nothing else is selectable.
+	// +optional
+	DefaultMember string `json:"defaultMember,omitempty"`
 	// TotalCapacity: summed over ready members.
 	// +optional
 	TotalCapacity *TotalCapacity `json:"totalCapacity,omitempty"`
@@ -374,10 +445,15 @@ type ModelFleetStatus struct {
 	// fleet's Ingress reference forever, with nothing in the CR pointing at them.
 	// +optional
 	AppliedGatewayNamespace string `json:"appliedGatewayNamespace,omitempty"`
-	// LastSyncTime: when this fleet was last reconciled — set on every pass, including the
-	// ones that failed before writing anything. It answers "is the controller still looking
-	// at this object", not "when did the gateway last change"; observedGeneration and
-	// GatewaySynced answer the latter.
+	// LastSyncTime: when this fleet's status was last written — on every pass that changed
+	// something, including the ones that failed before writing anything to the gateway, and
+	// otherwise once per resync interval as a heartbeat. It is NOT stamped on every pass:
+	// that write is an update event on this object, which the controller watches, so an
+	// unconditional stamp made each round trigger the next one.
+	//
+	// So a value a little older than the resync interval means "settled, nothing to say",
+	// not "stalled". It answers "is the controller still looking at this object", not "when
+	// did the gateway last change"; observedGeneration and GatewaySynced answer the latter.
 	// +optional
 	LastSyncTime *metav1.Time `json:"lastSyncTime,omitempty"`
 	// Conditions: Ready (serving), GatewaySynced (objects written), PolicyApplied (the policy

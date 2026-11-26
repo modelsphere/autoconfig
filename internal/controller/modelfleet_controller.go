@@ -11,6 +11,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -93,6 +94,27 @@ type fleetPlugin struct {
 	// it verbatim while the Secret-derived one was never programmed, with a healthy sync.
 	// There is no CEL rule to fall back on (see the field's doc), so this is the only guard.
 	overridable bool
+	// copyDefaultConfig: write this plugin's own spec.defaultConfig as the rule's config.
+	//
+	// Needed because of a layer above the plugin: with defaultConfigDisable true, the Higress
+	// controller does not send defaultConfig to the gateway at all - only `_rules_` - so a
+	// rule that counted on the plugin merging it over the global config gets an EMPTY global
+	// and fails to parse. Measured on the test cluster, after this controller had already
+	// shipped empty rules on the strength of reading the plugin's own parseRuleConfig, which
+	// is correct about the plugin and silent about what reaches it.
+	//
+	// So the thresholds still live in one place - the chart's defaultConfig - and this copies
+	// them per route rather than restating them.
+	copyDefaultConfig bool
+	// unusable: may this plugin's own global config make our rule unwritable? Returns a
+	// reason, or "" when the rule is safe to write.
+	//
+	// It covers the gap tolerateMissing does not: the plugin object EXISTS but its
+	// defaultConfig cannot support the rule we were about to add. Writing it anyway is worse
+	// than not writing it - a plugin that fails to load stalls the config push for EVERY
+	// plugin on that gateway, so one fleet's rule takes down key-auth, the backend router and
+	// everything else on it.
+	unusable func(obj *unstructured.Unstructured) string
 	// config renders this plugin's per-route config; returning nil means "no rule for this
 	// fleet", which removes any rule we previously wrote.
 	config func(*fleetRender) (any, error)
@@ -134,6 +156,14 @@ type fleetRender struct {
 	upstreamKey string
 	// upstreamKeyDefaulted: the credential came from the default Secret, not from a named one.
 	upstreamKeyDefaulted bool
+	// defaultMember: the member the plugin falls back to, with the default expanded.
+	defaultMember string
+	// allDisabled: every member is disabled, i.e. the model was deliberately taken offline.
+	allDisabled bool
+	// skippedPlugins: rules this round did not write because the plugin's own global config
+	// could not support them. Surfaced on the fleet, because the alternative to writing them
+	// was silence about a protection that is not running.
+	skippedPlugins []string
 	// gatewayNS: which gateway namespace to write to. Empty means the one the spec names;
 	// it is set explicitly only when withdrawing rules from a namespace the spec no longer
 	// points at.
@@ -205,6 +235,32 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 	}
 
+	if rend.allDisabled {
+		// Route first, rules after - the teardown order, for the same reason: a live Ingress
+		// whose key-auth rule has already gone is an open route.
+		gone, err := r.deleteIngress(ctx, &fleet)
+		if err != nil {
+			r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse,
+				"WithdrawError", fmt.Sprintf("every member is disabled, but this fleet's route "+
+					"could not be taken down: %v", err))
+			return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+		}
+		if !gone {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		if err := r.cleanupPluginRules(ctx, &fleet); err != nil {
+			r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionFalse,
+				"WithdrawError", err.Error())
+			return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+		}
+		// Synced is True: the gateway matches what the object asks for. Ready is False, and
+		// says why - the model is intentionally offline, not broken.
+		r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue,
+			"AllMembersDisabled", "every member is disabled: this model's route is withdrawn, "+
+				"so the gateway answers 404 for it rather than serving from a drained member")
+		return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
+	}
+
 	// Plugin rules first, Ingress last. The Ingress is what makes the route reachable, so
 	// everything that guards it has to be in place before it exists: writing the Ingress
 	// first means that a failure half way through the plugins publishes a live route whose
@@ -223,7 +279,14 @@ func (r *ModelFleetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	log.V(1).Info("fleet synced", "model", rend.modelName, "members", len(rend.members))
-	r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue, "Synced", "gateway objects written")
+	// Synced, but say what was left out. A rule this round refused to write - because the
+	// plugin's own config could not support it - means a protection is not running on this
+	// route, and the one thing worse than that is nobody knowing.
+	syncMsg := "gateway objects written"
+	if len(rend.skippedPlugins) > 0 {
+		syncMsg += "; not written: " + strings.Join(rend.skippedPlugins, "; ")
+	}
+	r.setFleetStatus(ctx, req.NamespacedName, rend, condGatewaySynced, metav1.ConditionTrue, "Synced", syncMsg)
 	return ctrl.Result{RequeueAfter: fleetResyncEvery}, nil
 }
 
@@ -303,6 +366,70 @@ func isPublicRoute(fleet *routingv1.ModelFleet) bool {
 	return len(c) == 1 && c[0] == "*"
 }
 
+// routeMaxConcurrency: how many in-flight requests this member can take, read from its
+// ModelRoute rather than restated on the fleet.
+//
+// "per-instance ceiling × discovered backends" is the ModelRoute controller's own rule for
+// sizing CART's dynamic concurrency, so using it here means the fleet's capacity and the
+// route's cannot disagree. It also tracks scaling by itself: a member that doubles its
+// replicas doubles its capacity with nobody editing a field.
+//
+// 0 when the route declares no ceiling, which is how openresty treats it too (the route's
+// default_max applies) - reported as 0 rather than guessed.
+// routeMaxConcurrency is how many concurrent requests this route can actually serve: the
+// SMALLER of the two ceilings on the path, because either one on its own overstates it.
+//
+// The backends alone ignore that openresty admits requests to the CART peer, which has a
+// limit of its own: 4 x 25 behind a CART that accepts 48 serves 48. The CART peer alone is
+// the opposite error: a CART that accepts 200 in front of 4 x 25 does not serve 200, it
+// queues the surplus internally. min() is the binding constraint in both directions.
+//
+// A tier's effective cap comes from peerMaxConcurrency, the same function the ModelRoute
+// controller writes into the peers table, rather than from restating its rules here. This
+// used to restate them and drifted within a day: `backend-svc` gained a derived cap
+// (PR #10) that this function knew nothing about. One route, one answer.
+//
+// backend-svc is deliberately left out of the min. It is the lowest-priority fallback over
+// the SAME backends, so it adds no capacity, and its cap gates only the fallback path - a
+// route is not smaller because its fallback is.
+//
+// 0 means "unknown" and keeps this route out of the fleet's total rather than contributing a
+// guess: no ceiling is declared, or there are no ready backends to multiply, or there are
+// several backend ceilings, which is several answers and not one.
+func routeMaxConcurrency(mr *routingv1.ModelRoute) int32 {
+	backends := mr.Status.Backends
+	perInstance, backendGroups := 0, 0
+	for _, p := range mr.Spec.Nginx.Peers {
+		if p.Use == "backend" && p.MaxConcurrency > 0 {
+			backendGroups++
+			perInstance = p.MaxConcurrency
+		}
+	}
+	backendTotal := 0
+	if perInstance > 0 && backendGroups == 1 && backends > 0 {
+		backendTotal = perInstance * backends
+	}
+	cart := 0
+	for _, p := range mr.Spec.Nginx.Peers {
+		if p.Use != "cart" {
+			continue
+		}
+		if c := peerMaxConcurrency(p, perInstance, backends); c > 0 {
+			cart = c
+		}
+	}
+	switch {
+	case cart > 0 && backendTotal > 0:
+		return int32(min(cart, backendTotal))
+	case cart > 0:
+		// No usable backend figure, but the CART ceiling is still a real limit, and saying
+		// it beats saying nothing.
+		return int32(cart)
+	default:
+		return int32(backendTotal)
+	}
+}
+
 // checkModelNameIsUnique refuses a model name another fleet on the same gateway already
 // serves. Two fleets with the same effective modelName publish two Ingresses carrying the
 // same exact-match header, and which one a request lands on is then not defined - the two
@@ -364,16 +491,37 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	if rend.modelName == "" {
 		rend.modelName = fleet.Name
 	}
+	// Omitted defaultMember means the first member. The plugin requires `default` to name one
+	// of the backends and rejects the entire decision table otherwise, so there is always one
+	// - but a single-hardware fleet should not have to say which.
+	rend.defaultMember = fleet.Spec.DefaultMember
+	if rend.defaultMember == "" {
+		for _, m := range fleet.Spec.Members {
+			if !m.Disabled {
+				rend.defaultMember = m.Name
+				break
+			}
+		}
+		if rend.defaultMember == "" && len(fleet.Spec.Members) > 0 {
+			rend.defaultMember = fleet.Spec.Members[0].Name
+		}
+	}
+	// Every member disabled is "take this model offline", and the only way to mean it is to
+	// stop publishing the route. The plugin cannot express "serve nobody": when nothing is
+	// selectable it routes to `default` unconditionally - not even `enabled: false` stops it
+	// ("model %q has no enabled backend with weight > 0; routing to its default backend
+	// %q"). Leaving the route up would therefore send 100% of traffic to a member someone
+	// had just drained, which is the exact opposite of what they asked for, and on a
+	// single-member fleet - the common case - the kill switch would do nothing at all.
+	rend.allDisabled = len(fleet.Spec.Members) > 0
+	for _, m := range fleet.Spec.Members {
+		if !m.Disabled {
+			rend.allDisabled = false
+			break
+		}
+	}
 	if err := r.checkModelNameIsUnique(ctx, fleet, rend.modelName); err != nil {
 		return nil, err
-	}
-	for _, m := range fleet.Spec.Members {
-		if ns, _ := splitRef(m.Backend.ModelRouteRef, fleet.Namespace); ns != fleet.Namespace {
-			return nil, fmt.Errorf("member %q: modelRouteRef %q names namespace %q, but this "+
-				"fleet's Ingress can only reach the openresty in its own namespace (%q), which "+
-				"serves only that namespace's routes - the member's path would 404 on a route "+
-				"reported as healthy", m.Name, m.Backend.ModelRouteRef, ns, fleet.Namespace)
-		}
 	}
 
 	policy := map[string]routingv1.PolicyMember{}
@@ -396,9 +544,11 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	undecided := len(policy) == 0
 	declared := map[string]bool{}
 
+	// The ConfigMap the first member writes into: every other member has to match it.
+	var servedBy, servedByMember string
 	for _, m := range fleet.Spec.Members {
 		declared[m.Name] = true
-		view := sink.FleetMemberView{Name: m.Name}
+		view := sink.FleetMemberView{Name: m.Name, Disabled: m.Disabled}
 		if pm, ok := policy[m.Name]; ok {
 			view.Tier, view.Weight = pm.Tier, pm.Weight
 		} else if undecided {
@@ -406,10 +556,6 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 			// 10000, so three members come out 3334/3333/3333 rather than drifting.
 			view.Weight = 1
 		}
-		if m.Capabilities != nil {
-			view.MaxConcurrency = m.Capabilities.MaxConcurrency
-		}
-
 		var mr routingv1.ModelRoute
 		ns, name := splitRef(m.Backend.ModelRouteRef, fleet.Namespace)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &mr); err != nil {
@@ -424,12 +570,52 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 		if route == "" {
 			route = mr.Name
 		}
+		// The member's path is only reachable through the openresty this fleet's Ingress
+		// points at, which is the one in the fleet's namespace. A ModelRoute writes its route
+		// config into whatever ConfigMap it names, and that is routinely in ANOTHER namespace
+		// - on these clusters half a dozen namespaces' routes all land in
+		// llm-route/openresty-conf - so a cross-namespace member is perfectly normal. What is
+		// not normal is a member whose route is served by a DIFFERENT openresty: its path
+		// would 404 on a route the fleet reports as healthy.
+		//
+		// This check replaces an earlier one that simply refused a cross-namespace
+		// modelRouteRef, on the assumption that an openresty serves only its own namespace.
+		// It does not, and that check both forbade a legitimate setup and missed the case
+		// that actually breaks: a same-namespace ModelRoute writing to another openresty.
+		// Compare the whole reference, not just its namespace: two openresty releases in one
+		// namespace give openresty-conf and rel-b-openresty-conf, and a namespace match alone
+		// would wave that through. What is checked is that every member writes into the SAME
+		// ConfigMap, in the fleet's namespace.
+		//
+		// The residual assumption, stated rather than papered over: one openresty per
+		// namespace. A fleet whose members all agree on a ConfigMap that is NOT the one the
+		// Ingress's openresty reads is still accepted. Closing that needs the Service's
+		// Deployment and the volume it mounts - another lookup, more RBAC, and a naming
+		// convention to lean on - so it is deliberately out of scope here.
+		confNS, confName := splitRef(mr.Spec.Nginx.OutputConfigMap, mr.Namespace)
+		conf := confNS + "/" + confName
+		if confNS != fleet.Namespace {
+			return nil, fmt.Errorf("member %q: ModelRoute %s/%s writes its route into %q, but "+
+				"this fleet's Ingress sends traffic to the openresty in namespace %q - the "+
+				"member's path would not be served there, and the route would 404 while the "+
+				"fleet reports it healthy", m.Name, ns, name, conf, fleet.Namespace)
+		}
+		if servedBy == "" {
+			servedBy, servedByMember = conf, m.Name
+		} else if conf != servedBy {
+			return nil, fmt.Errorf("member %q writes its route into %q but member %q writes "+
+				"into %q: the members of one fleet have to be served by one openresty, since "+
+				"the Ingress can only send traffic to one of them - whichever members the "+
+				"Ingress does not reach would 404 while the fleet reports them healthy",
+				m.Name, conf, servedByMember, servedBy)
+		}
 		view.Path = "/" + route
 		// Readiness is taken from the ModelRoute's own status rather than rediscovered here:
 		// that controller already watches the EndpointSlices, and a second discovery pass
 		// would give two answers to one question whenever the two disagree.
 		view.Ready = mr.Status.Ready && mr.Status.Backends > 0
 		view.ReadyReplicas = int32(mr.Status.Backends)
+		view.MaxConcurrency = routeMaxConcurrency(&mr)
 		rend.members = append(rend.members, view)
 	}
 
@@ -457,7 +643,7 @@ func (r *ModelFleetReconciler) resolve(ctx context.Context, fleet *routingv1.Mod
 	}
 	// Status reports the share actually in force, which differs from the table's weights
 	// when everything falls through to the default member (see sink.TrafficShares).
-	rend.effective = sink.TrafficShares(rend.members, fleet.Spec.DefaultMember)
+	rend.effective = sink.TrafficShares(rend.members, rend.defaultMember)
 
 	switch ref := fleet.Spec.Gateway.UpstreamAuthSecretRef; ref {
 	case upstreamAuthNone:
@@ -656,7 +842,7 @@ func fleetPlugins() []fleetPlugin {
 			if p := f.fleet.Spec.TrafficPolicy; p != nil {
 				rev = p.Revision
 			}
-			return sink.RenderDecisionTable(f.modelName, f.fleet.Spec.DefaultMember, f.members, rev)
+			return sink.RenderDecisionTable(f.modelName, f.defaultMember, f.members, rev)
 		},
 	}, {
 		// Without a rule here the route is not in any consumer's allow-list: 403. Missing
@@ -697,6 +883,52 @@ func fleetPlugins() []fleetPlugin {
 		// different accounting attributes may simply say so.
 		overridable: true,
 		config:      func(f *fleetRender) (any, error) { return sink.RenderAIStatistics(), nil },
+	}, {
+		// The repetition guard. Default ON: a rule is written for every fleet that has not
+		// said otherwise, which is why this is a plugin of its own rather than something each
+		// fleet passes through extraPlugins - a protection somebody has to remember to switch
+		// on is missing from the next fleet built by copying an older one.
+		name: "ai-stream-guard",
+		// Its absence costs the guard and nothing else: no 401, no route down, no missing
+		// metrics. A cluster whose gateway chart predates this plugin must not stop
+		// publishing fleets over it.
+		tolerateMissing: func(*fleetRender) bool { return true },
+		// The middle case, which is the dangerous one and which tolerateMissing does not
+		// cover: the object exists and its defaultConfig has no `detectors`. Our rule is
+		// empty by design and inherits that config, and the plugin refuses a config with no
+		// detectors - so the rule would be written, the plugin would fail to load, and the
+		// config push for EVERY plugin on that gateway would stall. Upgrading this
+		// controller without the matching gateway chart would take the whole gateway's
+		// config plane down, for every fleet route.
+		//
+		// So the rule is not written, the fleet publishes without the guard, and the reason
+		// is on the fleet rather than in a gateway that has stopped accepting config.
+		unusable: func(obj *unstructured.Unstructured) string {
+			dets, found, err := unstructured.NestedSlice(obj.Object, "spec", "defaultConfig", "detectors")
+			if err != nil || !found || len(dets) == 0 {
+				return "its defaultConfig has no `detectors`, and this controller writes an " +
+					"empty rule that inherits it - the plugin refuses a config with none, and " +
+					"a plugin that fails to load stalls the config push for every plugin on " +
+					"this gateway. Configure detectors in the gateway chart to enable the guard"
+			}
+			return ""
+		},
+		// Overridable, so a fleet that wants different thresholds can say so through
+		// extraPlugins - the same escape hatch ai-statistics has.
+		overridable: true,
+		// The rule carries a copy of the chart's defaultConfig: an empty rule would reach
+		// the gateway with no global config to inherit (see copyDefaultConfig) and the
+		// plugin would refuse it.
+		copyDefaultConfig: true,
+		config: func(f *fleetRender) (any, error) {
+			if g := f.fleet.Spec.Gateway.StreamGuard; g != nil && g.Disabled {
+				return nil, nil // no rule: the guard does not run on this route
+			}
+			// A marker: the actual config is the plugin's own defaultConfig, substituted
+			// where the object is read (copyDefaultConfig). Returning non-nil here is what
+			// says "this route wants the guard".
+			return sink.RenderStreamGuard(), nil
+		},
 	}}
 }
 
@@ -717,6 +949,9 @@ func renderedPlugins() map[string]bool {
 
 func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleetRender) error {
 	var errs []string
+	// Rules deliberately not written because the plugin's own config could not support them.
+	// Reported, not fatal - see the handling in the loop below.
+	var skipped []string
 	if err := r.withdrawFromOldGatewayNamespace(ctx, rend); err != nil {
 		// Not fatal: the new namespace still gets its rules, and the stale ones are retried
 		// every resync. Reported, because a rule nobody can see is the thing to avoid.
@@ -754,6 +989,15 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 		if err := r.upsertMatchRule(ctx, rend, p, raw); err != nil {
 			if isAbsent(err) && (raw == nil ||
 				(p.tolerateMissing != nil && p.tolerateMissing(rend))) {
+				continue
+			}
+			// A rule the plugin's own config cannot support was deliberately not written.
+			// It is reported on the fleet - loudly enough to act on - but it does not fail
+			// the sync, for the same reason tolerateMissing exists: the alternative is a
+			// gateway that has stopped accepting config for every route on it.
+			var unusable *pluginUnusableError
+			if errors.As(err, &unusable) {
+				skipped = append(skipped, unusable.Error())
 				continue
 			}
 			errs = append(errs, fmt.Sprintf("%s: %v", p.name, err))
@@ -851,6 +1095,7 @@ func (r *ModelFleetReconciler) applyPluginRules(ctx context.Context, rend *fleet
 	}
 	sort.Strings(rend.appliedExtras) // listType=set on the status field, and a stable order means no needless writes
 
+	rend.skippedPlugins = skipped
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
@@ -879,11 +1124,54 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 	if ns == "" {
 		ns = gatewayNamespace(rend.fleet)
 	}
+	// Outside the closure: cfg is mutated inside it (an unusable config becomes a
+	// withdrawal), so on a conflict retry the second attempt would re-enter with cfg already
+	// nil, never consult p.unusable again, and return nil - the rule withdrawn and the fleet
+	// reporting a clean "gateway objects written", which is the silence this reason exists to
+	// break.
+	unusableWhy := ""
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj := &unstructured.Unstructured{}
 		obj.SetGroupVersionKind(wasmPluginGVK)
 		if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: p.name}, obj); err != nil {
 			return err
+		}
+		// Would our rule be unwritable given this plugin's own global config? Asked after the
+		// Get, because the answer is on the object. A rule that cannot load is worse than no
+		// rule: it stalls the config push for every plugin on this gateway.
+		// An unusable plugin config does not just stop us writing - it WITHDRAWS the rule we
+		// wrote before. Skipping the write alone left the previous rule in place: the chart
+		// had no detectors any more, the fleet reported "not written", and the gateway went
+		// on cutting streams at a threshold that existed nowhere but in that stale rule.
+		// Caught by the cluster probe, which is also where the asymmetry is obvious - the
+		// condition says one thing and the gateway does another.
+		if cfg != nil && p.unusable != nil {
+			if unusableWhy = p.unusable(obj); unusableWhy != "" {
+				cfg = nil // fall through to the withdrawal path below
+			}
+		}
+		// Substitute the plugin's own defaultConfig for the marker config. The gateway never
+		// receives defaultConfig while defaultConfigDisable is true, so the rule has to carry
+		// it; the thresholds still exist in exactly one place, the chart.
+		if cfg != nil && p.copyDefaultConfig {
+			def, found, err := unstructured.NestedMap(obj.Object, "spec", "defaultConfig")
+			if err != nil {
+				return fmt.Errorf("read %s defaultConfig: %w", p.name, err)
+			}
+			if !found || len(def) == 0 {
+				// Withdraw, like the p.unusable path above, rather than returning here: a
+				// bare return leaves the rule already on the gateway in place while the
+				// fleet reports "not written" - the same asymmetry that path was changed to
+				// avoid. Unreachable for ai-stream-guard today, because its unusable hook
+				// rejects a missing defaultConfig first, but a trap for the next plugin
+				// given copyDefaultConfig without one.
+				unusableWhy = "its defaultConfig is empty, and this controller copies it " +
+					"into the rule because the gateway never receives defaultConfig while " +
+					"defaultConfigDisable is true"
+				cfg = nil
+			} else {
+				cfg = def
+			}
 		}
 		rules, _, err := unstructured.NestedSlice(obj.Object, "spec", "matchRules")
 		if err != nil {
@@ -925,13 +1213,27 @@ func (r *ModelFleetReconciler) upsertMatchRule(ctx context.Context, rend *fleetR
 			// Nothing changed: do not write. Every write here is a config push to the
 			// gateway, and a controller that rewrites an identical object on each resync
 			// turns a 30s resync into a 30s config churn across the data plane.
-			return nil
+			return unusableErr(p.name, unusableWhy)
 		}
 		if err := unstructured.SetNestedSlice(obj.Object, kept, "spec", "matchRules"); err != nil {
 			return err
 		}
-		return r.Update(ctx, obj)
+		if err := r.Update(ctx, obj); err != nil {
+			return err
+		}
+		// Written (or withdrawn). If the withdrawal was because the plugin's own config
+		// cannot support a rule, say so now - the rule is gone, which is what the message
+		// claims, and the caller reports it on the fleet without failing the sync.
+		return unusableErr(p.name, unusableWhy)
 	})
+}
+
+// unusableErr: nil unless there is a reason, so the write paths can return it unconditionally.
+func unusableErr(plugin, why string) error {
+	if why == "" {
+		return nil
+	}
+	return &pluginUnusableError{plugin: plugin, why: why}
 }
 
 // cleanupPluginRules withdraws every rule this fleet put into the gateway plugins.
@@ -1026,17 +1328,16 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 			return err
 		}
 		st := &fleet.Status
+		prev := st.DeepCopy()
 		if syncStatus == metav1.ConditionTrue {
 			// Only on success. observedGeneration == generation is THE convergence signal
 			// console and decision-gen poll; advancing it on a failed reconcile tells them
 			// the new split is live while nothing was written and the table is frozen.
 			st.ObservedGeneration = fleet.Generation
 		}
-		now := metav1.Now()
-		st.LastSyncTime = &now
-
 		if rend != nil {
 			st.ModelName = rend.modelName
+			st.DefaultMember = rend.defaultMember
 			if u := fleet.Spec.Gateway.ExternalURL; u != "" {
 				st.Endpoint = strings.TrimSuffix(u, "/") + "/v1"
 			} else {
@@ -1053,7 +1354,7 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 				// make the next round withdraw from the namespace it is trying to write to.
 				st.AppliedGatewayNamespace = gatewayNamespace(&fleet)
 			}
-			st.TotalCapacity = totalCapacity(st.Members, &fleet)
+			st.TotalCapacity = totalCapacity(st.Members)
 
 			policyOK, policyReason, policyMsg := metav1.ConditionTrue, "Applied", "traffic policy applied"
 			if len(rend.uncovered) > 0 {
@@ -1076,6 +1377,16 @@ func (r *ModelFleetReconciler) setFleetStatus(ctx context.Context, nn types.Name
 
 		ready, readyReason, readyMsg := fleetReadiness(st, syncStatus)
 		setCond(st, condReady, ready, readyReason, readyMsg, fleet.Generation)
+
+		// A settled fleet is not rewritten. The status write is an update event on the
+		// fleet, which this controller watches with no predicate, so stamping lastSyncTime
+		// unconditionally made every round enqueue the next one - measured on the test
+		// cluster as a status write about every 10s against a 30s resync.
+		if statusSettled(prev, st, fleetResyncEvery, prev.LastSyncTime) {
+			return nil
+		}
+		now := metav1.Now()
+		st.LastSyncTime = &now
 		return r.Status().Update(ctx, &fleet)
 	})
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -1093,6 +1404,10 @@ func memberStatuses(fleet *routingv1.ModelFleet, rend *fleetRender) []routingv1.
 		v := byName[spec.Name]
 		phase := routingv1.MemberNotFound
 		switch {
+		case spec.Disabled:
+			// Checked first: a disabled member that is also down is still, as far as anyone
+			// reading this is concerned, a member someone took out.
+			phase = routingv1.MemberDisabled
 		case v.Ready:
 			phase = routingv1.MemberReady
 		case v.Path != "":
@@ -1108,6 +1423,7 @@ func memberStatuses(fleet *routingv1.ModelFleet, rend *fleetRender) []routingv1.
 			ReadyReplicas:   v.ReadyReplicas,
 			EffectiveWeight: rend.effective[spec.Name],
 			Tier:            v.Tier,
+			MaxConcurrency:  v.MaxConcurrency,
 		})
 	}
 	return out
@@ -1116,19 +1432,17 @@ func memberStatuses(fleet *routingv1.ModelFleet, rend *fleetRender) []routingv1.
 // totalCapacity sums only the members that are actually ready: capacity is what can serve a
 // request right now, and counting a drained member would overstate the fleet exactly when
 // someone is looking at it to decide whether to shift traffic.
-func totalCapacity(members []routingv1.MemberStatus, fleet *routingv1.ModelFleet) *routingv1.TotalCapacity {
-	caps := map[string]int32{}
-	for _, m := range fleet.Spec.Members {
-		if m.Capabilities != nil {
-			caps[m.Name] = m.Capabilities.MaxConcurrency
-		}
-	}
+func totalCapacity(members []routingv1.MemberStatus) *routingv1.TotalCapacity {
 	var tc routingv1.TotalCapacity
 	for _, m := range members {
 		if m.Phase != routingv1.MemberReady {
 			continue
 		}
-		tc.MaxConcurrency += caps[m.Name]
+		// Each member's own figure, already derived from its ModelRoute. Summing the members'
+		// status rather than the spec is what makes this the capacity that can actually serve:
+		// it follows a member scaling, and it is 0 only when the route really declares no
+		// ceiling - not because somebody left a field out of the CR.
+		tc.MaxConcurrency += m.MaxConcurrency
 		tc.ReadyReplicas += m.ReadyReplicas
 	}
 	return &tc
@@ -1141,14 +1455,29 @@ func fleetReadiness(st *routingv1.ModelFleetStatus, syncStatus metav1.ConditionS
 	if syncStatus != metav1.ConditionTrue {
 		return metav1.ConditionFalse, "GatewayNotSynced", "gateway objects not written"
 	}
-	ready := 0
+	ready, disabled := 0, 0
 	for _, m := range st.Members {
-		if m.Phase == routingv1.MemberReady {
+		switch m.Phase {
+		case routingv1.MemberReady:
 			ready++
+		case routingv1.MemberDisabled:
+			disabled++
 		}
 	}
+	// "Deliberately taken out" and "broken" need opposite reactions, and this is the
+	// condition people alert on - reporting NoReadyMember for a fleet somebody drained on
+	// purpose sends them hunting for a fault that is not there.
+	if disabled > 0 && disabled == len(st.Members) {
+		return metav1.ConditionFalse, "AllMembersDisabled",
+			"every member is disabled; the route is withdrawn until one is re-enabled"
+	}
 	if ready == 0 {
-		return metav1.ConditionFalse, "NoReadyMember", "no member has a ready backend"
+		msg := "no member has a ready backend"
+		if disabled > 0 {
+			msg = fmt.Sprintf("no member has a ready backend (%d of %d are disabled)",
+				disabled, len(st.Members))
+		}
+		return metav1.ConditionFalse, "NoReadyMember", msg
 	}
 	if ready < len(st.Members) {
 		return metav1.ConditionTrue, "PartiallyReady",
@@ -1301,4 +1630,16 @@ func (r *ModelFleetReconciler) fleetsForModelRoute(ctx context.Context, obj clie
 		}
 	}
 	return out
+}
+
+// pluginUnusableError: our rule was not written because the plugin's own global config cannot
+// support it. Its own type so the caller can tell it from a failure to write - this one is a
+// deliberate skip, and a fleet that only hits this still publishes.
+type pluginUnusableError struct {
+	plugin string
+	why    string
+}
+
+func (e *pluginUnusableError) Error() string {
+	return fmt.Sprintf("%s: rule not written: %s", e.plugin, e.why)
 }
