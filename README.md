@@ -447,6 +447,18 @@ reconciler 把同一个网关下所有 `APIConsumer` 聚合、按名字排序,�
 加 key 最慢一个 resync(60s)生效;改 `APIConsumer` 对象本身是立即的。**没有**对 Secret 的 watch:
 那会给全集群 Secret 开 informer,正是这个 controller 刻意避开的(它只有 `secrets: get`、且不走缓存读)。
 
+⚠️ **撤销(从 Secret 里删掉一个 value)也是同一个 60s 口径** —— 这件事比"加 key 慢一分钟"要紧:
+key 泄露要立刻失效时,光改 Secret 最长还有一分钟能继续用。**要立刻生效就动对象本身**
+(改一个 annotation 即可,如 `kubectl annotate apiconsumer <名字> rotated-at=$(date +%s) --overwrite`),
+那是 generation 变化、下一秒就 reconcile。更彻底的是直接 `kubectl delete apiconsumer <名字>`:
+删除走 finalizer,key 在对象消失之前就已经从网关名单里撤掉了。
+
+渲染出的 credential 带 `Bearer ` 前缀(Secret 里存裸 key 即可):key-auth 比较的是
+**整个 Authorization header 原值**,不剥前缀、不 trim,配裸 key 的话标准客户端全部 401。
+⚠️ **同一个 key 不能给两个 consumer 用** —— key-auth 遇到重复 credential 会
+`return false` 整份配置解析失败,而插件是 `FAIL_CLOSE`,后果是**整个网关所有路由全部拒绝**,
+不是"其中一个不生效"。渲染层会拒掉这种配置(报错只给 consumer 名和下标,不带 key 值)。
+
 **两条写入安全规则**(这个改动最危险的地方,都是「宁可不写」):
 
 - **坏一个,全不写**。某个 `APIConsumer` 的 Secret 读不到时,**不会**把它从名单里摘掉再写剩下的 ——

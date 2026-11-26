@@ -26,8 +26,13 @@ type APIConsumerSpec struct {
 	// shared with whatever the chart still renders, while object names are per Kubernetes
 	// namespace: two teams could otherwise collide without either of them being able to see
 	// it. The reconciler refuses a duplicate rather than letting one silently win.
+	//
+	// Restricted to a DNS label: this name is written into the gateway's allow lists and
+	// turns up in the X-Mse-Consumer header and the access log, so a value with a comma, a
+	// quote or a space in it would land in all three.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	ConsumerName string `json:"consumerName,omitempty"`
 	// Gateway: which gateway's consumer list this belongs in.
 	// +optional
@@ -36,7 +41,7 @@ type APIConsumerSpec struct {
 	// keys — EVERY value in it becomes an accepted credential, so a rotation is "add the new
 	// key, let both work, remove the old one" with no window where neither does.
 	//
-	// Only the fleet's own namespace, and only a Secret: the controller holds a cluster-wide
+	// Only this object's own namespace, and only a Secret: the controller holds a cluster-wide
 	// `secrets: get`, so a ref that could name any namespace would turn "can write an
 	// APIConsumer here" into "can read every Secret in the cluster".
 	// +kubebuilder:validation:MinLength=1

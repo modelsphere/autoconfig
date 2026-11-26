@@ -572,3 +572,72 @@ func TestConsumerDeleteReleasesWhenTheGatewayIsGone(t *testing.T) {
 		t.Fatalf("held on a gateway that does not exist: %v", con.Finalizers)
 	}
 }
+
+// A settled consumer must not be rewritten on every pass. The status write is an update event
+// on the object, and this controller watches its own kind with no predicate, so a write that
+// always happens - lastSyncTime used to be stamped unconditionally - makes each round enqueue
+// the next one. Here that costs an uncached Secret GET for every consumer on the gateway,
+// every iteration.
+func TestConsumerSettledStatusIsNotRewritten(t *testing.T) {
+	r, c := newConsumerReconciler(t,
+		consumerFixture("tenant-a", "tenant-a-keys"),
+		credSecret("tenant-a-keys", map[string]string{"key": "sk-a"}),
+		keyAuthWith(),
+	)
+	nn := types.NamespacedName{Namespace: "llm-route", Name: "tenant-a"}
+	version := func() string {
+		var con routingv1.APIConsumer
+		if err := c.Get(context.Background(), nn, &con); err != nil {
+			t.Fatal(err)
+		}
+		return con.ResourceVersion
+	}
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	settled := version()
+	for i := 0; i < 3; i++ {
+		if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v := version(); v != settled {
+		t.Fatalf("the object was rewritten with nothing to say (resourceVersion %s -> %s)", settled, v)
+	}
+
+	// ...but a real change still gets written.
+	var con routingv1.APIConsumer
+	if err := c.Get(context.Background(), nn, &con); err != nil {
+		t.Fatal(err)
+	}
+	con.Spec.ConsumerName = "renamed"
+	con.Generation = 2
+	if err := c.Update(context.Background(), &con); err != nil {
+		t.Fatal(err)
+	}
+	before := version()
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if version() == before {
+		t.Fatal("a changed consumer did not update its status")
+	}
+
+	// ...and so does a stale heartbeat, so that lastSyncTime does not freeze on a settled
+	// object and read as a dead controller.
+	if err := c.Get(context.Background(), nn, &con); err != nil {
+		t.Fatal(err)
+	}
+	stale := metav1.NewTime(time.Now().Add(-2 * consumerResyncTime))
+	con.Status.LastSyncTime = &stale
+	if err := c.Status().Update(context.Background(), &con); err != nil {
+		t.Fatal(err)
+	}
+	before = version()
+	if err := reconcileConsumer(t, r, "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	if version() == before {
+		t.Fatal("lastSyncTime was left stale: nothing would show the controller is still alive")
+	}
+}

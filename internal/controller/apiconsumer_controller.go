@@ -41,8 +41,10 @@ const (
 	managedConsumersAnnotation = "routing.modelsphere.dev/managed-consumers"
 )
 
-// ModelFleetReconciler already defines wasmPluginGVK, gatewayNamespace and isAbsent; this
-// controller shares them deliberately — a second definition is a second thing to keep in step.
+// ModelFleetReconciler already defines wasmPluginGVK, isAbsent and sameRules; this controller
+// shares them deliberately — a second definition is a second thing to keep in step. The
+// gateway namespace is resolved separately (consumerGatewayNamespace), because an APIConsumer
+// has no fleet to inherit one from.
 
 type APIConsumerReconciler struct {
 	client.Client
@@ -75,6 +77,14 @@ func (r *APIConsumerReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// reconciler only ever sees the objects that exist, so after the finalizer is
 			// gone nothing would remember that this credential is still accepted. Deleting
 			// an APIConsumer has to actually revoke the key.
+			// Not trusting status.appliedGatewayNamespace alone to decide there is nothing
+			// to revoke, tempting as it is for an object that was never programmed: a round
+			// that wrote the credential and then failed to write its own status leaves the
+			// key live with no record of it, and skipping the withdrawal would strand that
+			// key in key-auth for good. The two cases this would have saved are already
+			// covered - a misspelled gateway namespace has no key-auth to Get, which is the
+			// absent sentinel and releases at once, and anything else gives up at the
+			// deadline.
 			for _, ns := range distinctNamespaces(gwNS, consumer.Status.AppliedGatewayNamespace) {
 				err := r.programGateway(ctx, ns, &consumer)
 				// A gateway that is GONE needs no rewrite, and neither does one whose CRD
@@ -374,6 +384,7 @@ func (r *APIConsumerReconciler) setConsumerStatus(ctx context.Context, nn types.
 			return err
 		}
 		st := &c.Status
+		prev := st.DeepCopy()
 		if status == metav1.ConditionTrue {
 			// Only on success: observedGeneration is how the console answers "is this key
 			// live yet", and advancing it on a failed round says yes while the gateway still
@@ -383,9 +394,12 @@ func (r *APIConsumerReconciler) setConsumerStatus(ctx context.Context, nn types.
 			st.ConsumerName = name
 			st.Credentials = creds
 		}
+		setConsumerCond(st, status, reason, msg, c.Generation)
+		if statusSettled(prev, st, consumerResyncTime, prev.LastSyncTime) {
+			return nil
+		}
 		now := metav1.Now()
 		st.LastSyncTime = &now
-		setConsumerCond(st, status, reason, msg, c.Generation)
 		return r.Status().Update(ctx, &c)
 	})
 	if err != nil && !apierrors.IsNotFound(err) {
