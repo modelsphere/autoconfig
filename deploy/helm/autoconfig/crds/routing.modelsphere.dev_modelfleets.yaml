@@ -606,7 +606,11 @@ spec:
                         to, derived from the ModelRoute.'
                       type: string
                     phase:
-                      description: 'Phase: Ready / Degraded / NotFound.'
+                      description: |-
+                        Phase: Ready / Degraded / NotFound / Disabled. Disabled is a member the fleet itself
+                        turned off (members[].disabled), not one that is failing: it has no route on the
+                        gateway and takes no traffic, and a console that shows it beside Degraded sends people
+                        looking for a fault that is not there.
                       enum:
                       - Ready
                       - Degraded

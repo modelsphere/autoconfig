@@ -33,3 +33,15 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
     kubectl delete mr --all -A          # 1) 先删所有 ModelRoute(controller 摘 finalizer)
     helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}   # 2) 再卸载
   已卡住的补救:kubectl patch mr <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'
+
+⚠️ 升级既有 release:先 apply CRD,再让 controller 重启,顺序不能反。
+  `helm upgrade` 不更新 crds/ 目录,而「APIConsumer 这个 kind 服务不服务」是 controller
+  启动时判定一次的。漏了这一步 = 没人写 key-auth 的 defaultConfig.consumers,
+  配上不再渲染该字段的网关 chart,就是该网关所有路由对所有调用方 401/403。
+    helm pull <repo>/autoconfig --version <ver> --untar      # 1) 取到 crds/
+    kubectl apply --server-side -f autoconfig/crds/          # 2) 先装 CRD
+    helm upgrade {{ .Release.Name }} <repo>/autoconfig -n {{ .Release.Namespace }}  # 3) 再升级
+  controller 里有看门狗:CRD 事后出现时它会退出,靠重启把判定重做一次,所以漏了也会自愈,
+  但中间那段时间网关是拒绝服务的。
+  同一机制还有个更安静的版本:CRD 没升级时 ModelFleet 的 spec.gateway.streamGuard 会被
+  API server 静默裁掉 —— 写 disabled: true 被接受、然后被忽略,防护照旧开着。
