@@ -39,9 +39,15 @@ autoconfig controller 已部署到 namespace「{{ .Release.Namespace }}」。
   启动时判定一次的。漏了这一步 = 没人写 key-auth 的 defaultConfig.consumers,
   配上不再渲染该字段的网关 chart,就是该网关所有路由对所有调用方 401/403。
     helm pull <repo>/autoconfig --version <ver> --untar      # 1) 取到 crds/
-    kubectl apply --server-side -f autoconfig/crds/          # 2) 先装 CRD
-    helm upgrade {{ .Release.Name }} <repo>/autoconfig -n {{ .Release.Namespace }}  # 3) 再升级
-  controller 里有看门狗:CRD 事后出现时它会退出,靠重启把判定重做一次,所以漏了也会自愈,
-  但中间那段时间网关是拒绝服务的。
+    kubectl apply --server-side --force-conflicts \
+      -f autoconfig/crds/                                    # 2) 先装 CRD
+    kubectl explain modelfleet.spec.gateway.streamGuard      # 3) 确认 CRD 真升上去了
+    helm upgrade {{ .Release.Name }} <repo>/autoconfig -n {{ .Release.Namespace }}  # 4) 再升级
+  `--force-conflicts` 不能省:crds/ 第一次是 helm 装的,`.spec.versions` 归它的 field
+  manager,不带这个 flag 第 2 步会 `conflict with "helm"` 直接失败。失败了还接着做第 4 步,
+  正好掉进这段警告要避开的窗口。第 3 步报 `field ... does not exist` 就是第 2 步没生效,别往下走。
+  controller 里有看门狗(cmd/main.go,启动时没看到 APIConsumer 就每分钟探一次):CRD 事后
+  出现时它让进程退出,靠 Deployment 重启把判定重做一次 —— 看 pod 的 RESTARTS 和
+  「APIConsumer CRD has appeared」日志。所以漏了也会自愈,但中间那段时间网关是拒绝服务的。
   同一机制还有个更安静的版本:CRD 没升级时 ModelFleet 的 spec.gateway.streamGuard 会被
   API server 静默裁掉 —— 写 disabled: true 被接受、然后被忽略,防护照旧开着。
