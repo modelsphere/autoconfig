@@ -373,7 +373,10 @@ const (
 type MemberStatus struct {
 	// Name of the member.
 	Name string `json:"name"`
-	// Phase: Ready / Degraded / NotFound.
+	// Phase: Ready / Degraded / NotFound / Disabled. Disabled is a member the fleet itself
+	// turned off (members[].disabled), not one that is failing: it has no route on the
+	// gateway and takes no traffic, and a console that shows it beside Degraded sends people
+	// looking for a fault that is not there.
 	Phase MemberPhase `json:"phase"`
 	// Hardware, copied from spec so the console renders the pod table in one read.
 	// +optional
